@@ -1756,10 +1756,9 @@ int handle_manual_cuLaunchKernel(conn_t *conn) {
     }
   }
 
-  if (rpc_write_start_response(conn, request_id) < 0 ||
-      rpc_write(conn, &result, sizeof(result)) < 0 || rpc_write_end(conn) < 0) {
-    return -1;
-  }
+  // Fire-and-forget: no response is sent.
+  (void)request_id;
+  (void)result;
   return 0;
 }
 

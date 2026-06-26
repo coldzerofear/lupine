@@ -1031,6 +1031,8 @@ class FunctionAnnotationMetadata:
     operations: list[Operation]
     disabled_client: bool = False
     disabled_server: bool = False
+    # @async: fire-and-forget op; client does not wait, server sends no response.
+    async_fire_forget: bool = False
     routing_kind: Optional[str] = None
     routing_parameter: Optional[Parameter] = None
     record_owners: list[OwnerAnnotation] = None

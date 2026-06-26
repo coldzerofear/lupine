@@ -5569,6 +5569,7 @@ cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY,
           lupine_route_identity(route)) {
     launch_context = lupine_current_context;
   }
+  // Fire-and-forget; launch errors are sticky and surface at the next sync.
   if (conn == nullptr ||
       rpc_write_start_request(conn, RPC_cuLaunchKernel) < 0 ||
       rpc_write(conn, &f, sizeof(f)) < 0 ||
@@ -5584,16 +5585,13 @@ cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY,
       rpc_write(conn, &layout.count, sizeof(layout.count)) < 0 ||
       rpc_write(conn, &total_size, sizeof(total_size)) < 0 ||
       rpc_write(conn, packed.data(), packed.size()) < 0 ||
-      rpc_wait_for_response(conn) < 0 ||
-      rpc_read(conn, &return_value, sizeof(return_value)) < 0 ||
-      rpc_read_end(conn) < 0) {
+      rpc_write_end(conn) < 0) {
+    pthread_mutex_unlock(&conn->call_mutex);
     return CUDA_ERROR_DEVICE_UNAVAILABLE;
   }
-  if (return_value != CUDA_SUCCESS) {
-    LUPINE_TRACE_LOG(
-        "LUPINE cuLaunchKernel result=" << static_cast<int>(return_value));
-  }
-  return return_value;
+  (void)return_value;
+  pthread_mutex_unlock(&conn->call_mutex);
+  return CUDA_SUCCESS;
 }
 
 extern "C" CUresult cuLaunchKernelEx(const CUlaunchConfig *config, CUfunction f,

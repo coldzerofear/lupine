@@ -1010,6 +1010,9 @@ def parse_annotation(
             continue
         if line.startswith("*"):
             line = line[2:]
+        if line.strip().startswith("@async"):
+            metadata.async_fire_forget = True
+            continue
         if line.startswith("@routingkey"):
             parts = line.split()
             if len(parts) < 2:
@@ -1916,6 +1919,29 @@ def main():
                         )
                     )
 
+            if metadata.async_fire_forget:
+                # Fire-and-forget: send without waiting for a response.
+                f.write(
+                    "    if (conn == nullptr ||\n"
+                    "        rpc_write_start_request(conn, RPC_{name}) < 0 ||\n".format(
+                        name=function.name.format()
+                    )
+                )
+                for operation in operations:
+                    operation.client_rpc_write(f)
+                f.write("        rpc_write_end(conn) < 0) {\n")
+                f.write("        if (conn != nullptr) pthread_mutex_unlock(&conn->call_mutex);\n")
+                f.write(
+                    "        return {error_return};\n".format(
+                        error_return=error_const(function.return_type.format())
+                    )
+                )
+                f.write("    }\n")
+                f.write("    pthread_mutex_unlock(&conn->call_mutex);\n")
+                f.write("    return CUDA_SUCCESS;\n")
+                f.write("}\n\n")
+                continue
+
             f.write(
                 "    if (conn == nullptr ||\n"
                 "        rpc_write_start_request(conn, RPC_{name}) < 0 ||\n".format(
@@ -2114,20 +2140,26 @@ def main():
                     )
                 )
 
-            f.write("    if (rpc_write_start_response(conn, request_id) < 0 ||\n")
+            if metadata.async_fire_forget:
+                # Fire-and-forget: no response is sent.
+                f.write("    (void) lupine_intercept_result;\n")
+                f.write("\n")
+                f.write("    return 0;\n")
+            else:
+                f.write("    if (rpc_write_start_response(conn, request_id) < 0 ||\n")
 
-            for operation in operations:
-                operation.server_rpc_write(f)
+                for operation in operations:
+                    operation.server_rpc_write(f)
 
-            f.write(
-                "        rpc_write(conn, &lupine_intercept_result, sizeof({return_type})) < 0 ||\n".format(
-                    return_type=function.return_type.format()
+                f.write(
+                    "        rpc_write(conn, &lupine_intercept_result, sizeof({return_type})) < 0 ||\n".format(
+                        return_type=function.return_type.format()
+                    )
                 )
-            )
-            f.write("        rpc_write_end(conn) < 0)\n")
-            f.write("        goto ERROR_{index};\n".format(index=len(defers)))
-            f.write("\n")
-            f.write("    return 0;\n")
+                f.write("        rpc_write_end(conn) < 0)\n")
+                f.write("        goto ERROR_{index};\n".format(index=len(defers)))
+                f.write("\n")
+                f.write("    return 0;\n")
 
             for i, defer in enumerate(defers):
                 f.write("ERROR_{index}:\n".format(index=len(defers) - i))
