@@ -48,6 +48,7 @@ struct conn_t {
   int logical_index;
   int closed;
   void *http2;
+  void *tls_session; // SSL* for https:// client connections; otherwise null.
 };
 
 extern int rpc_dispatch(conn_t *conn, int parity);

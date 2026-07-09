@@ -16,6 +16,9 @@
 #include <mutex>
 #include <netdb.h>
 #include <netinet/tcp.h>
+#ifdef LUPINE_TLS_OPENSSL
+#include <openssl/ssl.h>
+#endif
 #include <pthread.h>
 #include <signal.h>
 #include <sstream>
@@ -89,6 +92,7 @@ void *rpc_client_dispatch_thread(void *arg);
 struct lupine_server_endpoint {
   std::string host;
   std::string port;
+  bool tls = false;
 };
 
 static CUresult lupine_remote_cuInit(conn_t *conn, unsigned int flags);
@@ -595,11 +599,11 @@ static int lupine_connect_endpoint(conn_t *conn,
       setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, (char *)&flag,
                  sizeof(flag)) < 0 ||
       connect(sockfd, res->ai_addr, res->ai_addrlen) < 0) {
-    LUPINE_LOG_ERROR("Connecting to " << endpoint.host << " port "
-                                      << endpoint.port << " failed: "
-                                      << (gai_status != 0
-                                              ? gai_strerror(gai_status)
-                                              : strerror(errno)));
+    LUPINE_LOG_ERROR("Connecting to "
+                     << endpoint.host << " port " << endpoint.port
+                     << " failed: "
+                     << (gai_status != 0 ? gai_strerror(gai_status)
+                                         : strerror(errno)));
     goto error;
   }
 
@@ -610,6 +614,41 @@ static int lupine_connect_endpoint(conn_t *conn,
   conn->closed = 0;
   conn->local_request_parity = conn->request_id & 1;
   conn->logical_index = static_cast<int>(logical_index);
+  if (endpoint.tls) {
+#ifdef LUPINE_TLS_OPENSSL
+    static SSL_CTX *tls_ctx = []() {
+      SSL_CTX *c = SSL_CTX_new(TLS_client_method());
+      if (c != nullptr) {
+        SSL_CTX_set_min_proto_version(c, TLS1_2_VERSION);
+        SSL_CTX_set_default_verify_paths(c);
+        SSL_CTX_set_verify(c, SSL_VERIFY_PEER, nullptr);
+      }
+      return c;
+    }();
+    SSL *ssl = tls_ctx != nullptr ? SSL_new(tls_ctx) : nullptr;
+    if (ssl != nullptr &&
+        SSL_set_tlsext_host_name(ssl, endpoint.host.c_str()) == 1 &&
+        SSL_set1_host(ssl, endpoint.host.c_str()) == 1 &&
+        SSL_set_fd(ssl, static_cast<int>(sockfd)) == 1 &&
+        SSL_connect(ssl) == 1) {
+      conn->tls_session = ssl;
+    } else {
+      if (ssl != nullptr) {
+        SSL_free(ssl);
+      }
+      LUPINE_LOG_ERROR("TLS handshake with " << endpoint.host << " failed");
+      close(sockfd);
+      goto error;
+    }
+#else
+    LUPINE_LOG_ERROR("LUPINE_SERVER entry "
+                     << endpoint.host << ":" << endpoint.port
+                     << " uses https:// but this client was built "
+                        "without TLS support");
+    close(sockfd);
+    goto error;
+#endif
+  }
   if (pthread_mutex_init(&conn->read_mutex, NULL) != 0 ||
       pthread_mutex_init(&conn->write_mutex, NULL) != 0 ||
       pthread_mutex_init(&conn->call_mutex, NULL) != 0 ||
@@ -659,7 +698,8 @@ static conn_t *lupine_thread_conn_by_index(unsigned int index) {
   // The Linux server forks one child process per accepted connection. CUDA
   // object handles, including primary-context handles used by libcudart, are
   // only valid inside that child process. Keep all client host threads on the
-  // same connection and mirror thread-local current context with cuCtxSetCurrent.
+  // same connection and mirror thread-local current context with
+  // cuCtxSetCurrent.
   return &conns[index];
 }
 
@@ -3186,7 +3226,8 @@ static CUresult lupine_set_current_context_on_route(lupine_route route,
 
   conn_t *conn = lupine_route_remote_conn(route);
   CUresult return_value = CUDA_ERROR_DEVICE_UNAVAILABLE;
-  if (conn == nullptr || rpc_write_start_request(conn, RPC_cuCtxSetCurrent) < 0 ||
+  if (conn == nullptr ||
+      rpc_write_start_request(conn, RPC_cuCtxSetCurrent) < 0 ||
       rpc_write(conn, &ctx, sizeof(ctx)) < 0 ||
       rpc_wait_for_response(conn) < 0 ||
       rpc_read(conn, &return_value, sizeof(return_value)) < 0 ||
@@ -8938,6 +8979,13 @@ static void lupine_rpc_shutdown() {
 
   for (int i = 0; i < count; ++i) {
     lupine_join_connection_threads(&conns[i]);
+#ifdef LUPINE_TLS_OPENSSL
+    // Safe now: the read thread is joined, so nothing touches the SSL*.
+    if (conns[i].tls_session != nullptr) {
+      SSL_free(static_cast<SSL *>(conns[i].tls_session));
+      conns[i].tls_session = nullptr;
+    }
+#endif
     rpc_write_queue_free(&conns[i]);
   }
 
@@ -9106,19 +9154,28 @@ int rpc_open() {
 
     char *host;
     char *port;
+    bool tls = false;
 
-    // Split the string into IP address and port
+    // Optional URL scheme: https:// enables TLS on this connection.
+    if (strncmp(token, "https://", 8) == 0) {
+      tls = true;
+      token += 8;
+    } else if (strncmp(token, "http://", 7) == 0) {
+      token += 7;
+    }
+
+    // Split the remaining string into host and port.
     char *colon = strchr(token, ':');
     if (colon == NULL) {
       host = token;
-      port = const_cast<char *>(DEFAULT_PORT);
+      port = const_cast<char *>(tls ? "443" : DEFAULT_PORT);
     } else {
       *colon = '\0';
       host = token;
       port = colon + 1;
     }
 
-    lupine_server_endpoint endpoint{host, port};
+    lupine_server_endpoint endpoint{host, port, tls};
     if (lupine_connect_endpoint(&conns[nconns], endpoint,
                                 static_cast<unsigned int>(nconns)) < 0) {
       continue;
