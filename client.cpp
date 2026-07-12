@@ -566,6 +566,8 @@ static int lupine_connect_endpoint(conn_t *conn,
   }
 
   rpc_write_queue_free(conn);
+  // A new transport gets fresh server lane threads with no CUDA context.
+  lupine_invalidate_current_context_cache();
   *conn = {};
   conn->connfd = sockfd;
   conn->request_id = 0;
@@ -728,7 +730,8 @@ static int lupine_route_identity(lupine_route route) {
     return -1;
   }
   if (route.kind == LUPINE_ROUTE_REMOTE) {
-    return lupine_conn_index(route.conn);
+    int index = lupine_conn_index(route.conn);
+    return index >= 0 ? index : -2;
   }
   return -2;
 }
@@ -3260,37 +3263,6 @@ static thread_local CUcontext lupine_current_context = nullptr;
 static thread_local CUcontext lupine_default_context_hint = nullptr;
 static std::atomic<CUcontext> lupine_global_default_context_hint{nullptr};
 static thread_local auto *lupine_context_stack = new std::vector<CUcontext>();
-static std::atomic<unsigned long long> lupine_context_cache_generation{0};
-static thread_local bool lupine_ctx_get_device_cache_valid = false;
-static thread_local unsigned long long lupine_ctx_get_device_cache_generation =
-    0;
-static thread_local CUcontext lupine_ctx_get_device_cache_context = nullptr;
-static thread_local CUdevice lupine_ctx_get_device_cache_device = -1;
-
-extern "C" void lupine_invalidate_current_context_cache() {
-  lupine_context_cache_generation.fetch_add(1, std::memory_order_acq_rel);
-  lupine_ctx_get_device_cache_valid = false;
-}
-
-static void lupine_cache_current_context_device(CUdevice device) {
-  lupine_ctx_get_device_cache_generation =
-      lupine_context_cache_generation.load(std::memory_order_acquire);
-  lupine_ctx_get_device_cache_context = lupine_current_context;
-  lupine_ctx_get_device_cache_device = device;
-  lupine_ctx_get_device_cache_valid = true;
-}
-
-static bool lupine_cached_current_context_device(CUdevice *device) {
-  unsigned long long generation =
-      lupine_context_cache_generation.load(std::memory_order_acquire);
-  if (device == nullptr || !lupine_ctx_get_device_cache_valid ||
-      lupine_ctx_get_device_cache_generation != generation ||
-      lupine_ctx_get_device_cache_context != lupine_current_context) {
-    return false;
-  }
-  *device = lupine_ctx_get_device_cache_device;
-  return true;
-}
 
 extern "C" lupine_route lupine_route_for_current_context() {
   return lupine_route_for_context(lupine_current_context);
@@ -3301,23 +3273,25 @@ static CUresult lupine_set_current_context_on_route(lupine_route route,
   if (route.kind == LUPINE_ROUTE_INVALID) {
     return CUDA_ERROR_DEVICE_UNAVAILABLE;
   }
+  uint64_t epoch = lupine_lane_context_cache_epoch();
+  CUresult result = CUDA_ERROR_DEVICE_UNAVAILABLE;
   if (lupine_route_is_local(route)) {
     using real_fn_t = CUresult (*)(CUcontext);
     auto real = lupine_real_cuda_fn<real_fn_t>("cuCtxSetCurrent");
-    return real == nullptr ? CUDA_ERROR_DEVICE_UNAVAILABLE : real(ctx);
+    result = real == nullptr ? CUDA_ERROR_DEVICE_UNAVAILABLE : real(ctx);
+  } else {
+    conn_t *conn = lupine_route_remote_conn(route);
+    if (conn == nullptr ||
+        rpc_write_start_request(conn, RPC_cuCtxSetCurrent) < 0 ||
+        rpc_write(conn, &ctx, sizeof(ctx)) < 0 ||
+        rpc_wait_for_response(conn) < 0 ||
+        rpc_read(conn, &result, sizeof(result)) < 0 || rpc_read_end(conn) < 0) {
+      result = CUDA_ERROR_DEVICE_UNAVAILABLE;
+    }
   }
-
-  conn_t *conn = lupine_route_remote_conn(route);
-  CUresult return_value = CUDA_ERROR_DEVICE_UNAVAILABLE;
-  if (conn == nullptr ||
-      rpc_write_start_request(conn, RPC_cuCtxSetCurrent) < 0 ||
-      rpc_write(conn, &ctx, sizeof(ctx)) < 0 ||
-      rpc_wait_for_response(conn) < 0 ||
-      rpc_read(conn, &return_value, sizeof(return_value)) < 0 ||
-      rpc_read_end(conn) < 0) {
-    return CUDA_ERROR_DEVICE_UNAVAILABLE;
-  }
-  return return_value;
+  lupine_lane_context_cache_update(lupine_route_identity(route), ctx, epoch,
+                                   result == CUDA_SUCCESS);
+  return result;
 }
 
 static lupine_route lupine_route_for_default_context_hint(CUcontext ctx) {
@@ -3340,12 +3314,16 @@ static lupine_route lupine_route_for_default_context_hint(CUcontext ctx) {
     return route;
   }
 
-  CUresult result = lupine_set_current_context_on_route(route, ctx);
-  if (result != CUDA_SUCCESS) {
-    return lupine_route{LUPINE_ROUTE_INVALID, nullptr};
+  if (!lupine_lane_context_cache_matches(lupine_route_identity(route), ctx)) {
+    CUresult result = lupine_set_current_context_on_route(route, ctx);
+    if (result != CUDA_SUCCESS) {
+      return lupine_route{LUPINE_ROUTE_INVALID, nullptr};
+    }
   }
-  lupine_current_context = ctx;
-  lupine_invalidate_current_context_cache();
+  if (lupine_current_context != ctx) {
+    lupine_current_context = ctx;
+    lupine_current_context_device_cache_invalidate();
+  }
   return route;
 }
 
@@ -3393,25 +3371,28 @@ static CUresult lupine_set_remote_current_context(CUcontext ctx) {
 
 extern "C" void lupine_note_ctx_create(CUcontext ctx, conn_t *conn) {
   lupine_note_context_owner(ctx, conn);
+  lupine_lane_context_cache_store(
+      lupine_route_identity(lupine_remote_route_for_conn(conn)), ctx);
   lupine_context_stack->push_back(lupine_current_context);
   lupine_current_context = ctx;
   if (ctx != nullptr) {
     lupine_default_context_hint = ctx;
     lupine_global_default_context_hint.store(ctx, std::memory_order_relaxed);
   }
-  lupine_invalidate_current_context_cache();
+  lupine_current_context_device_cache_invalidate();
 }
 
 extern "C" void lupine_note_ctx_create_route(CUcontext ctx,
                                              lupine_route route) {
   lupine_note_context_owner_route(ctx, route);
+  lupine_lane_context_cache_store(lupine_route_identity(route), ctx);
   lupine_context_stack->push_back(lupine_current_context);
   lupine_current_context = ctx;
   if (ctx != nullptr) {
     lupine_default_context_hint = ctx;
     lupine_global_default_context_hint.store(ctx, std::memory_order_relaxed);
   }
-  lupine_invalidate_current_context_cache();
+  lupine_current_context_device_cache_invalidate();
 }
 
 extern "C" CUresult lupine_cuCtxPushCurrent_virtual(CUcontext ctx) {
@@ -3423,7 +3404,7 @@ extern "C" CUresult lupine_cuCtxPushCurrent_virtual(CUcontext ctx) {
       lupine_default_context_hint = ctx;
       lupine_global_default_context_hint.store(ctx, std::memory_order_relaxed);
     }
-    lupine_invalidate_current_context_cache();
+    lupine_current_context_device_cache_invalidate();
   } else {
     lupine_context_stack->pop_back();
   }
@@ -3448,7 +3429,7 @@ extern "C" CUresult lupine_cuCtxPopCurrent_virtual(CUcontext *pctx) {
       lupine_global_default_context_hint.store(previous,
                                                std::memory_order_relaxed);
     }
-    lupine_invalidate_current_context_cache();
+    lupine_current_context_device_cache_invalidate();
   } else {
     lupine_context_stack->push_back(previous);
   }
@@ -3463,7 +3444,7 @@ extern "C" CUresult lupine_cuCtxSetCurrent_virtual(CUcontext ctx) {
       lupine_default_context_hint = ctx;
       lupine_global_default_context_hint.store(ctx, std::memory_order_relaxed);
     }
-    lupine_invalidate_current_context_cache();
+    lupine_current_context_device_cache_invalidate();
   }
   return result;
 }
@@ -3480,7 +3461,8 @@ extern "C" CUresult lupine_cuCtxGetDevice_cached(CUdevice *device) {
   if (device == nullptr) {
     return CUDA_ERROR_INVALID_VALUE;
   }
-  if (lupine_cached_current_context_device(device)) {
+  if (lupine_current_context_device_cache_lookup(lupine_current_context,
+                                                 device)) {
     return CUDA_SUCCESS;
   }
 
@@ -3493,7 +3475,8 @@ extern "C" CUresult lupine_cuCtxGetDevice_cached(CUdevice *device) {
     }
     CUresult result = real(device);
     if (result == CUDA_SUCCESS) {
-      lupine_cache_current_context_device(*device);
+      lupine_current_context_device_cache_insert(lupine_current_context,
+                                                 *device);
     }
     return result;
   }
@@ -3510,7 +3493,7 @@ extern "C" CUresult lupine_cuCtxGetDevice_cached(CUdevice *device) {
   }
   if (return_value == CUDA_SUCCESS) {
     *device = lupine_local_device_for_remote(conn, remote_device);
-    lupine_cache_current_context_device(*device);
+    lupine_current_context_device_cache_insert(lupine_current_context, *device);
   }
   return return_value;
 }
@@ -9017,6 +9000,10 @@ void rpc_close(conn_t *conn) {
   if (conn == nullptr) {
     return;
   }
+
+  // A reopened connection reuses the static conn_t slot but gets fresh server
+  // lane threads with no CUDA context. Invalidate all per-lane context hints.
+  lupine_invalidate_current_context_cache();
 
   if (!conn->closed) {
     conn->closed = 1;
