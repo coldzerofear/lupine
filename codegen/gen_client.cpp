@@ -50,13 +50,15 @@ extern "C" void lupine_note_deviceptr_allocation(CUdeviceptr ptr, size_t size,
 
 extern "C" void lupine_forget_deviceptr_owner(CUdeviceptr ptr);
 
-extern "C" void lupine_record_library_kernel(CUkernel kernel, CUlibrary library,
-                                             const char *name,
-                                             lupine_route route);
+extern "C" CUresult lupine_record_library_kernel(CUkernel kernel,
+                                                 CUlibrary library,
+                                                 const char *name,
+                                                 lupine_route route);
 
-extern "C" void lupine_record_module_function(CUfunction function,
-                                              CUmodule module, const char *name,
-                                              lupine_route route);
+extern "C" CUresult lupine_record_module_function(CUfunction function,
+                                                  CUmodule module,
+                                                  const char *name,
+                                                  lupine_route route);
 
 extern "C" void lupine_prepare_host_range_write(void *host, size_t size);
 extern "C" void lupine_mark_host_range_clean(void *host, size_t size);
@@ -74,7 +76,7 @@ extern "C" CUresult lupine_cuCtxSetCurrent_virtual(CUcontext ctx);
 extern "C" CUresult lupine_cuCtxGetCurrent_virtual(CUcontext *pctx);
 extern "C" CUresult lupine_cuCtxGetDevice_cached(CUdevice *device);
 extern "C" void lupine_invalidate_current_context_cache();
-extern "C" void lupine_invalidate_kernel_param_layout_cache();
+extern "C" void lupine_invalidate_function_caches();
 extern "C" CUresult
 lupine_cuDevicePrimaryCtxGetState_cached(CUdevice dev, unsigned int *flags,
                                          int *active);
@@ -87,6 +89,14 @@ lupine_cuDeviceGetAttribute_cached(int *pi, CUdevice_attribute attrib,
                                    CUdevice dev);
 extern "C" CUresult lupine_cuKernelGetFunction_cached(CUfunction *pFunc,
                                                       CUkernel kernel);
+extern "C" CUresult lupine_cuKernelGetParamInfo_cached(CUkernel kernel,
+                                                       size_t paramIndex,
+                                                       size_t *paramOffset,
+                                                       size_t *paramSize);
+extern "C" CUresult lupine_cuFuncGetParamInfo_cached(CUfunction func,
+                                                     size_t paramIndex,
+                                                     size_t *paramOffset,
+                                                     size_t *paramSize);
 extern "C" CUresult lupine_cuOccupancyMaxActiveBlocksPerMultiprocessor_cached(
     int *numBlocks, CUfunction func, int blockSize, size_t dynamicSMemSize);
 extern "C" CUresult
@@ -451,8 +461,6 @@ CUresult cuDevicePrimaryCtxRelease_v2(CUdevice dev) {
       lupine_invalidate_primary_context_state(dev);
     if (return_value == CUDA_SUCCESS)
       lupine_invalidate_current_context_cache();
-    if (return_value == CUDA_SUCCESS)
-      lupine_invalidate_kernel_param_layout_cache();
     return return_value;
   }
   conn_t *conn = lupine_route_remote_conn(route);
@@ -467,8 +475,6 @@ CUresult cuDevicePrimaryCtxRelease_v2(CUdevice dev) {
     lupine_invalidate_primary_context_state(dev);
   if (return_value == CUDA_SUCCESS)
     lupine_invalidate_current_context_cache();
-  if (return_value == CUDA_SUCCESS)
-    lupine_invalidate_kernel_param_layout_cache();
   return return_value;
 }
 
@@ -511,8 +517,6 @@ CUresult cuDevicePrimaryCtxReset_v2(CUdevice dev) {
       lupine_invalidate_primary_context_state(dev);
     if (return_value == CUDA_SUCCESS)
       lupine_invalidate_current_context_cache();
-    if (return_value == CUDA_SUCCESS)
-      lupine_invalidate_kernel_param_layout_cache();
     return return_value;
   }
   conn_t *conn = lupine_route_remote_conn(route);
@@ -527,8 +531,6 @@ CUresult cuDevicePrimaryCtxReset_v2(CUdevice dev) {
     lupine_invalidate_primary_context_state(dev);
   if (return_value == CUDA_SUCCESS)
     lupine_invalidate_current_context_cache();
-  if (return_value == CUDA_SUCCESS)
-    lupine_invalidate_kernel_param_layout_cache();
   return return_value;
 }
 
@@ -540,8 +542,6 @@ CUresult cuCtxDestroy_v2(CUcontext ctx) {
                                                   &return_value, ctx)) {
     if (return_value == CUDA_SUCCESS)
       lupine_invalidate_current_context_cache();
-    if (return_value == CUDA_SUCCESS)
-      lupine_invalidate_kernel_param_layout_cache();
     return return_value;
   }
   conn_t *conn = lupine_route_remote_conn(route);
@@ -554,8 +554,6 @@ CUresult cuCtxDestroy_v2(CUcontext ctx) {
     return CUDA_ERROR_DEVICE_UNAVAILABLE;
   if (return_value == CUDA_SUCCESS)
     lupine_invalidate_current_context_cache();
-  if (return_value == CUDA_SUCCESS)
-    lupine_invalidate_kernel_param_layout_cache();
   return return_value;
 }
 
@@ -806,8 +804,6 @@ CUresult cuCtxDetach(CUcontext ctx) {
                                                   &return_value, ctx)) {
     if (return_value == CUDA_SUCCESS)
       lupine_invalidate_current_context_cache();
-    if (return_value == CUDA_SUCCESS)
-      lupine_invalidate_kernel_param_layout_cache();
     return return_value;
   }
   conn_t *conn = lupine_route_remote_conn(route);
@@ -819,8 +815,6 @@ CUresult cuCtxDetach(CUcontext ctx) {
     return CUDA_ERROR_DEVICE_UNAVAILABLE;
   if (return_value == CUDA_SUCCESS)
     lupine_invalidate_current_context_cache();
-  if (return_value == CUDA_SUCCESS)
-    lupine_invalidate_kernel_param_layout_cache();
   return return_value;
 }
 
@@ -869,7 +863,7 @@ CUresult cuModuleUnload(CUmodule hmod) {
   if (lupine_call_local_cuda_if_routed<real_fn_t>(route, "cuModuleUnload",
                                                   &return_value, hmod)) {
     if (return_value == CUDA_SUCCESS)
-      lupine_invalidate_kernel_param_layout_cache();
+      lupine_invalidate_function_caches();
     return return_value;
   }
   conn_t *conn = lupine_route_remote_conn(route);
@@ -881,7 +875,7 @@ CUresult cuModuleUnload(CUmodule hmod) {
       rpc_read_end(conn) < 0)
     return CUDA_ERROR_DEVICE_UNAVAILABLE;
   if (return_value == CUDA_SUCCESS)
-    lupine_invalidate_kernel_param_layout_cache();
+    lupine_invalidate_function_caches();
   return return_value;
 }
 
@@ -916,7 +910,7 @@ CUresult cuModuleGetFunction(CUfunction *hfunc, CUmodule hmod,
       lupine_note_function_owner_route(*hfunc, route);
     }
     if (return_value == CUDA_SUCCESS && hfunc != nullptr)
-      lupine_record_module_function(*hfunc, hmod, name, route);
+      return_value = lupine_record_module_function(*hfunc, hmod, name, route);
     return return_value;
   }
   conn_t *conn = lupine_route_remote_conn(route);
@@ -934,7 +928,7 @@ CUresult cuModuleGetFunction(CUfunction *hfunc, CUmodule hmod,
     lupine_note_function_owner_route(*hfunc, route);
   }
   if (return_value == CUDA_SUCCESS && hfunc != nullptr)
-    lupine_record_module_function(*hfunc, hmod, name, route);
+    return_value = lupine_record_module_function(*hfunc, hmod, name, route);
   return return_value;
 }
 
@@ -1072,7 +1066,7 @@ CUresult cuLibraryUnload(CUlibrary library) {
   if (lupine_call_local_cuda_if_routed<real_fn_t>(route, "cuLibraryUnload",
                                                   &return_value, library)) {
     if (return_value == CUDA_SUCCESS)
-      lupine_invalidate_kernel_param_layout_cache();
+      lupine_invalidate_function_caches();
     return return_value;
   }
   conn_t *conn = lupine_route_remote_conn(route);
@@ -1084,7 +1078,7 @@ CUresult cuLibraryUnload(CUlibrary library) {
       rpc_read_end(conn) < 0)
     return CUDA_ERROR_DEVICE_UNAVAILABLE;
   if (return_value == CUDA_SUCCESS)
-    lupine_invalidate_kernel_param_layout_cache();
+    lupine_invalidate_function_caches();
   return return_value;
 }
 
@@ -1096,7 +1090,8 @@ CUresult cuLibraryGetKernel(CUkernel *pKernel, CUlibrary library,
   if (lupine_call_local_cuda_if_routed<real_fn_t>(
           route, "cuLibraryGetKernel", &return_value, pKernel, library, name)) {
     if (return_value == CUDA_SUCCESS && pKernel != nullptr)
-      lupine_record_library_kernel(*pKernel, library, name, route);
+      return_value =
+          lupine_record_library_kernel(*pKernel, library, name, route);
     return return_value;
   }
   conn_t *conn = lupine_route_remote_conn(route);
@@ -1111,7 +1106,7 @@ CUresult cuLibraryGetKernel(CUkernel *pKernel, CUlibrary library,
       rpc_read_end(conn) < 0)
     return CUDA_ERROR_DEVICE_UNAVAILABLE;
   if (return_value == CUDA_SUCCESS && pKernel != nullptr)
-    lupine_record_library_kernel(*pKernel, library, name, route);
+    return_value = lupine_record_library_kernel(*pKernel, library, name, route);
   return return_value;
 }
 
@@ -1288,6 +1283,12 @@ CUresult cuKernelSetCacheConfig(CUkernel kernel, CUfunc_cache config,
       rpc_read_end(conn) < 0)
     return CUDA_ERROR_DEVICE_UNAVAILABLE;
   return return_value;
+}
+
+CUresult cuKernelGetParamInfo(CUkernel kernel, size_t paramIndex,
+                              size_t *paramOffset, size_t *paramSize) {
+  return lupine_cuKernelGetParamInfo_cached(kernel, paramIndex, paramOffset,
+                                            paramSize);
 }
 
 CUresult cuMemGetInfo_v2(size_t *free, size_t *total) {
@@ -4027,6 +4028,12 @@ CUresult cuFuncGetModule(CUmodule *hmod, CUfunction hfunc) {
     lupine_note_module_owner_route(*hmod, route);
   }
   return return_value;
+}
+
+CUresult cuFuncGetParamInfo(CUfunction func, size_t paramIndex,
+                            size_t *paramOffset, size_t *paramSize) {
+  return lupine_cuFuncGetParamInfo_cached(func, paramIndex, paramOffset,
+                                          paramSize);
 }
 
 CUresult
@@ -7609,6 +7616,7 @@ std::unordered_map<std::string, void *> functionMap = {
     {"cuKernelGetAttribute", (void *)cuKernelGetAttribute},
     {"cuKernelSetAttribute", (void *)cuKernelSetAttribute},
     {"cuKernelSetCacheConfig", (void *)cuKernelSetCacheConfig},
+    {"cuKernelGetParamInfo", (void *)cuKernelGetParamInfo},
     {"cuMemGetInfo_v2", (void *)cuMemGetInfo_v2},
     {"cuMemAlloc_v2", (void *)cuMemAlloc_v2},
     {"cuMemAllocPitch_v2", (void *)cuMemAllocPitch_v2},
@@ -7732,6 +7740,7 @@ std::unordered_map<std::string, void *> functionMap = {
     {"cuFuncSetAttribute", (void *)cuFuncSetAttribute},
     {"cuFuncSetCacheConfig", (void *)cuFuncSetCacheConfig},
     {"cuFuncGetModule", (void *)cuFuncGetModule},
+    {"cuFuncGetParamInfo", (void *)cuFuncGetParamInfo},
     {"cuLaunchCooperativeKernel", (void *)cuLaunchCooperativeKernel},
     {"cuLaunchCooperativeKernelMultiDevice",
      (void *)cuLaunchCooperativeKernelMultiDevice},
