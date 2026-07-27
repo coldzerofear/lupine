@@ -148,7 +148,10 @@ endif()
 
 add_executable(${SERVER_OUTPUT} ${SERVER_SOURCES} ${SERVER_HEADERS})
 target_include_directories(${SERVER_OUTPUT} PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
-target_compile_definitions(${SERVER_OUTPUT} PRIVATE LUPINE_RPC_SERVER)
+target_compile_definitions(${SERVER_OUTPUT} PRIVATE
+    LUPINE_RPC_SERVER
+    LUPINE_CUDA_VERSION="${CUDAToolkit_VERSION}"
+)
 target_link_libraries(${SERVER_OUTPUT} PRIVATE CUDA::cuda_driver ${NGHTTP2_LIBRARY} lupine_lz4)
 
 if (WIN32)
@@ -156,17 +159,29 @@ if (WIN32)
 else()
     target_link_libraries(${SERVER_OUTPUT} PRIVATE dl)
 
-    add_executable(h2_test
+    set(H2_TEST_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/h2.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/rpc.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/compress.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/h2_test.cpp
     )
+    add_executable(h2_test ${H2_TEST_SOURCES})
+    target_compile_definitions(h2_test PRIVATE
+        LUPINE_CUDA_VERSION="${CUDAToolkit_VERSION}"
+    )
     target_link_libraries(h2_test PRIVATE stdc++ ${NGHTTP2_LIBRARY} lupine_lz4 pthread)
+
+    add_executable(h2_unknown_cuda_version_test ${H2_TEST_SOURCES})
+    target_compile_definitions(h2_unknown_cuda_version_test PRIVATE
+        LUPINE_H2_UNKNOWN_CUDA_VERSION_TEST
+    )
+    target_link_libraries(h2_unknown_cuda_version_test PRIVATE stdc++ ${NGHTTP2_LIBRARY} lupine_lz4 pthread)
 
     enable_testing()
     add_test(NAME h2_test COMMAND h2_test)
     set_tests_properties(h2_test PROPERTIES TIMEOUT 30)
+    add_test(NAME h2_unknown_cuda_version_test COMMAND h2_unknown_cuda_version_test)
+    set_tests_properties(h2_unknown_cuda_version_test PROPERTIES TIMEOUT 10)
 
     add_executable(checkpoint_test
         ${CMAKE_CURRENT_SOURCE_DIR}/checkpoint.cpp
