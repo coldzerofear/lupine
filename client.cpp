@@ -7689,6 +7689,7 @@ lupine_manual_function_map() {
       {"cuMemcpy3D", (void *)cuMemcpy3D_v2},
       {"cuMemcpy3D_v2", (void *)cuMemcpy3D_v2},
       {"cuPointerGetAttribute", (void *)cuPointerGetAttribute},
+      {"cuPointerSetAttribute", (void *)cuPointerSetAttribute},
       {"cuGetExportTable", (void *)cuGetExportTable},
       {"cuModuleLoad", (void *)cuModuleLoad},
       {"cuModuleLoadData", (void *)cuModuleLoadData},
