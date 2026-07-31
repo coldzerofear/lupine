@@ -429,6 +429,28 @@ def test_sidecar_keeps_handles_of_live_tensors(monkeypatch):
     assert tensor._lupine_handle == 7
 
 
+def test_sidecar_keeps_worker_after_unserializable_argument():
+    tensor_support._ensure_registered()
+    proc = subprocess.Popen(
+        [sys.executable, "-u", "-c", sidecar._worker_source()],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    session = sidecar.SidecarSession(server="host-a:14833")
+    session._proc = proc
+    session._lock = threading.Lock()
+    try:
+        with pytest.raises(sidecar.SidecarError, match="cannot send this operation"):
+            session.forward(torch.ops.aten.full.default, ((2,), 1 + 2j), {})
+
+        assert "torch" in session._request({"op": "ping"})
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+        proc.wait(timeout=5)
+
+
 def test_sidecar_worker_survives_an_unserializable_result():
     proc = subprocess.Popen(
         [sys.executable, "-u", "-c", sidecar._worker_source()],
