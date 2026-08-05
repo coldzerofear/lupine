@@ -697,19 +697,6 @@ extern "C" CUresult cuDeviceGetP2PAttribute(int *value,
     return CUDA_ERROR_DEVICE_UNAVAILABLE;
   }
 
-#if CUDA_VERSION >= 13010
-  constexpr CUdevice_P2PAttribute max_attribute =
-      CU_DEVICE_P2P_ATTRIBUTE_ONLY_PARTIAL_NATIVE_ATOMIC_SUPPORTED;
-#else
-  constexpr CUdevice_P2PAttribute max_attribute =
-      CU_DEVICE_P2P_ATTRIBUTE_CUDA_ARRAY_ACCESS_SUPPORTED;
-#endif
-  int attribute = static_cast<int>(attrib);
-  if (attribute < static_cast<int>(CU_DEVICE_P2P_ATTRIBUTE_PERFORMANCE_RANK) ||
-      attribute > static_cast<int>(max_attribute)) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-
   if (!lupine_routes_share_server(src_route, dst_route)) {
     *value = 0;
     return CUDA_SUCCESS;
