@@ -194,6 +194,14 @@ class ArrayOperation:
                 error_return=error_return,
             )
         )
+        if self.compressible:
+            # Refresh stale mapped mirrors before the connection is held.
+            f.write(
+                "    lupine_ensure_mapped_host_readable({param_name}, {size});\n".format(
+                    param_name=self.parameter.name,
+                    size=self.transfer_size_expr(),
+                )
+            )
 
     def client_rpc_write(self, f):
         if self.iter:
@@ -255,8 +263,9 @@ class ArrayOperation:
     def client_post_rpc_read_success(self, f):
         if not self.recv:
             return
+        # Unconditional: the prepare pin must drop even on error returns.
         f.write(
-            "    if (return_value == CUDA_SUCCESS) lupine_mark_host_range_clean({param_name}, {size});\n".format(
+            "    lupine_mark_host_range_clean({param_name}, {size});\n".format(
                 param_name=self.parameter.name,
                 size=self.transfer_size_expr(),
             )

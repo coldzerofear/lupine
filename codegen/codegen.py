@@ -1315,7 +1315,8 @@ def main():
             'extern "C" CUresult lupine_flush_dirty_host_pages_to_server();\n\n'
             'extern "C" int lupine_read_deferred_dtoh_copies(conn_t *conn);\n'
             'extern "C" int lupine_forward_remote_stdout(conn_t *conn);\n'
-            'extern "C" CUresult lupine_sync_mapped_device_to_host();\n\n'
+            'extern "C" CUresult lupine_sync_mapped_device_to_host();\n'
+            'extern "C" void lupine_ensure_mapped_host_readable(const void *host, size_t size);\n\n'
         )
         for function, annotation, operations, metadata in functions_with_annotations:
             # We don't generate client function definitions for client-disabled

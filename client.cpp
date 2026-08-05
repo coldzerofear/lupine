@@ -3333,6 +3333,7 @@ extern "C" int lupine_read_deferred_dtoh_copies(conn_t *conn) {
     }
     lupine_prepare_host_range_write(dst, bytes);
     if (rpc_read_payload(conn, dst, bytes) < 0) {
+      lupine_mark_host_range_clean(dst, bytes);
       return -1;
     }
     lupine_mark_host_range_clean(dst, bytes);
@@ -4278,18 +4279,22 @@ extern "C" CUresult cuMemcpyAtoH_v2(void *dstHost, CUarray srcArray,
         (return_value == CUDA_SUCCESS && chunk != 0 &&
          rpc_read(conn, copy_dst + offset, chunk) < 0)) {
       rpc_read_end(conn);
+      lupine_mark_host_range_clean(dstHost, ByteCount);
       return CUDA_ERROR_DEVICE_UNAVAILABLE;
     }
     bool final_chunk =
         return_value != CUDA_SUCCESS || offset + chunk == ByteCount;
     if (rpc_read_end(conn) < 0) {
+      lupine_mark_host_range_clean(dstHost, ByteCount);
       return CUDA_ERROR_DEVICE_UNAVAILABLE;
     }
     if (return_value != CUDA_SUCCESS) {
+      lupine_mark_host_range_clean(dstHost, ByteCount);
       return return_value;
     }
     offset += chunk;
     if (!final_chunk && rpc_read_start(conn, request_id) < 0) {
+      lupine_mark_host_range_clean(dstHost, ByteCount);
       return CUDA_ERROR_DEVICE_UNAVAILABLE;
     }
   } while (offset < ByteCount);
@@ -4443,14 +4448,18 @@ static CUresult lupine_cuMemcpy2D_common(const CUDA_MEMCPY2D *pCopy,
   if (returned_dst_size != 0) {
     lupine_prepare_host_range_write(dst_host, returned_dst_size);
     if (rpc_read(conn, dst_host, returned_dst_size) < 0) {
+      lupine_mark_host_range_clean(dst_host, returned_dst_size);
       return CUDA_ERROR_DEVICE_UNAVAILABLE;
     }
   }
   if (rpc_read(conn, &return_value, sizeof(return_value)) < 0 ||
       rpc_read_end(conn) < 0) {
+    if (returned_dst_size != 0) {
+      lupine_mark_host_range_clean(dst_host, returned_dst_size);
+    }
     return CUDA_ERROR_DEVICE_UNAVAILABLE;
   }
-  if (return_value == CUDA_SUCCESS && returned_dst_size != 0) {
+  if (returned_dst_size != 0) {
     lupine_mark_host_range_clean(dst_host, returned_dst_size);
   }
   return return_value;
@@ -4593,14 +4602,18 @@ extern "C" CUresult cuMemcpy3D_v2(const CUDA_MEMCPY3D *pCopy) {
   if (returned_dst_size != 0) {
     lupine_prepare_host_range_write(dst_host, returned_dst_size);
     if (rpc_read(conn, dst_host, returned_dst_size) < 0) {
+      lupine_mark_host_range_clean(dst_host, returned_dst_size);
       return CUDA_ERROR_DEVICE_UNAVAILABLE;
     }
   }
   if (rpc_read(conn, &return_value, sizeof(return_value)) < 0 ||
       rpc_read_end(conn) < 0) {
+    if (returned_dst_size != 0) {
+      lupine_mark_host_range_clean(dst_host, returned_dst_size);
+    }
     return CUDA_ERROR_DEVICE_UNAVAILABLE;
   }
-  if (return_value == CUDA_SUCCESS && returned_dst_size != 0) {
+  if (returned_dst_size != 0) {
     lupine_mark_host_range_clean(dst_host, returned_dst_size);
   }
   return return_value;
@@ -6492,8 +6505,7 @@ static CUresult lupine_normalize_context(CUcontext *ctx) {
   if (ctx == nullptr) {
     return CUDA_ERROR_INVALID_VALUE;
   }
-  // The context-local-storage export table accepts (CUcontext)-1 as well as
-  // NULL for "the calling thread's current context".
+  // (CUcontext)-1 also means the calling thread's current context.
   if (*ctx != nullptr &&
       *ctx != reinterpret_cast<CUcontext>(~static_cast<uintptr_t>(0))) {
     return CUDA_SUCCESS;
