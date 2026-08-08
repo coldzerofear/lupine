@@ -30,6 +30,12 @@ struct rpc_http2_read_stats {
 
 #define LUPINE_RPC_TERMINATE_LANE 0xFFFF
 
+// Wire layout for LUPINE_RPC_lupineDeviceSnapshot. The response is all or
+// nothing: a non-success result carries no payload, otherwise every device
+// record holds a fixed-size name buffer, uuid, total memory, and a
+// count-prefixed list of (attribute, value) pairs.
+#define LUPINE_DEVICE_SNAPSHOT_NAME_BYTES 256
+
 typedef struct conn_t conn_t;
 
 struct conn_t {
