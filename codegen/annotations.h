@@ -2463,6 +2463,7 @@ CUresult cuLibraryLoadFromFile(CUlibrary *library, const char *fileName,
  */
 CUresult cuLibraryUnload(CUlibrary library);
 /**
+ * @disabled client - manual client serves the library kernel table
  * @routingkey LIBRARY library
  * @param pKernel RECV_ONLY
  * @param library SEND_ONLY
