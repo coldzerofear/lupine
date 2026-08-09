@@ -52,6 +52,7 @@
 #include "client_routing.h"
 #include "codegen/gen_api.h"
 #include "codegen/gen_client.h"
+#include "events.h"
 #include "ipc.h"
 #include "lupine_attr_sizes.h"
 #include "lupine_fatbin.h"
@@ -3873,6 +3874,110 @@ extern "C" CUresult cuStreamWaitEvent_ptsz(CUstream hStream, CUevent hEvent,
   return cuStreamWaitEvent(hStream, hEvent, Flags);
 }
 
+extern "C" CUresult cuEventRecord(CUevent hEvent, CUstream hStream) {
+  lupine_route route = hStream != nullptr ? lupine_route_for_stream(hStream)
+                                          : lupine_route_for_default();
+  CUresult return_value;
+  using real_fn_t = CUresult (*)(CUevent, CUstream);
+  if (lupine_call_local_cuda_if_routed<real_fn_t>(
+          route, "cuEventRecord", &return_value, hEvent, hStream)) {
+    return return_value;
+  }
+  lupine_note_event_recorded(hEvent);
+  conn_t *conn = lupine_route_remote_conn(route);
+  if (conn == nullptr || rpc_write_start_request(conn, RPC_cuEventRecord) < 0 ||
+      rpc_write(conn, &hEvent, sizeof(hEvent)) < 0 ||
+      rpc_write(conn, &hStream, sizeof(hStream)) < 0 ||
+      rpc_write_end(conn) < 0) {
+    return CUDA_ERROR_DEVICE_UNAVAILABLE;
+  }
+  return CUDA_SUCCESS;
+}
+
+#ifdef cuEventRecord_ptsz
+#undef cuEventRecord_ptsz
+#endif
+extern "C" CUresult cuEventRecord_ptsz(CUevent hEvent, CUstream hStream) {
+  return cuEventRecord(hEvent, hStream);
+}
+
+extern "C" CUresult cuEventRecordWithFlags(CUevent hEvent, CUstream hStream,
+                                           unsigned int flags) {
+  lupine_route route = hStream != nullptr ? lupine_route_for_stream(hStream)
+                                          : lupine_route_for_default();
+  CUresult return_value;
+  using real_fn_t = CUresult (*)(CUevent, CUstream, unsigned int);
+  if (lupine_call_local_cuda_if_routed<real_fn_t>(
+          route, "cuEventRecordWithFlags", &return_value, hEvent, hStream,
+          flags)) {
+    return return_value;
+  }
+  lupine_note_event_recorded(hEvent);
+  conn_t *conn = lupine_route_remote_conn(route);
+  if (conn == nullptr ||
+      rpc_write_start_request(conn, RPC_cuEventRecordWithFlags) < 0 ||
+      rpc_write(conn, &hEvent, sizeof(hEvent)) < 0 ||
+      rpc_write(conn, &hStream, sizeof(hStream)) < 0 ||
+      rpc_write(conn, &flags, sizeof(flags)) < 0 || rpc_write_end(conn) < 0) {
+    return CUDA_ERROR_DEVICE_UNAVAILABLE;
+  }
+  return CUDA_SUCCESS;
+}
+
+#ifdef cuEventRecordWithFlags_ptsz
+#undef cuEventRecordWithFlags_ptsz
+#endif
+extern "C" CUresult cuEventRecordWithFlags_ptsz(CUevent hEvent,
+                                                CUstream hStream,
+                                                unsigned int flags) {
+  return cuEventRecordWithFlags(hEvent, hStream, flags);
+}
+
+extern "C" CUresult cuEventQuery(CUevent hEvent) {
+  CUresult flush_result = lupine_flush_dirty_host_pages_to_server();
+  if (flush_result != CUDA_SUCCESS) {
+    return flush_result;
+  }
+  lupine_route route = lupine_route_for_event(hEvent);
+  CUresult return_value;
+  using real_fn_t = CUresult (*)(CUevent);
+  if (lupine_call_local_cuda_if_routed<real_fn_t>(route, "cuEventQuery",
+                                                  &return_value, hEvent)) {
+    return return_value == CUDA_SUCCESS ? lupine_sync_mapped_device_to_host()
+                                        : return_value;
+  }
+  conn_t *conn = lupine_route_remote_conn(route);
+  if (conn == nullptr) {
+    return CUDA_ERROR_DEVICE_UNAVAILABLE;
+  }
+  CUevent events[kLupineEventQueryBatch];
+  uint64_t recorded[kLupineEventQueryBatch];
+  uint32_t count =
+      lupine_collect_event_query_batch(hEvent, conn, events, recorded);
+  if (count == 0) {
+    return lupine_sync_mapped_device_to_host();
+  }
+  // Sampled before the request so a copy issued while it is in flight is not
+  // mistaken for one the server already drained.
+  uint64_t drained = lupine_async_dtoh_issued_count();
+  CUresult results[kLupineEventQueryBatch];
+  if (rpc_write_start_request(conn, RPC_cuEventQuery) < 0 ||
+      rpc_write(conn, &count, sizeof(count)) < 0 ||
+      rpc_write(conn, events, count * sizeof(events[0])) < 0 ||
+      rpc_wait_for_response(conn) < 0 ||
+      lupine_read_deferred_dtoh_copies(conn) < 0 ||
+      rpc_read(conn, results, count * sizeof(results[0])) < 0 ||
+      rpc_read_end(conn) < 0) {
+    return CUDA_ERROR_DEVICE_UNAVAILABLE;
+  }
+  lupine_note_event_query_results(events, recorded, results, count);
+  if (results[0] != CUDA_SUCCESS) {
+    return results[0];
+  }
+  lupine_note_async_dtoh_drained(drained);
+  return lupine_sync_mapped_device_to_host();
+}
+
 extern "C" CUresult cuCtxCreate_v2(CUcontext *pctx, unsigned int flags,
                                    CUdevice dev) {
   if (pctx == nullptr) {
@@ -4876,6 +4981,7 @@ extern "C" CUresult cuMemcpyAtoH(void *dstHost, CUarray srcArray,
 
 extern "C" CUresult cuMemcpyDtoHAsync_v2(void *dstHost, CUdeviceptr srcDevice,
                                          size_t ByteCount, CUstream hStream) {
+  lupine_note_async_dtoh_copy();
   conn_t *conn = lupine_rpc_conn_for_deviceptr(srcDevice);
   if (conn == nullptr ||
       rpc_write_start_request(conn, RPC_cuMemcpyDtoHAsync_v2) < 0 ||
@@ -8475,6 +8581,10 @@ lupine_manual_function_map() {
       {"cuStreamWaitValue64", (void *)cuStreamWaitValue64_v2},
       {"cuStreamWaitEvent", (void *)cuStreamWaitEvent},
       {"cuStreamWaitEvent_ptsz", (void *)cuStreamWaitEvent_ptsz},
+      {"cuEventRecord", (void *)cuEventRecord},
+      {"cuEventRecord_ptsz", (void *)cuEventRecord_ptsz},
+      {"cuEventRecordWithFlags", (void *)cuEventRecordWithFlags},
+      {"cuEventRecordWithFlags_ptsz", (void *)cuEventRecordWithFlags_ptsz},
       {"cuStreamWriteValue32", (void *)cuStreamWriteValue32_v2},
       {"cuStreamWriteValue64", (void *)cuStreamWriteValue64_v2},
       {"cuStreamBatchMemOp", (void *)cuStreamBatchMemOp_v2},
