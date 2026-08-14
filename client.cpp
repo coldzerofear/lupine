@@ -289,6 +289,28 @@ struct lupine_kernel_attribute_key_hash {
   }
 };
 
+struct lupine_function_attribute_key {
+  int route_id = -2;
+  CUfunction function = nullptr;
+  int attribute = 0;
+
+  bool operator==(const lupine_function_attribute_key &other) const {
+    return route_id == other.route_id && function == other.function &&
+           attribute == other.attribute;
+  }
+};
+
+struct lupine_function_attribute_key_hash {
+  size_t operator()(const lupine_function_attribute_key &key) const {
+    size_t hash = std::hash<int>{}(key.route_id);
+    hash ^= std::hash<uintptr_t>{}(reinterpret_cast<uintptr_t>(key.function)) +
+            0x9e3779b9 + (hash << 6) + (hash >> 2);
+    hash ^= std::hash<int>{}(key.attribute) + 0x9e3779b9 + (hash << 6) +
+            (hash >> 2);
+    return hash;
+  }
+};
+
 struct lupine_param_info_key {
   uintptr_t handle = 0;
   size_t index = 0;
@@ -455,6 +477,15 @@ lupine_kernel_attribute_cache() {
   static auto *cache =
       new libcuckoo::cuckoohash_map<lupine_kernel_attribute_key, int,
                                     lupine_kernel_attribute_key_hash>();
+  return *cache;
+}
+
+static libcuckoo::cuckoohash_map<lupine_function_attribute_key, int,
+                                 lupine_function_attribute_key_hash> &
+lupine_function_attribute_cache() {
+  static auto *cache =
+      new libcuckoo::cuckoohash_map<lupine_function_attribute_key, int,
+                                    lupine_function_attribute_key_hash>();
   return *cache;
 }
 
@@ -2332,6 +2363,50 @@ extern "C" CUresult cuKernelGetAttribute(int *pi, CUfunction_attribute attrib,
   return return_value;
 }
 
+extern "C" CUresult cuFuncGetAttribute(int *pi, CUfunction_attribute attrib,
+                                       CUfunction hfunc) {
+  if (pi == nullptr) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+
+  CUfunction translated = lupine_translate_private_function(hfunc);
+  lupine_route route = lupine_route_for_function(translated);
+  lupine_function_attribute_key key{lupine_route_identity(route), translated,
+                                    static_cast<int>(attrib)};
+  if (lupine_function_attribute_cache().find(key, *pi)) {
+    return CUDA_SUCCESS;
+  }
+
+  using real_fn_t = CUresult (*)(int *, CUfunction_attribute, CUfunction);
+  CUresult return_value;
+  if (lupine_call_local_cuda_if_routed<real_fn_t>(
+          route, "cuFuncGetAttribute", &return_value, pi, attrib, translated)) {
+    if (return_value == CUDA_SUCCESS) {
+      lupine_function_attribute_cache().insert_or_assign(key, *pi);
+    }
+    return return_value;
+  }
+
+  conn_t *conn = lupine_route_remote_conn(route);
+  int value = 0;
+  if (conn == nullptr ||
+      rpc_write_start_request(conn, RPC_cuFuncGetAttribute) < 0 ||
+      rpc_write(conn, &value, sizeof(value)) < 0 ||
+      rpc_write(conn, &attrib, sizeof(attrib)) < 0 ||
+      rpc_write(conn, &translated, sizeof(translated)) < 0 ||
+      rpc_wait_for_response(conn) < 0 ||
+      rpc_read(conn, &value, sizeof(value)) < 0 ||
+      rpc_read(conn, &return_value, sizeof(return_value)) < 0 ||
+      rpc_read_end(conn) < 0) {
+    return CUDA_ERROR_DEVICE_UNAVAILABLE;
+  }
+  if (return_value == CUDA_SUCCESS) {
+    lupine_function_attribute_cache().insert_or_assign(key, value);
+    *pi = value;
+  }
+  return return_value;
+}
+
 extern "C" void lupine_invalidate_kernel_attribute_cache() {
   lupine_kernel_attribute_cache().clear();
 }
@@ -2341,6 +2416,10 @@ extern "C" void lupine_kernel_attribute_cache_erase(int route_id,
                                                     int dev) {
   lupine_kernel_attribute_cache().erase(
       lupine_kernel_attribute_key{route_id, kernel, attrib, dev});
+}
+
+extern "C" void lupine_invalidate_function_attribute_cache() {
+  lupine_function_attribute_cache().clear();
 }
 
 static CUresult lupine_cuOccupancy_cached(int *numBlocks, CUfunction func,
@@ -4526,6 +4605,7 @@ extern "C" void lupine_invalidate_function_caches() {
   lupine_kernel_function_cache().clear();
   lupine_occupancy_cache().clear();
   lupine_kernel_attribute_cache().clear();
+  lupine_function_attribute_cache().clear();
 }
 
 static CUresult lupine_resolve_launch_function_for_route(
