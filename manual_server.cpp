@@ -364,16 +364,12 @@ static void lupine_finish_stdout_capture(lupine_captured_stdout *capture) {
 }
 
 static int lupine_write_captured_stdout(conn_t *conn,
-                                        const lupine_captured_stdout &capture,
-                                        uint64_t *output_size) {
-  if (output_size == nullptr) {
+                                        const lupine_captured_stdout &capture) {
+  uint64_t output_size = capture.output.size();
+  if (rpc_write_copy(conn, &output_size, sizeof(output_size)) < 0) {
     return -1;
   }
-  *output_size = capture.output.size();
-  if (rpc_write(conn, output_size, sizeof(*output_size)) < 0) {
-    return -1;
-  }
-  if (*output_size != 0 &&
+  if (output_size != 0 &&
       rpc_write(conn, capture.output.data(), capture.output.size()) < 0) {
     return -1;
   }
@@ -807,11 +803,11 @@ lupine_detach_pending_dtoh_copies(conn_t *conn, CUstream stream,
 }
 
 static int lupine_write_pending_dtoh_copies(
-    uint32_t *copy_count, conn_t *conn,
-    const std::vector<lupine_pending_dtoh_copy> &pending) {
-  if (copy_count != nullptr) {
-    *copy_count = static_cast<uint32_t>(pending.size());
-    if (rpc_write(conn, copy_count, sizeof(*copy_count)) < 0) {
+    conn_t *conn, const std::vector<lupine_pending_dtoh_copy> &pending,
+    bool include_count) {
+  if (include_count) {
+    uint32_t copy_count = static_cast<uint32_t>(pending.size());
+    if (rpc_write_copy(conn, &copy_count, sizeof(copy_count)) < 0) {
       return -1;
     }
   }
@@ -1211,9 +1207,9 @@ int handle_manual_lupineLibraryAttributeSnapshot(conn_t *conn) {
 #if CUDA_VERSION >= 12040
   CUdevice device = -1;
   CUresult device_result = cuCtxGetDevice(&device);
-  if (rpc_write(conn, &device_result, sizeof(device_result)) < 0 ||
+  if (rpc_write_copy(conn, &device_result, sizeof(device_result)) < 0 ||
       (device_result == CUDA_SUCCESS &&
-       rpc_write(conn, &device, sizeof(device)) < 0)) {
+       rpc_write_copy(conn, &device, sizeof(device)) < 0)) {
     return -1;
   }
   if (device_result != CUDA_SUCCESS) {
@@ -1222,9 +1218,9 @@ int handle_manual_lupineLibraryAttributeSnapshot(conn_t *conn) {
 
   unsigned int kernel_count = 0;
   CUresult count_result = cuLibraryGetKernelCount(&kernel_count, library);
-  if (rpc_write(conn, &count_result, sizeof(count_result)) < 0 ||
+  if (rpc_write_copy(conn, &count_result, sizeof(count_result)) < 0 ||
       (count_result == CUDA_SUCCESS &&
-       rpc_write(conn, &kernel_count, sizeof(kernel_count)) < 0)) {
+       rpc_write_copy(conn, &kernel_count, sizeof(kernel_count)) < 0)) {
     return -1;
   }
   if (count_result != CUDA_SUCCESS || kernel_count == 0) {
@@ -1234,7 +1230,7 @@ int handle_manual_lupineLibraryAttributeSnapshot(conn_t *conn) {
   std::vector<CUkernel> kernels(kernel_count);
   CUresult enumerate_result =
       cuLibraryEnumerateKernels(kernels.data(), kernel_count, library);
-  if (rpc_write(conn, &enumerate_result, sizeof(enumerate_result)) < 0) {
+  if (rpc_write_copy(conn, &enumerate_result, sizeof(enumerate_result)) < 0) {
     return -1;
   }
   if (enumerate_result != CUDA_SUCCESS) {
@@ -1246,7 +1242,7 @@ int handle_manual_lupineLibraryAttributeSnapshot(conn_t *conn) {
     CUresult function_result =
         kernel == nullptr ? CUDA_ERROR_INVALID_HANDLE
                           : cuKernelGetFunction(&function, kernel);
-    if (rpc_write(conn, &kernel, sizeof(kernel)) < 0 ||
+    if (rpc_write_copy(conn, &kernel, sizeof(kernel)) < 0 ||
         rpc_write_copy(conn, &function_result, sizeof(function_result)) < 0 ||
         (function_result == CUDA_SUCCESS &&
          (rpc_write_copy(conn, &function, sizeof(function)) < 0 ||
@@ -1257,7 +1253,7 @@ int handle_manual_lupineLibraryAttributeSnapshot(conn_t *conn) {
   }
 #else
   CUresult result = CUDA_ERROR_NOT_SUPPORTED;
-  if (rpc_write(conn, &result, sizeof(result)) < 0) {
+  if (rpc_write_copy(conn, &result, sizeof(result)) < 0) {
     return -1;
   }
 #endif
@@ -2443,10 +2439,9 @@ static void CUDA_CB lupine_stream_callback(CUstream stream, CUresult status,
   void *fn = reinterpret_cast<void *>(callback->callback);
   void *client_user_data = callback->userData;
   void *response = nullptr;
-  uint32_t copy_count = 0;
   auto pending = lupine_detach_pending_dtoh_copies(conn, stream, false);
   if (rpc_write_start_request(conn, 2) >= 0 &&
-      lupine_write_pending_dtoh_copies(&copy_count, conn, pending) >= 0 &&
+      lupine_write_pending_dtoh_copies(conn, pending, true) >= 0 &&
       rpc_write(conn, &stream, sizeof(stream)) >= 0 &&
       rpc_write(conn, &status, sizeof(status)) >= 0 &&
       rpc_write(conn, &fn, sizeof(fn)) >= 0 &&
@@ -3185,18 +3180,13 @@ int handle_manual_cuEventQuery(conn_t *conn) {
   if (rpc_write_start_response(conn, request_id) < 0) {
     return -1;
   }
-  uint32_t copy_count = 0;
   std::vector<lupine_pending_dtoh_copy> pending;
   if (result == CUDA_SUCCESS) {
     pending = lupine_detach_pending_dtoh_copies(conn, nullptr, true);
-    if (lupine_write_pending_dtoh_copies(&copy_count, conn, pending) < 0) {
-      lupine_cleanup_pending_dtoh_copies(&pending);
-      return -1;
-    }
-  } else {
-    if (rpc_write(conn, &copy_count, sizeof(copy_count)) < 0) {
-      return -1;
-    }
+  }
+  if (lupine_write_pending_dtoh_copies(conn, pending, true) < 0) {
+    lupine_cleanup_pending_dtoh_copies(&pending);
+    return -1;
   }
   if (rpc_write(conn, &result, sizeof(result)) < 0 || rpc_write_end(conn) < 0) {
     lupine_cleanup_pending_dtoh_copies(&pending);
@@ -4019,12 +4009,10 @@ int handle_manual_cuCtxSynchronize(conn_t *conn) {
   lupine_start_stdout_capture(&capture);
   CUresult result = cuCtxSynchronize();
   lupine_finish_stdout_capture(&capture);
-  uint32_t copy_count = 0;
-  uint64_t stdout_size = 0;
   auto pending = lupine_detach_pending_dtoh_copies(conn, nullptr, true);
   if (rpc_write_start_response(conn, request_id) < 0 ||
-      lupine_write_pending_dtoh_copies(&copy_count, conn, pending) < 0 ||
-      lupine_write_captured_stdout(conn, capture, &stdout_size) < 0 ||
+      lupine_write_pending_dtoh_copies(conn, pending, true) < 0 ||
+      lupine_write_captured_stdout(conn, capture) < 0 ||
       rpc_write(conn, &result, sizeof(result)) < 0 || rpc_write_end(conn) < 0) {
     lupine_cleanup_pending_dtoh_copies(&pending);
     return -1;
@@ -4058,7 +4046,6 @@ int handle_manual_cuStreamSynchronize(conn_t *conn) {
       lupine_detach_pending_dtoh_copies(conn, stream, all_pending_streams);
   uint32_t pending_copy_count = static_cast<uint32_t>(pending.size());
   copy_count = graph_copy_count + pending_copy_count;
-  uint64_t stdout_size = 0;
   if (rpc_write_start_response(conn, request_id) < 0 ||
       rpc_write(conn, &copy_count, sizeof(copy_count)) < 0 ||
       std::any_of(
@@ -4070,8 +4057,8 @@ int handle_manual_cuStreamSynchronize(conn_t *conn) {
                    (copy.bytes != 0 &&
                     rpc_write_payload(conn, copy.server_src, copy.bytes) < 0);
           }) ||
-      lupine_write_pending_dtoh_copies(nullptr, conn, pending) < 0 ||
-      lupine_write_captured_stdout(conn, capture, &stdout_size) < 0 ||
+      lupine_write_pending_dtoh_copies(conn, pending, false) < 0 ||
+      lupine_write_captured_stdout(conn, capture) < 0 ||
       rpc_write(conn, &result, sizeof(result)) < 0 || rpc_write_end(conn) < 0) {
     lupine_cleanup_pending_dtoh_copies(&pending);
     return -1;
@@ -4117,12 +4104,10 @@ int handle_manual_cuEventSynchronize(conn_t *conn) {
   lupine_start_stdout_capture(&capture);
   CUresult result = cuEventSynchronize(event);
   lupine_finish_stdout_capture(&capture);
-  uint32_t copy_count = 0;
-  uint64_t stdout_size = 0;
   auto pending = lupine_detach_pending_dtoh_copies(conn, nullptr, true);
   if (rpc_write_start_response(conn, request_id) < 0 ||
-      lupine_write_pending_dtoh_copies(&copy_count, conn, pending) < 0 ||
-      lupine_write_captured_stdout(conn, capture, &stdout_size) < 0 ||
+      lupine_write_pending_dtoh_copies(conn, pending, true) < 0 ||
+      lupine_write_captured_stdout(conn, capture) < 0 ||
       rpc_write(conn, &result, sizeof(result)) < 0 || rpc_write_end(conn) < 0) {
     lupine_cleanup_pending_dtoh_copies(&pending);
     return -1;
