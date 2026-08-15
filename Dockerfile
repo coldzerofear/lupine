@@ -224,8 +224,17 @@ ARG GCC_TOOLSET=
 ENV CUDA_HOME=/usr/local/cuda
 ENV PATH="${CUDA_HOME}/bin:${PATH}"
 
-RUN dnf install -y gcc gcc-c++ make cmake perl binutils file tar gzip \
-    && if [ -n "${GCC_TOOLSET}" ]; then dnf install -y "${GCC_TOOLSET}-gcc" "${GCC_TOOLSET}-gcc-c++"; fi \
+# libstdc++-static lives in PowerTools (disabled by default on Rocky 8), unlike
+# Ubuntu where libstdc++-dev ships the .a. Without it, -static-libstdc++ makes
+# ld hunt for libstdc++.a, fail with "cannot find -lstdc++", and the whole
+# matrix dies at link time. gcc-toolset ships its own libstdc++.a via its
+# -libstdc++-devel (pulled by -gcc-c++), so the toolset lane needs nothing
+# extra; scl-utils is what provides scl_source.
+RUN dnf install -y --enablerepo=powertools \
+        gcc gcc-c++ libstdc++-static make cmake perl binutils file tar gzip \
+    && if [ -n "${GCC_TOOLSET}" ]; then \
+         dnf install -y scl-utils "${GCC_TOOLSET}-gcc" "${GCC_TOOLSET}-gcc-c++"; \
+       fi \
     && dnf clean all
 
 # nghttp2: C library only, static, PIC (it ends up inside a shared object).
@@ -261,6 +270,7 @@ COPY . /opt/lupine
 # scl_source puts the toolset gcc on PATH for this shell only; cmake inherits.
 RUN set -eux; \
     if [ -n "${GCC_TOOLSET}" ]; then . scl_source enable "${GCC_TOOLSET}"; fi; \
+    echo "==== configure ($(gcc --version | head -1)) ===="; \
     cmake -S /opt/lupine -B /opt/lupine/build-static \
       -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" \
       -DLUPINE_STATIC_DEPS=ON \
@@ -268,6 +278,7 @@ RUN set -eux; \
       -DNGHTTP2_LIBRARY=/opt/static-deps/lib/libnghttp2.a \
       -DOPENSSL_ROOT_DIR=/opt/static-deps \
       -DCMAKE_LIBRARY_PATH="${CUDA_HOME}/lib64/stubs"; \
+    echo "==== build ===="; \
     cmake --build /opt/lupine/build-static --parallel "$(nproc)" \
       --target lupine_driver lupine_nvml
 
