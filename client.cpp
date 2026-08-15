@@ -66,6 +66,67 @@ conn_t conns[16];
 int nconns = 0;
 static bool lupine_rpc_shutting_down = false;
 
+// Set in a child that inherited a live connection across fork(). CUDA state
+// cannot survive a fork: locally the driver enforces that by poisoning the
+// child's context, and the shim has to reproduce it, because here the child's
+// inherited descriptor still addresses the PARENT's session. Left unhandled,
+// a child's ordinary teardown (cuLibraryUnload, cuDevicePrimaryCtxRelease) is
+// forwarded onto the parent's context and destroys it, and the destructor
+// below then shutdown()s the shared socket out from under the parent -- which
+// keeps running, now holding a dead session and a released context.
+static bool lupine_forked_child = false;
+
+#ifndef _WIN32
+static void lupine_rpc_atfork_prepare() { pthread_mutex_lock(&conn_mutex); }
+
+static void lupine_rpc_atfork_parent() { pthread_mutex_unlock(&conn_mutex); }
+
+// Runs in the child, which owns only the forking thread: every dispatch and
+// read thread is gone, and whatever mutexes they held are locked forever. So
+// abandon the inherited transport rather than unwind it.
+//
+// close(), never shutdown(): the descriptor is shared with the parent, and
+// close() drops only this process's reference while shutdown() would take down
+// the TCP connection both processes are using. Nothing here allocates or
+// frees -- conn_t is trivially destructible by design, so zeroing it is a
+// plain store -- which keeps the handler safe even if another thread held the
+// allocator lock at fork() time. The write_queue/http2/tls_session blocks are
+// deliberately leaked into the child's private image for the same reason; a
+// poisoned child issues no further RPCs.
+static void lupine_rpc_atfork_child() {
+  bool inherited = nconns > 0;
+  for (int i = 0; i < nconns; ++i) {
+    if (!conns[i].closed && conns[i].connfd != LUPINE_INVALID_SOCKET) {
+      close(conns[i].connfd);
+    }
+    conns[i] = {};
+    conns[i].connfd = LUPINE_INVALID_SOCKET;
+    // Routing may still hold pointers into this table; `closed` is what every
+    // read and write path checks first, so the stale entries stay inert.
+    conns[i].closed = 1;
+  }
+  nconns = 0;
+  lupine_rpc_shutting_down = false;
+  if (inherited) {
+    lupine_forked_child = true;
+  }
+  pthread_mutex_unlock(&conn_mutex);
+}
+
+static pthread_once_t lupine_rpc_fork_once = PTHREAD_ONCE_INIT;
+
+static void lupine_rpc_install_fork_handlers() {
+  pthread_atfork(lupine_rpc_atfork_prepare, lupine_rpc_atfork_parent,
+                 lupine_rpc_atfork_child);
+}
+#endif
+
+static void lupine_rpc_register_fork_handlers() {
+#ifndef _WIN32
+  pthread_once(&lupine_rpc_fork_once, lupine_rpc_install_fork_handlers);
+#endif
+}
+
 void rpc_destroy_thread_lane(uint64_t lane_id) {
   conn_t *active_conns[sizeof(conns) / sizeof(conns[0])];
   int count = 0;
@@ -8404,8 +8465,19 @@ close_connection:
 }
 
 int rpc_open() {
+  lupine_rpc_register_fork_handlers();
+
   if (pthread_mutex_lock(&conn_mutex) < 0)
     return -1;
+
+  // A process that forked after CUDA was initialized cannot use CUDA, exactly
+  // as with a local driver. Dialing a fresh connection here would be worse
+  // than failing: the child would get a second, empty context in which its
+  // teardown appears to succeed, hiding the fault instead of reporting it.
+  if (lupine_forked_child) {
+    pthread_mutex_unlock(&conn_mutex);
+    return -1;
+  }
 
   if (nconns > 0) {
     if (pthread_mutex_unlock(&conn_mutex) < 0)

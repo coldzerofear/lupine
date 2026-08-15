@@ -92,9 +92,65 @@ void *rpc_client_dispatch_thread(void *p) {
   return nullptr;
 }
 
+// Set by the fork handler; consumed by open_connection() below. The handler
+// itself must not touch the device/label vectors, because releasing their
+// storage means calling the allocator, which a child of a multi-threaded
+// parent may not do. Deferring that to the next call under the mutex keeps
+// the handler allocation-free without leaving the tables desynchronized.
+bool fork_reset_pending = false;
+
+#ifndef _WIN32
+void atfork_prepare() { pthread_mutex_lock(&conn_mutex); }
+
+void atfork_parent() { pthread_mutex_unlock(&conn_mutex); }
+
+// Abandon the connections inherited from the parent. close(), never
+// shutdown(): the descriptor is shared, so shutdown() would tear down the
+// connection the parent is still using. Unlike CUDA there is nothing to
+// poison -- NVML keeps no per-process device state that a fork invalidates --
+// so the child is simply left disconnected and may dial again on its own.
+void atfork_child() {
+  for (int i = 0; i < nconns; ++i) {
+    if (!conns[i].closed && conns[i].connfd != LUPINE_INVALID_SOCKET) {
+      close(conns[i].connfd);
+    }
+    conns[i] = {};
+    conns[i].connfd = LUPINE_INVALID_SOCKET;
+    conns[i].closed = 1;
+  }
+  nconns = 0;
+  connected = false;
+  devices_ready = false;
+  fork_reset_pending = true;
+  pthread_mutex_unlock(&conn_mutex);
+}
+
+pthread_once_t fork_once = PTHREAD_ONCE_INIT;
+
+void install_fork_handlers() {
+  pthread_atfork(atfork_prepare, atfork_parent, atfork_child);
+}
+#endif
+
+void register_fork_handlers() {
+#ifndef _WIN32
+  pthread_once(&fork_once, install_fork_handlers);
+#endif
+}
+
 int open_connection() {
+  register_fork_handlers();
+
   if (pthread_mutex_lock(&conn_mutex) < 0) {
     return -1;
+  }
+  if (fork_reset_pending) {
+    // Inherited entries described the parent's connections, which this process
+    // no longer has; dialing on top of them would desynchronize the label and
+    // device indices from conns[].
+    devices.clear();
+    conn_labels.clear();
+    fork_reset_pending = false;
   }
   if (connected) {
     pthread_mutex_unlock(&conn_mutex);
@@ -154,7 +210,9 @@ int open_connection() {
       continue;
     }
 
-    int sockfd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    int sockfd = socket(res->ai_family,
+                        lupine_socket_type_with_cloexec(res->ai_socktype),
+                        res->ai_protocol);
     if (sockfd >= 0) {
       lupine_socket_apply_transport_options(sockfd);
       if (connect(sockfd, res->ai_addr, res->ai_addrlen) == 0) {
