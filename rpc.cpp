@@ -44,7 +44,9 @@ lupine_socket_t lupine_tcp_connect(const char *host, const char *port) {
     } else {
       for (addrinfo *ai = res; ai != nullptr; ai = ai->ai_next) {
         lupine_socket_t sockfd =
-            socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+            socket(ai->ai_family,
+                   lupine_socket_type_with_cloexec(ai->ai_socktype),
+                   ai->ai_protocol);
         if (sockfd == LUPINE_INVALID_SOCKET) {
           continue;
         }

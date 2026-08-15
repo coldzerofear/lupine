@@ -280,6 +280,23 @@ inline int lupine_socket_apply_transport_options(lupine_socket_t fd) {
   return 0;
 }
 
+// lupine_socket_type_with_cloexec returns the type argument for socket(),
+// requesting close-on-exec atomically where the platform supports it.
+//
+// An RPC socket must not survive exec(). The client's connection table lives
+// in memory that exec() replaces, so the new image has no record of the
+// inherited descriptor: it can neither use it nor close it, yet it holds the
+// server-side connection open for as long as the exec'd process lives. Setting
+// the flag in socket() rather than with a follow-up fcntl() closes the window
+// where a concurrent fork+exec could copy the descriptor first.
+inline int lupine_socket_type_with_cloexec(int socktype) {
+#ifdef SOCK_CLOEXEC
+  return socktype | SOCK_CLOEXEC;
+#else
+  return socktype;
+#endif
+}
+
 // lupine_socket_connect_with_timeout connects `fd` to `addr`, waiting up to
 // `timeout_ms` milliseconds. A non-positive timeout performs a plain blocking
 // connect (the historical behavior). A bounded timeout prevents a
