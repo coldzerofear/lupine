@@ -927,6 +927,67 @@ int handle_manual_cuModuleLoadData(conn_t *conn) {
   return 0;
 }
 
+static int lupine_write_function_attributes(conn_t *conn, CUfunction function) {
+  if (conn == nullptr) {
+    return -1;
+  }
+  uint32_t count = CU_FUNC_ATTRIBUTE_MAX;
+  if (rpc_write_copy(conn, &count, sizeof(count)) < 0) {
+    return -1;
+  }
+  for (int attribute = 0; attribute < CU_FUNC_ATTRIBUTE_MAX; ++attribute) {
+    int value = 0;
+    CUresult result =
+        function == nullptr
+            ? CUDA_ERROR_INVALID_HANDLE
+            : cuFuncGetAttribute(&value,
+                                 static_cast<CUfunction_attribute>(attribute),
+                                 function);
+    if (rpc_write_copy(conn, &result, sizeof(result)) < 0 ||
+        (result == CUDA_SUCCESS &&
+         (rpc_write_copy(conn, &attribute, sizeof(attribute)) < 0 ||
+          rpc_write_copy(conn, &value, sizeof(value)) < 0))) {
+      return -1;
+    }
+  }
+  return 0;
+}
+
+static int lupine_write_kernel_attributes(conn_t *conn, CUkernel kernel,
+                                          CUdevice device) {
+  if (conn == nullptr) {
+    return -1;
+  }
+  uint32_t count = CU_FUNC_ATTRIBUTE_MAX;
+  if (rpc_write_copy(conn, &count, sizeof(count)) < 0) {
+    return -1;
+  }
+#if CUDA_VERSION < 12000
+  (void)kernel;
+  (void)device;
+#endif
+  for (int attribute = 0; attribute < CU_FUNC_ATTRIBUTE_MAX; ++attribute) {
+    int value = 0;
+#if CUDA_VERSION >= 12000
+    CUresult result =
+        kernel == nullptr
+            ? CUDA_ERROR_INVALID_HANDLE
+            : cuKernelGetAttribute(&value,
+                                   static_cast<CUfunction_attribute>(attribute),
+                                   kernel, device);
+#else
+    CUresult result = CUDA_ERROR_NOT_SUPPORTED;
+#endif
+    if (rpc_write_copy(conn, &result, sizeof(result)) < 0 ||
+        (result == CUDA_SUCCESS &&
+         (rpc_write_copy(conn, &attribute, sizeof(attribute)) < 0 ||
+          rpc_write_copy(conn, &value, sizeof(value)) < 0))) {
+      return -1;
+    }
+  }
+  return 0;
+}
+
 int handle_manual_lupineFunctionParamLayoutSnapshot(conn_t *conn) {
   CUfunction function = nullptr;
   if (rpc_read(conn, &function, sizeof(function)) < 0) {
@@ -939,6 +1000,24 @@ int handle_manual_lupineFunctionParamLayoutSnapshot(conn_t *conn) {
 
   if (rpc_write_start_response(conn, request_id) < 0 ||
       rpc_write_func_param_info(conn, function) < 0 ||
+      rpc_write_end(conn) < 0) {
+    return -1;
+  }
+  return 0;
+}
+
+int handle_manual_lupineFunctionAttributeSnapshot(conn_t *conn) {
+  CUfunction function = nullptr;
+  if (rpc_read(conn, &function, sizeof(function)) < 0) {
+    return -1;
+  }
+  int request_id = rpc_read_end(conn);
+  if (request_id < 0) {
+    return -1;
+  }
+
+  if (rpc_write_start_response(conn, request_id) < 0 ||
+      lupine_write_function_attributes(conn, function) < 0 ||
       rpc_write_end(conn) < 0) {
     return -1;
   }
@@ -1113,6 +1192,75 @@ int handle_manual_lupineLibrarySnapshot(conn_t *conn) {
       return -1;
     }
   }
+  return rpc_write_end(conn) < 0 ? -1 : 0;
+}
+
+int handle_manual_lupineLibraryAttributeSnapshot(conn_t *conn) {
+  CUlibrary library = nullptr;
+  if (rpc_read(conn, &library, sizeof(library)) < 0) {
+    return -1;
+  }
+  int request_id = rpc_read_end(conn);
+  if (request_id < 0) {
+    return -1;
+  }
+
+  if (rpc_write_start_response(conn, request_id) < 0) {
+    return -1;
+  }
+#if CUDA_VERSION >= 12040
+  CUdevice device = -1;
+  CUresult device_result = cuCtxGetDevice(&device);
+  if (rpc_write(conn, &device_result, sizeof(device_result)) < 0 ||
+      (device_result == CUDA_SUCCESS &&
+       rpc_write(conn, &device, sizeof(device)) < 0)) {
+    return -1;
+  }
+  if (device_result != CUDA_SUCCESS) {
+    return rpc_write_end(conn) < 0 ? -1 : 0;
+  }
+
+  unsigned int kernel_count = 0;
+  CUresult count_result = cuLibraryGetKernelCount(&kernel_count, library);
+  if (rpc_write(conn, &count_result, sizeof(count_result)) < 0 ||
+      (count_result == CUDA_SUCCESS &&
+       rpc_write(conn, &kernel_count, sizeof(kernel_count)) < 0)) {
+    return -1;
+  }
+  if (count_result != CUDA_SUCCESS || kernel_count == 0) {
+    return rpc_write_end(conn) < 0 ? -1 : 0;
+  }
+
+  std::vector<CUkernel> kernels(kernel_count);
+  CUresult enumerate_result =
+      cuLibraryEnumerateKernels(kernels.data(), kernel_count, library);
+  if (rpc_write(conn, &enumerate_result, sizeof(enumerate_result)) < 0) {
+    return -1;
+  }
+  if (enumerate_result != CUDA_SUCCESS) {
+    return rpc_write_end(conn) < 0 ? -1 : 0;
+  }
+
+  for (const CUkernel &kernel : kernels) {
+    CUfunction function = nullptr;
+    CUresult function_result =
+        kernel == nullptr ? CUDA_ERROR_INVALID_HANDLE
+                          : cuKernelGetFunction(&function, kernel);
+    if (rpc_write(conn, &kernel, sizeof(kernel)) < 0 ||
+        rpc_write_copy(conn, &function_result, sizeof(function_result)) < 0 ||
+        (function_result == CUDA_SUCCESS &&
+         (rpc_write_copy(conn, &function, sizeof(function)) < 0 ||
+          lupine_write_function_attributes(conn, function) < 0)) ||
+        lupine_write_kernel_attributes(conn, kernel, device) < 0) {
+      return -1;
+    }
+  }
+#else
+  CUresult result = CUDA_ERROR_NOT_SUPPORTED;
+  if (rpc_write(conn, &result, sizeof(result)) < 0) {
+    return -1;
+  }
+#endif
   return rpc_write_end(conn) < 0 ? -1 : 0;
 }
 

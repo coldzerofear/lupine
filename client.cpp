@@ -504,6 +504,63 @@ lupine_function_attribute_cache() {
   return *cache;
 }
 
+static int lupine_read_function_attributes(conn_t *conn, lupine_route route,
+                                           CUfunction function) {
+  uint32_t count = 0;
+  if (conn == nullptr || rpc_read(conn, &count, sizeof(count)) < 0 ||
+      count > 4096) {
+    return -1;
+  }
+  int route_id = lupine_route_identity(route);
+  for (uint32_t i = 0; i < count; ++i) {
+    CUresult result = CUDA_ERROR_UNKNOWN;
+    if (rpc_read(conn, &result, sizeof(result)) < 0) {
+      return -1;
+    }
+    if (result != CUDA_SUCCESS) {
+      continue;
+    }
+    int attribute = 0;
+    int value = 0;
+    if (rpc_read(conn, &attribute, sizeof(attribute)) < 0 ||
+        rpc_read(conn, &value, sizeof(value)) < 0) {
+      return -1;
+    }
+    lupine_function_attribute_cache().insert_or_assign(
+        lupine_function_attribute_key{route_id, function, attribute}, value);
+  }
+  return 0;
+}
+
+static int lupine_read_kernel_attributes(conn_t *conn, lupine_route route,
+                                         CUkernel kernel, CUdevice device) {
+  uint32_t count = 0;
+  if (conn == nullptr || rpc_read(conn, &count, sizeof(count)) < 0 ||
+      count > 4096) {
+    return -1;
+  }
+  int route_id = lupine_route_identity(route);
+  for (uint32_t i = 0; i < count; ++i) {
+    CUresult result = CUDA_ERROR_UNKNOWN;
+    if (rpc_read(conn, &result, sizeof(result)) < 0) {
+      return -1;
+    }
+    if (result != CUDA_SUCCESS) {
+      continue;
+    }
+    int attribute = 0;
+    int value = 0;
+    if (rpc_read(conn, &attribute, sizeof(attribute)) < 0 ||
+        rpc_read(conn, &value, sizeof(value)) < 0) {
+      return -1;
+    }
+    lupine_kernel_attribute_cache().insert_or_assign(
+        lupine_kernel_attribute_key{route_id, kernel, attribute, device},
+        value);
+  }
+  return 0;
+}
+
 static libcuckoo::cuckoohash_map<lupine_param_info_key, lupine_param_info_value,
                                  lupine_param_info_key_hash> &
 lupine_param_info_cache() {
@@ -1137,6 +1194,23 @@ static void lupine_prefetch_function_param_layout(CUfunction function,
   }
 }
 
+static void lupine_prefill_function_attribute_snapshot(CUfunction function,
+                                                       lupine_route route,
+                                                       conn_t *conn) {
+  if (function == nullptr || conn == nullptr) {
+    return;
+  }
+
+  if (rpc_write_start_request(conn,
+                              LUPINE_RPC_lupineFunctionAttributeSnapshot) < 0 ||
+      rpc_write(conn, &function, sizeof(function)) < 0 ||
+      rpc_wait_for_response(conn) < 0 ||
+      lupine_read_function_attributes(conn, route, function) < 0 ||
+      rpc_read_end(conn) < 0) {
+    return;
+  }
+}
+
 extern "C" CUresult cuModuleGetFunction(CUfunction *function, CUmodule module,
                                         const char *name) {
   if (function == nullptr || name == nullptr) {
@@ -1170,6 +1244,7 @@ extern "C" CUresult cuModuleGetFunction(CUfunction *function, CUmodule module,
   }
   (void)lupine_record_module_function(*function, module, name, route);
   lupine_prefetch_function_param_layout(*function, route);
+  lupine_prefill_function_attribute_snapshot(*function, route, conn);
   return result;
 }
 
@@ -4530,6 +4605,79 @@ static void lupine_prefill_library_snapshot(CUlibrary library, conn_t *conn) {
   }
 }
 
+static void lupine_prefill_library_attribute_snapshot(CUlibrary library,
+                                                      conn_t *conn) {
+  if (library == nullptr || conn == nullptr) {
+    return;
+  }
+
+  CUresult result = CUDA_ERROR_UNKNOWN;
+  CUdevice remote_device = -1;
+  if (rpc_write_start_request(conn, LUPINE_RPC_lupineLibraryAttributeSnapshot) <
+          0 ||
+      rpc_write(conn, &library, sizeof(library)) < 0 ||
+      rpc_wait_for_response(conn) < 0 ||
+      rpc_read(conn, &result, sizeof(result)) < 0) {
+    return;
+  }
+  if (result != CUDA_SUCCESS) {
+    (void)rpc_read_end(conn);
+    return;
+  }
+  if (rpc_read(conn, &remote_device, sizeof(remote_device)) < 0 ||
+      rpc_read(conn, &result, sizeof(result)) < 0) {
+    return;
+  }
+  if (result != CUDA_SUCCESS) {
+    (void)rpc_read_end(conn);
+    return;
+  }
+
+  unsigned int kernel_count = 0;
+  if (rpc_read(conn, &kernel_count, sizeof(kernel_count)) < 0 ||
+      kernel_count > 1024 * 1024) {
+    return;
+  }
+  if (kernel_count == 0) {
+    (void)rpc_read_end(conn);
+    return;
+  }
+  if (rpc_read(conn, &result, sizeof(result)) < 0) {
+    return;
+  }
+  if (result != CUDA_SUCCESS) {
+    (void)rpc_read_end(conn);
+    return;
+  }
+
+  lupine_route route = lupine_remote_route_for_conn(conn);
+  for (unsigned int i = 0; i < kernel_count; ++i) {
+    CUkernel kernel = nullptr;
+    CUfunction function = nullptr;
+    if (rpc_read(conn, &kernel, sizeof(kernel)) < 0 ||
+        rpc_read(conn, &result, sizeof(result)) < 0) {
+      return;
+    }
+    if (result == CUDA_SUCCESS) {
+      if (rpc_read(conn, &function, sizeof(function)) < 0) {
+        return;
+      }
+      if (function != nullptr) {
+        lupine_note_function_owner_route(function, route);
+      }
+      if (lupine_read_function_attributes(conn, route, function) < 0) {
+        return;
+      }
+    }
+    if (lupine_read_kernel_attributes(conn, route, kernel, remote_device) < 0) {
+      return;
+    }
+  }
+  if (rpc_read_end(conn) < 0) {
+    return;
+  }
+}
+
 extern "C" CUresult
 cuLibraryLoadData(CUlibrary *library, const void *code,
                   CUjit_option *jitOptions, void **jitOptionsValues,
@@ -4595,6 +4743,7 @@ cuLibraryLoadData(CUlibrary *library, const void *code,
                                 kind, image_bytes.data(), image_bytes.size(),
                                 code);
     lupine_prefill_library_snapshot(*library, conn);
+    lupine_prefill_library_attribute_snapshot(*library, conn);
   }
   return return_value;
 }
