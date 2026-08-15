@@ -229,11 +229,11 @@ ENV PATH="${CUDA_HOME}/bin:${PATH}"
 # ld hunt for libstdc++.a, fail with "cannot find -lstdc++", and the whole
 # matrix dies at link time. gcc-toolset ships its own libstdc++.a via its
 # -libstdc++-devel (pulled by -gcc-c++), so the toolset lane needs nothing
-# extra; scl-utils is what provides scl_source.
+# extra.
 RUN dnf install -y --enablerepo=powertools \
         gcc gcc-c++ libstdc++-static make cmake perl binutils file tar gzip \
     && if [ -n "${GCC_TOOLSET}" ]; then \
-         dnf install -y scl-utils "${GCC_TOOLSET}-gcc" "${GCC_TOOLSET}-gcc-c++"; \
+         dnf install -y "${GCC_TOOLSET}-gcc" "${GCC_TOOLSET}-gcc-c++"; \
        fi \
     && dnf clean all
 
@@ -267,9 +267,14 @@ RUN set -eux; \
 WORKDIR /opt/lupine
 COPY . /opt/lupine
 
-# scl_source puts the toolset gcc on PATH for this shell only; cmake inherits.
+# The toolset gcc goes on PATH by hand rather than via `scl_source enable`:
+# scl_source trips `set -u` ("_recursion: unbound variable") and takes the whole
+# RUN down with exit 1 before cmake even starts. Prepending its bin dir is all
+# scl_source does for our purposes; cmake and nvcc pick the compiler from PATH.
+# The configure/build markers exist because BuildKit only shows the failing
+# step tail -- "exit code 2" alone told us nothing the first time this broke.
 RUN set -eux; \
-    if [ -n "${GCC_TOOLSET}" ]; then . scl_source enable "${GCC_TOOLSET}"; fi; \
+    if [ -n "${GCC_TOOLSET}" ]; then export PATH="/opt/rh/${GCC_TOOLSET}/root/usr/bin:${PATH}"; fi; \
     echo "==== configure ($(gcc --version | head -1)) ===="; \
     cmake -S /opt/lupine -B /opt/lupine/build-static \
       -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" \
