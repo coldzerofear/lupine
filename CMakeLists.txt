@@ -35,10 +35,47 @@ endif()
 set(MIN_CUDA_VERSION 11.0)
 
 find_package(CUDAToolkit REQUIRED)
+
+# Self-contained client shims. The client .so files are injected into arbitrary
+# container images whose library sets we do not control; a runtime dependency on
+# libnghttp2/libssl/libstdc++ there either fails to resolve (minimal images) or
+# forces shipping those libraries alongside, where they shadow the image's own
+# copies for every process in the container (observed: a mounted dependency dir
+# broke ollama's llama-server outright). With this ON, nghttp2/OpenSSL/libstdc++/
+# libgcc are linked statically into the shims and the only runtime dependency
+# left is glibc. The exports version scripts (client.exports / nvml.exports)
+# already hide every embedded symbol from .dynsym, so the static copies cannot
+# interpose on the target image's own nghttp2/OpenSSL/libstdc++.
+# lz4 below is the in-tree precedent for exactly this reasoning.
+option(LUPINE_STATIC_DEPS
+       "Statically link nghttp2/OpenSSL/libstdc++/libgcc into the client shims" OFF)
+
 find_path(NGHTTP2_INCLUDE_DIR nghttp2/nghttp2.h REQUIRED)
-find_library(NGHTTP2_LIBRARY nghttp2 REQUIRED)
+if (LUPINE_STATIC_DEPS)
+    find_library(NGHTTP2_LIBRARY libnghttp2.a REQUIRED)
+    set(OPENSSL_USE_STATIC_LIBS TRUE)
+else()
+    find_library(NGHTTP2_LIBRARY nghttp2 REQUIRED)
+endif()
 # The server stays plaintext (front it with a TLS proxy); only the client links OpenSSL.
 find_package(OpenSSL QUIET)
+
+# What the client targets link for the C++ runtime. The explicit stdc++ entry
+# (rather than letting the C++ driver add it) is historical; keep it for the
+# dynamic build, but a static build must NOT name it or the dynamic library
+# gets linked regardless of -static-libstdc++.
+if (LUPINE_STATIC_DEPS)
+    set(LUPINE_CXX_RUNTIME_LIBS "")
+    set(LUPINE_CLIENT_STATIC_LINK_OPTIONS -static-libstdc++ -static-libgcc)
+    # Static libcrypto needs the loader + threads it would otherwise pull in
+    # through its own DT_NEEDED.
+    set(LUPINE_TLS_EXTRA_LIBS ${CMAKE_DL_LIBS} Threads::Threads)
+    find_package(Threads REQUIRED)
+else()
+    set(LUPINE_CXX_RUNTIME_LIBS stdc++)
+    set(LUPINE_CLIENT_STATIC_LINK_OPTIONS "")
+    set(LUPINE_TLS_EXTRA_LIBS "")
+endif()
 
 if (NOT CUDAToolkit_VERSION)
     message(FATAL_ERROR "CUDA Toolkit is required but not found.")
@@ -146,10 +183,11 @@ if (NOT WIN32)
     target_compile_definitions(${CLIENT_OUTPUT} PRIVATE LUPINE_RPC_CLIENT)
     if(OpenSSL_FOUND)
       target_compile_definitions(${CLIENT_OUTPUT} PRIVATE LUPINE_TLS_OPENSSL)
-      target_link_libraries(${CLIENT_OUTPUT} PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+      target_link_libraries(${CLIENT_OUTPUT} PRIVATE OpenSSL::SSL OpenSSL::Crypto ${LUPINE_TLS_EXTRA_LIBS})
     endif()
-    target_link_libraries(${CLIENT_OUTPUT} PRIVATE stdc++ ${NGHTTP2_LIBRARY} lupine_lz4)
+    target_link_libraries(${CLIENT_OUTPUT} PRIVATE ${LUPINE_CXX_RUNTIME_LIBS} ${NGHTTP2_LIBRARY} lupine_lz4)
     target_link_options(${CLIENT_OUTPUT} PRIVATE
+        ${LUPINE_CLIENT_STATIC_LINK_OPTIONS}
         "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/client.exports"
     )
     set_target_properties(${CLIENT_OUTPUT} PROPERTIES
@@ -163,10 +201,11 @@ if (NOT WIN32)
     target_include_directories(${NVML_CLIENT_OUTPUT} PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
     if(OpenSSL_FOUND)
       target_compile_definitions(${NVML_CLIENT_OUTPUT} PRIVATE LUPINE_TLS_OPENSSL)
-      target_link_libraries(${NVML_CLIENT_OUTPUT} PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+      target_link_libraries(${NVML_CLIENT_OUTPUT} PRIVATE OpenSSL::SSL OpenSSL::Crypto ${LUPINE_TLS_EXTRA_LIBS})
     endif()
-    target_link_libraries(${NVML_CLIENT_OUTPUT} PRIVATE stdc++ ${NGHTTP2_LIBRARY} lupine_lz4)
+    target_link_libraries(${NVML_CLIENT_OUTPUT} PRIVATE ${LUPINE_CXX_RUNTIME_LIBS} ${NGHTTP2_LIBRARY} lupine_lz4)
     target_link_options(${NVML_CLIENT_OUTPUT} PRIVATE
+        ${LUPINE_CLIENT_STATIC_LINK_OPTIONS}
         "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/nvml.exports"
     )
     set_target_properties(${NVML_CLIENT_OUTPUT} PROPERTIES

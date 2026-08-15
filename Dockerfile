@@ -185,3 +185,150 @@ ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 EXPOSE 14833
 
 ENTRYPOINT ["/opt/lupine/bin/lupine_driver_server"]
+
+
+# ---------------------------------------------------------------------------
+# Self-contained ("static") client shims.
+#
+# The regular client images above carry their own runtime (libnghttp2, libssl,
+# libstdc++). That works when the app runs INSIDE those images -- but the shims
+# are also injected into arbitrary user images (k8s device injection), whose
+# library sets we do not control. There, dynamic deps either fail to resolve or
+# have to be shipped alongside, where they shadow the image's own copies for
+# every process in the container. These stages produce shims whose only runtime
+# dependency is glibc: nghttp2 / OpenSSL / libstdc++ / libgcc are linked in
+# statically (LUPINE_STATIC_DEPS=ON) and hidden from .dynsym by the existing
+# export version scripts.
+#
+# Built on rockylinux8 rather than Ubuntu, deliberately: its glibc 2.28 is the
+# lowest floor NVIDIA publishes devel images for across the whole CUDA matrix
+# (11.7-13.1, amd64+arm64), and an artifact only loads on glibc >= its
+# builder's. gcc-toolset supplies a newer compiler where nvcc requires one;
+# its libstdc++ delta links statically by design, so the floor stays 2.28.
+# ---------------------------------------------------------------------------
+
+FROM nvidia/cuda:${CUDA_VERSION}-${CUDA_IMAGE_FLAVOR}-rockylinux8 AS client-static-build
+
+ARG CMAKE_BUILD_TYPE=Release
+ARG NGHTTP2_VERSION=1.64.0
+ARG NGHTTP2_SHA256=20e73f3cf9db3f05988996ac8b3a99ed529f4565ca91a49eb0550498e10621e8
+ARG OPENSSL_VERSION=3.0.18
+ARG OPENSSL_SHA256=d80c34f5cf902dccf1f1b5df5ebb86d0392e37049e5d73df1b3abae72e4ffe8b
+# Declared glibc ceiling; check_static_client.sh fails the build if the linked
+# result references anything newer (e.g. someone swaps in a newer base).
+ARG MAX_GLIBC=2.28
+# Set to a gcc-toolset package name (e.g. gcc-toolset-13) when this CUDA
+# version's nvcc rejects the system gcc 8.5. Empty = system gcc.
+ARG GCC_TOOLSET=
+
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH="${CUDA_HOME}/bin:${PATH}"
+
+RUN dnf install -y gcc gcc-c++ make cmake perl binutils file tar gzip \
+    && if [ -n "${GCC_TOOLSET}" ]; then dnf install -y "${GCC_TOOLSET}-gcc" "${GCC_TOOLSET}-gcc-c++"; fi \
+    && dnf clean all
+
+# nghttp2: C library only, static, PIC (it ends up inside a shared object).
+RUN set -eux; \
+    curl -fsSL -o nghttp2.tar.gz \
+      "https://github.com/nghttp2/nghttp2/releases/download/v${NGHTTP2_VERSION}/nghttp2-${NGHTTP2_VERSION}.tar.gz"; \
+    echo "${NGHTTP2_SHA256}  nghttp2.tar.gz" | sha256sum -c -; \
+    tar xzf nghttp2.tar.gz; \
+    cd "nghttp2-${NGHTTP2_VERSION}"; \
+    ./configure --prefix=/opt/static-deps --enable-lib-only \
+                --enable-static --disable-shared --with-pic; \
+    make -j"$(nproc)"; \
+    make install; \
+    cd ..; rm -rf "nghttp2-${NGHTTP2_VERSION}" nghttp2.tar.gz
+
+# OpenSSL: static, PIC, no loadable modules (nothing to dlopen at runtime).
+# install_sw skips man pages. `./config` autodetects amd64 vs arm64.
+RUN set -eux; \
+    curl -fsSL -o openssl.tar.gz \
+      "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"; \
+    echo "${OPENSSL_SHA256}  openssl.tar.gz" | sha256sum -c -; \
+    tar xzf openssl.tar.gz; \
+    cd "openssl-${OPENSSL_VERSION}"; \
+    ./config --prefix=/opt/static-deps --libdir=lib \
+             no-shared no-module no-tests -fPIC; \
+    make -j"$(nproc)" build_sw; \
+    make install_sw; \
+    cd ..; rm -rf "openssl-${OPENSSL_VERSION}" openssl.tar.gz
+
+WORKDIR /opt/lupine
+COPY . /opt/lupine
+
+# scl_source puts the toolset gcc on PATH for this shell only; cmake inherits.
+RUN set -eux; \
+    if [ -n "${GCC_TOOLSET}" ]; then . scl_source enable "${GCC_TOOLSET}"; fi; \
+    cmake -S /opt/lupine -B /opt/lupine/build-static \
+      -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" \
+      -DLUPINE_STATIC_DEPS=ON \
+      -DNGHTTP2_INCLUDE_DIR=/opt/static-deps/include \
+      -DNGHTTP2_LIBRARY=/opt/static-deps/lib/libnghttp2.a \
+      -DOPENSSL_ROOT_DIR=/opt/static-deps \
+      -DCMAKE_LIBRARY_PATH="${CUDA_HOME}/lib64/stubs"; \
+    cmake --build /opt/lupine/build-static --parallel "$(nproc)" \
+      --target lupine_driver lupine_nvml
+
+RUN chmod +x /opt/lupine/deploy/check_static_client.sh \
+    && /opt/lupine/deploy/check_static_client.sh \
+         /opt/lupine/build-static/libcuda.so.1 \
+         /opt/lupine/build-static/libnvidia-ml.so.1 \
+         "${MAX_GLIBC}"
+
+# Load-probe helper: RTLD_NOW forces every relocation, so a missing dependency
+# or undefined symbol fails at build time, not in a user pod.
+RUN printf '%s\n' \
+      '#include <dlfcn.h>' \
+      '#include <stdio.h>' \
+      'int main(int argc, char **argv) {' \
+      '  for (int i = 1; i < argc; i++) {' \
+      '    if (!dlopen(argv[i], RTLD_NOW | RTLD_LOCAL)) {' \
+      '      fprintf(stderr, "FAIL %s: %s\n", argv[i], dlerror());' \
+      '      return 1;' \
+      '    }' \
+      '    printf("ok %s\n", argv[i]);' \
+      '  }' \
+      '  return 0;' \
+      '}' > /tmp/loadprobe.c \
+    && gcc -o /opt/lupine/build-static/loadprobe /tmp/loadprobe.c -ldl
+
+# Bare image AT THE GLIBC FLOOR (rocky8-minimal = 2.28), deliberately: no
+# libnghttp2, no libssl, no libstdc++ guarantees beyond the base, no CUDA. If
+# the shims load here under RTLD_NOW, they load anywhere with glibc >= 2.28.
+FROM rockylinux:8-minimal AS client-static-loadtest
+
+COPY --from=client-static-build /opt/lupine/build-static/libcuda.so.1 /probe/libcuda.so.1
+COPY --from=client-static-build /opt/lupine/build-static/libnvidia-ml.so.1 /probe/libnvidia-ml.so.1
+COPY --from=client-static-build /opt/lupine/build-static/loadprobe /probe/loadprobe
+
+RUN /probe/loadprobe /probe/libcuda.so.1 /probe/libnvidia-ml.so.1 \
+    && touch /probe/loadtest-passed
+
+# Final artifact carrier. busybox so an init container can `cp -a` the
+# artifacts into a shared volume; nothing here ever executes the shims.
+FROM busybox:stable-glibc AS client-static
+
+ARG CUDA_VERSION
+ARG MAX_GLIBC=2.28
+
+LABEL org.opencontainers.image.title="lupine-client-static"
+LABEL org.opencontainers.image.description="Self-contained LUPINE client shims (glibc-only runtime deps)"
+LABEL org.opencontainers.image.source="https://github.com/lupinemachines/lupine"
+LABEL org.opencontainers.image.version="${CUDA_VERSION}-static"
+LABEL io.lupine.cuda-version="${CUDA_VERSION}"
+LABEL io.lupine.min-glibc="${MAX_GLIBC}"
+
+# The loadtest stage produces no artifact we ship; copying its marker makes it
+# a hard build dependency so the probe cannot be skipped by stage pruning.
+COPY --from=client-static-loadtest /probe/loadtest-passed /artifacts/.loadtest-passed
+COPY --from=client-static-build /opt/lupine/build-static/libcuda.so.1 /artifacts/libcuda.so.1
+COPY --from=client-static-build /opt/lupine/build-static/libnvidia-ml.so.1 /artifacts/libnvidia-ml.so.1
+
+RUN printf 'cuda_version=%s\nmin_glibc=%s\n' \
+      "${CUDA_VERSION}" "${MAX_GLIBC}" > /artifacts/metadata \
+    && ln -s libcuda.so.1 /artifacts/libcuda.so \
+    && ln -s libnvidia-ml.so.1 /artifacts/libnvidia-ml.so
+
+CMD ["sh", "-c", "cp -a /artifacts/. \"${ARTIFACTS_DEST:-/target}/\" && echo copied to ${ARTIFACTS_DEST:-/target}"]
