@@ -2407,6 +2407,13 @@ static CUresult lupine_cuGetParamInfo_cached(uintptr_t handle,
     return CUDA_SUCCESS;
   }
 
+  size_t param_count = 0;
+  if (lupine_param_layout_count_cache().find(
+          lupine_param_layout_key{handle, kernel}, param_count) &&
+      param_index >= param_count) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+
   CUresult result = CUDA_ERROR_DEVICE_UNAVAILABLE;
   size_t offset = 0;
   size_t size = 0;
@@ -5016,17 +5023,10 @@ cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY,
        lupine_managed_kernel_requires_launch_sync(route_function) ||
        lupine_managed_kernel_requires_launch_sync(f));
   conn_t *conn = lupine_route_remote_conn(route);
-  CUcontext launch_context = nullptr;
-  if (lupine_current_context != nullptr &&
-      lupine_route_identity(lupine_route_for_context(lupine_current_context)) ==
-          lupine_route_identity(route)) {
-    launch_context = lupine_current_context;
-  }
   // Fire-and-forget; launch errors are sticky and surface at the next sync.
   if (conn == nullptr ||
       rpc_write_start_request(conn, RPC_cuLaunchKernel) < 0 ||
       rpc_write(conn, &f, sizeof(f)) < 0 ||
-      rpc_write(conn, &launch_context, sizeof(launch_context)) < 0 ||
       rpc_write(conn, &gridDimX, sizeof(gridDimX)) < 0 ||
       rpc_write(conn, &gridDimY, sizeof(gridDimY)) < 0 ||
       rpc_write(conn, &gridDimZ, sizeof(gridDimZ)) < 0 ||
@@ -5146,12 +5146,6 @@ extern "C" CUresult cuLaunchKernelEx(const CUlaunchConfig *config, CUfunction f,
        lupine_managed_kernel_requires_launch_sync(route_function) ||
        lupine_managed_kernel_requires_launch_sync(f));
   conn_t *conn = lupine_route_remote_conn(route);
-  CUcontext launch_context = nullptr;
-  if (lupine_current_context != nullptr &&
-      lupine_route_identity(lupine_route_for_context(lupine_current_context)) ==
-          lupine_route_identity(route)) {
-    launch_context = lupine_current_context;
-  }
   // Attribute-free launches are fire-and-forget like cuLaunchKernel; launch
   // errors are sticky and surface at the next sync. Launches carrying
   // attributes stay synchronous so attribute validation errors (e.g. invalid
@@ -5162,7 +5156,6 @@ extern "C" CUresult cuLaunchKernelEx(const CUlaunchConfig *config, CUfunction f,
       rpc_write_start_request(conn, RPC_cuLaunchKernelEx) < 0 ||
       rpc_write_launch_config(conn, config) < 0 ||
       rpc_write(conn, &f, sizeof(f)) < 0 ||
-      rpc_write(conn, &launch_context, sizeof(launch_context)) < 0 ||
       rpc_write_copy(conn, &kernel_handle, sizeof(kernel_handle)) < 0 ||
 #if CUDA_VERSION >= 12000
       (kernel_handle
@@ -8295,11 +8288,7 @@ void rpc_close(conn_t *conn) {
   // lane threads with no CUDA context. Invalidate all per-lane context hints.
   lupine_invalidate_current_context_cache();
 
-  if (!conn->closed) {
-    conn->closed = 1;
-    shutdown(conn->connfd, SHUT_RDWR);
-    close(conn->connfd);
-  }
+  rpc_close_transport_socket(conn);
 
   pthread_mutex_lock(&conn->read_mutex);
   pthread_cond_broadcast(&conn->read_cond);
