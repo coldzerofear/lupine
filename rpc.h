@@ -186,6 +186,7 @@ extern int rpc_http2_read(conn_t *conn, void *data, size_t size);
 extern int rpc_http2_writev(conn_t *conn, const rpc_write_entry *entries,
                             int entry_count);
 extern int rpc_http2_client_init(conn_t *conn);
+extern void rpc_http2_client_start_heartbeat(conn_t *conn);
 // Sends HEAD / and returns the x-lupine-cuda-version response header, or
 // nullptr when the request fails or the server does not advertise a version.
 // The returned pointer remains valid until rpc_http2_destroy() or
@@ -199,6 +200,12 @@ extern int rpc_http2_compress_lz4(conn_t *conn);
 // the HTTP/2 request headers, or nullptr when no session was supplied.
 extern const char *rpc_http2_session_id(conn_t *conn);
 extern int rpc_http2_get_read_stats(conn_t *conn, rpc_http2_read_stats *stats);
+
+// Keeps the client-to-server TCP path active while a synchronous RPC waits for
+// its response. The heartbeat is transport-only: it emits HTTP/2 PING frames
+// and does not add, combine, or otherwise change CUDA RPCs.
+extern void rpc_http2_response_wait_begin(conn_t *conn);
+extern void rpc_http2_response_wait_end(conn_t *conn);
 
 // Server-side flow control for payloads that outlive the read that received
 // them. Between hold_begin and hold_end the transport stops crediting received

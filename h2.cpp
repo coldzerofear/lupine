@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <climits>
 #include <deque>
 #include <errno.h>
@@ -15,6 +16,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -30,6 +32,10 @@ constexpr uint32_t kH2ServerWindow =
 constexpr uint64_t kH2MaxHeldBytes = LUPINE_FF_STAGING_WINDOW_BYTES / 2;
 constexpr uint32_t kH2MaxFrame = (16 * 1024 * 1024) - 1;
 constexpr size_t kH2FrameHeaderLen = 9;
+// Linux restarts slow start after an idle period of one retransmission
+// timeout. Keeping response waits below the usual 200 ms minimum RTO avoids
+// collapsing the congestion window between bursts on high-latency links.
+constexpr long kH2HeartbeatIntervalMs = 100;
 
 struct h2_buffer {
   std::vector<unsigned char> data;
@@ -62,6 +68,9 @@ struct h2_transport {
   std::vector<unsigned char> compress_scratch;
   pthread_mutex_t session_mutex = PTHREAD_MUTEX_INITIALIZER;
   pthread_cond_t session_progress = PTHREAD_COND_INITIALIZER;
+  pthread_cond_t heartbeat_progress = PTHREAD_COND_INITIALIZER;
+  pthread_t heartbeat_thread = {};
+  int response_waiters = 0;
   bool transport_failed = false;
   std::string request_method;
   std::string request_path;
@@ -557,6 +566,36 @@ int h2_flush_session_locked(h2_transport *transport) {
   return result == 0 ? 0 : -1;
 }
 
+void *h2_heartbeat_main(void *arg) {
+  auto *transport = static_cast<h2_transport *>(arg);
+  pthread_mutex_lock(&transport->session_mutex);
+  for (;;) {
+    while (transport->response_waiters == 0) {
+      pthread_cond_wait(&transport->heartbeat_progress,
+                        &transport->session_mutex);
+    }
+    if (transport->response_waiters < 0) {
+      break;
+    }
+
+    pthread_mutex_unlock(&transport->session_mutex);
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(kH2HeartbeatIntervalMs));
+    pthread_mutex_lock(&transport->session_mutex);
+
+    std::array<uint8_t, 8> opaque = {};
+    if (nghttp2_submit_ping(transport->session, NGHTTP2_FLAG_NONE,
+                            opaque.data()) != 0 ||
+        h2_flush_session_locked(transport) < 0) {
+      // The heartbeat is best-effort. The normal RPC read/write path owns
+      // transport error reporting and the in-flight CUDA call's result.
+      break;
+    }
+  }
+  pthread_mutex_unlock(&transport->session_mutex);
+  return nullptr;
+}
+
 int h2_flush_session(h2_transport *transport) {
   pthread_mutex_lock(&transport->session_mutex);
   int result = h2_flush_session_locked(transport);
@@ -865,6 +904,34 @@ int rpc_http2_get_read_stats(conn_t *conn, rpc_http2_read_stats *stats) {
   return 0;
 }
 
+void rpc_http2_response_wait_begin(conn_t *conn) {
+  if (conn == nullptr || conn->http2 == nullptr) {
+    return;
+  }
+  auto *transport = static_cast<h2_transport *>(conn->http2);
+  if (transport->server) {
+    return;
+  }
+  pthread_mutex_lock(&transport->session_mutex);
+  if (transport->heartbeat_thread != 0 && transport->response_waiters >= 0) {
+    ++transport->response_waiters;
+    pthread_cond_broadcast(&transport->heartbeat_progress);
+  }
+  pthread_mutex_unlock(&transport->session_mutex);
+}
+
+void rpc_http2_response_wait_end(conn_t *conn) {
+  if (conn == nullptr || conn->http2 == nullptr) {
+    return;
+  }
+  auto *transport = static_cast<h2_transport *>(conn->http2);
+  pthread_mutex_lock(&transport->session_mutex);
+  if (transport->response_waiters > 0) {
+    --transport->response_waiters;
+  }
+  pthread_mutex_unlock(&transport->session_mutex);
+}
+
 void rpc_http2_window_hold_begin(conn_t *conn) {
   if (conn == nullptr || conn->http2 == nullptr) {
     return;
@@ -913,6 +980,21 @@ int rpc_http2_client_init(conn_t *conn) {
   return h2_init_direct(conn, false, false);
 }
 
+void rpc_http2_client_start_heartbeat(conn_t *conn) {
+  if (conn == nullptr || conn->http2 == nullptr) {
+    return;
+  }
+  auto *transport = static_cast<h2_transport *>(conn->http2);
+  pthread_mutex_lock(&transport->session_mutex);
+  if (transport->heartbeat_thread == 0 && transport->response_waiters >= 0) {
+    pthread_t thread = {};
+    if (pthread_create(&thread, nullptr, h2_heartbeat_main, transport) == 0) {
+      transport->heartbeat_thread = thread;
+    }
+  }
+  pthread_mutex_unlock(&transport->session_mutex);
+}
+
 const char *rpc_http2_client_probe(conn_t *conn) {
   if (h2_init_direct(conn, false, true) < 0) {
     return nullptr;
@@ -954,10 +1036,19 @@ void rpc_http2_destroy(conn_t *conn) {
   }
   auto *transport = static_cast<h2_transport *>(conn->http2);
   conn->http2 = nullptr;
+  pthread_mutex_lock(&transport->session_mutex);
+  transport->response_waiters = -1;
+  pthread_cond_broadcast(&transport->heartbeat_progress);
+  pthread_mutex_unlock(&transport->session_mutex);
+  if (transport->heartbeat_thread != 0) {
+    pthread_join(transport->heartbeat_thread, nullptr);
+    transport->heartbeat_thread = 0;
+  }
   if (transport->session != nullptr) {
     nghttp2_session_del(transport->session);
     transport->session = nullptr;
   }
+  pthread_cond_destroy(&transport->heartbeat_progress);
   pthread_cond_destroy(&transport->session_progress);
   pthread_mutex_destroy(&transport->session_mutex);
   delete transport;

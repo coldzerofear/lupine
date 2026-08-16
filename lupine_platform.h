@@ -19,10 +19,12 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+// clang-format off: Windows extension headers require winsock2.h first.
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <mswsock.h>
 #include <mstcpip.h>
+// clang-format on
 
 using ssize_t = SSIZE_T;
 using socklen_t = int;
@@ -179,6 +181,7 @@ using lupine_socket_t = int;
 
 inline int lupine_socket_init() { return 0; }
 inline bool lupine_socket_error_is_intr() { return errno == EINTR; }
+
 inline int lupine_socket_close(lupine_socket_t socket) { return close(socket); }
 inline int lupine_socket_set_reuseaddr(lupine_socket_t socket) {
   const int enable = 1;
