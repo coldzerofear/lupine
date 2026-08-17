@@ -17,8 +17,6 @@ struct rpc_write_entry {
   // every block is stored raw (the source is already compressed, so the LZ4
   // attempt would only waste CPU; the wire format is unchanged).
   unsigned char framed;
-  // The queue owns iov_base and releases it after rpc_write_end or reset.
-  unsigned char owned;
 };
 
 struct rpc_http2_read_stats {
@@ -74,6 +72,9 @@ struct conn_t {
   rpc_write_entry *write_queue;
   int write_queue_count;
   int write_queue_capacity;
+  unsigned char *write_copy_buffer;
+  size_t write_copy_capacity;
+  size_t write_copy_offset;
   int local_request_parity;
   int logical_index;
   int closed;
@@ -84,6 +85,11 @@ struct conn_t {
 extern int rpc_dispatch(conn_t *conn, int parity);
 extern int rpc_read_start(conn_t *conn, int write_id);
 extern int rpc_read(conn_t *conn, void *data, size_t size);
+// Reads a field emitted by rpc_write_buffer. Keeping buffered reads distinct
+// makes request and response serializers exact field-for-field inverses.
+static inline int rpc_read_buffer(conn_t *conn, void *data, size_t size) {
+  return rpc_read(conn, data, size);
+}
 extern int rpc_drain(conn_t *conn, size_t size);
 extern int rpc_read_end(conn_t *conn);
 
@@ -91,10 +97,16 @@ extern int rpc_wait_for_response(conn_t *conn);
 
 extern int rpc_write_start_request(conn_t *conn, const int op);
 extern int rpc_write_start_response(conn_t *conn, const int read_id);
+// A zero-size write is a successful no-op, including when data is null.
 extern int rpc_write(conn_t *conn, const void *data, const size_t size);
-// Copies data into request-owned storage. Unlike rpc_write, the caller may
-// modify or release its source buffer before rpc_write_end returns.
-extern int rpc_write_copy(conn_t *conn, const void *data, const size_t size);
+// Reserves the request-owned storage used by subsequent rpc_write_buffer
+// calls. The reservation must be made once before the first buffered write in
+// an RPC and is released with the request.
+extern int rpc_copy_alloc(conn_t *conn, const size_t size);
+// Returns and queues the next aligned span in the request-owned allocation.
+// The complete allocation is fixed before serialization starts, so returned
+// pointers remain valid until the request ends.
+extern void *rpc_write_buffer(conn_t *conn, size_t size, size_t alignment);
 extern int rpc_write_iovecs(conn_t *conn, const struct iovec *iovecs,
                             size_t count);
 extern int rpc_write_framed(conn_t *conn, const void *data, const size_t size);
@@ -116,68 +128,11 @@ extern void rpc_conn_destroy(conn_t *conn);
 // permanent failure.
 extern lupine_socket_t lupine_tcp_connect(const char *host, const char *port);
 
-extern int
-rpc_write_kernel_node_params(conn_t *conn,
-                             const CUDA_KERNEL_NODE_PARAMS *node_params,
-                             CUfunction function);
-extern int rpc_read_kernel_node_params(conn_t *conn,
-                                       CUDA_KERNEL_NODE_PARAMS *node_params);
-extern int rpc_read_kernel_node_params_and_values(
-    conn_t *conn, CUDA_KERNEL_NODE_PARAMS *node_params, CUresult *result);
-extern void rpc_free_kernel_param_values(void **values);
-#ifdef LUPINE_RPC_SERVER
-extern int rpc_write_func_param_info(conn_t *conn, CUfunction function);
-extern int rpc_read_func_param_values(conn_t *conn, void ***values,
-                                      CUfunction function, CUresult *result);
-#if CUDA_VERSION >= 12000
-extern int rpc_read_kernel_param_values(conn_t *conn, void ***values,
-                                        CUkernel kernel, CUresult *result);
-#endif
-extern int rpc_read_kernel_node_param_values(
-    conn_t *conn, CUDA_KERNEL_NODE_PARAMS *node_params, CUresult *result);
-#endif
-#if defined(LUPINE_RPC_CLIENT) || defined(LUPINE_RPC_SERVER)
-extern int rpc_write_func_param_values(conn_t *conn, CUfunction function,
-                                       void *const *values);
-#if CUDA_VERSION >= 12000
-extern int rpc_write_kernel_param_values(conn_t *conn, CUkernel kernel,
-                                         void *const *values);
-#endif
-#endif
-extern int rpc_write_launch_config(conn_t *conn, const CUlaunchConfig *config);
-extern int rpc_read_launch_config(conn_t *conn, CUlaunchConfig *config,
-                                  std::vector<CUlaunchAttribute> *attributes);
 struct rpc_jit_output_binding {
   CUjit_option option;
   void *dst;
   size_t size;
 };
-struct rpc_jit_server_state {
-  std::vector<CUjit_option> options;
-  std::vector<void *> option_values;
-  float wall_time = 0.0f;
-  std::vector<char> info_log;
-  std::vector<char> error_log;
-  bool capture_wall_time = false;
-  bool capture_info_log = false;
-  bool capture_error_log = false;
-};
-extern int rpc_write_jit_options(conn_t *conn, const unsigned int *num_options,
-                                 const CUjit_option *options,
-                                 void *const *option_values);
-extern int rpc_read_jit_options(conn_t *conn,
-                                std::vector<CUjit_option> *options,
-                                std::vector<uintptr_t> *raw_values);
-extern int rpc_read_jit_options(conn_t *conn, rpc_jit_server_state *state);
-extern int rpc_write_library_options(conn_t *conn,
-                                     const unsigned int *num_options,
-                                     const CUlibraryOption *options,
-                                     void *const *option_values);
-extern int rpc_read_library_options(conn_t *conn,
-                                    std::vector<CUlibraryOption> *options,
-                                    std::vector<uintptr_t> *raw_values,
-                                    bool *has_option_values);
-extern int rpc_write_jit_outputs(conn_t *conn, rpc_jit_server_state *state);
 extern int
 rpc_read_jit_outputs(conn_t *conn,
                      const std::vector<rpc_jit_output_binding> &bindings);
