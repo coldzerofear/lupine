@@ -197,9 +197,9 @@ if (NOT WIN32)
     target_compile_definitions(${CUDA_CLIENT_OUTPUT} PRIVATE LUPINE_RPC_CLIENT)
     if(OpenSSL_FOUND)
       target_compile_definitions(${CUDA_CLIENT_OUTPUT} PRIVATE LUPINE_TLS_OPENSSL)
-      target_link_libraries(${CLIENT_OUTPUT} PRIVATE OpenSSL::SSL OpenSSL::Crypto ${LUPINE_TLS_EXTRA_LIBS})
+      target_link_libraries(${CUDA_CLIENT_OUTPUT} PRIVATE OpenSSL::SSL OpenSSL::Crypto ${LUPINE_TLS_EXTRA_LIBS})
     endif()
-    target_link_libraries(${CLIENT_OUTPUT} PRIVATE ${LUPINE_CXX_RUNTIME_LIBS} ${NGHTTP2_LIBRARY} lupine_lz4)
+    target_link_libraries(${CUDA_CLIENT_OUTPUT} PRIVATE ${LUPINE_CXX_RUNTIME_LIBS} ${NGHTTP2_LIBRARY} lupine_lz4)
     target_link_options(${CUDA_CLIENT_OUTPUT} PRIVATE
         ${LUPINE_STATIC_RUNTIME_LINK_OPTIONS}
         "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/cuda_client.exports"
