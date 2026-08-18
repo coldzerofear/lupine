@@ -36,9 +36,57 @@ set(MIN_CUDA_VERSION 11.0)
 
 find_package(CUDAToolkit REQUIRED)
 find_path(NGHTTP2_INCLUDE_DIR nghttp2/nghttp2.h REQUIRED)
+
+# Self-contained client shims. The client .so files are injected into arbitrary
+# container images whose library sets we do not control; a runtime dependency on
+# libnghttp2/libssl/libstdc++ there either fails to resolve (minimal images) or
+# forces shipping those libraries alongside, where they shadow the image's own
+# copies for every process in the container (observed: a mounted dependency dir
+# broke ollama's llama-server outright). With this ON, nghttp2/OpenSSL/libstdc++/
+# libgcc are linked statically into the shims and the only runtime dependency
+# left is glibc. The exports version scripts (client.exports / nvml.exports)
+# already hide every embedded symbol from .dynsym, so the static copies cannot
+# interpose on the target image's own nghttp2/OpenSSL/libstdc++.
+# lz4 below is the in-tree precedent for exactly this reasoning.
+#
+# The server takes the same treatment for a different reason: its own runtime
+# needs are tiny (glibc, plus the libcuda/libnvidia-ml the container runtime
+# injects), so once nghttp2 and libstdc++ are linked in it no longer needs a
+# CUDA runtime base image to live in -- which is most of the server image.
+option(LUPINE_STATIC_DEPS
+       "Statically link nghttp2/OpenSSL/libstdc++/libgcc into the client shims and the server" OFF)
+
+find_path(NGHTTP2_INCLUDE_DIR nghttp2/nghttp2.h REQUIRED)
 find_library(NGHTTP2_LIBRARY nghttp2 REQUIRED)
+if (LUPINE_STATIC_DEPS)
+    find_library(NGHTTP2_LIBRARY libnghttp2.a REQUIRED)
+    set(OPENSSL_USE_STATIC_LIBS TRUE)
+else()
+    find_library(NGHTTP2_LIBRARY nghttp2 REQUIRED)
+endif()
 # The server stays plaintext (front it with a TLS proxy); only the client links OpenSSL.
 find_package(OpenSSL QUIET)
+
+# What the client shims and the server link for the C++ runtime. The explicit
+# stdc++ entry (rather than letting the C++ driver add it) is historical; keep
+# it for the dynamic build, but a static build must NOT name it or the dynamic
+# library gets linked regardless of -static-libstdc++.
+if (LUPINE_STATIC_DEPS)
+    set(LUPINE_CXX_RUNTIME_LIBS "")
+    # Plain g++ driver flags, for the server as well as the shims. The server's
+    # sources compile as CUDA, but with no device code to link CMake finishes
+    # the link with CMAKE_CUDA_HOST_LINK_LAUNCHER (g++) rather than nvcc, which
+    # would need these wrapped in -Xcompiler and rejects them bare.
+    set(LUPINE_STATIC_RUNTIME_LINK_OPTIONS -static-libstdc++ -static-libgcc)
+    # Static libcrypto needs the loader + threads it would otherwise pull in
+    # through its own DT_NEEDED.
+    set(LUPINE_TLS_EXTRA_LIBS ${CMAKE_DL_LIBS} Threads::Threads)
+    find_package(Threads REQUIRED)
+else()
+    set(LUPINE_CXX_RUNTIME_LIBS stdc++)
+    set(LUPINE_STATIC_RUNTIME_LINK_OPTIONS "")
+    set(LUPINE_TLS_EXTRA_LIBS "")
+endif()
 
 if (NOT CUDAToolkit_VERSION)
     message(FATAL_ERROR "CUDA Toolkit is required but not found.")
@@ -149,10 +197,11 @@ if (NOT WIN32)
     target_compile_definitions(${CUDA_CLIENT_OUTPUT} PRIVATE LUPINE_RPC_CLIENT)
     if(OpenSSL_FOUND)
       target_compile_definitions(${CUDA_CLIENT_OUTPUT} PRIVATE LUPINE_TLS_OPENSSL)
-      target_link_libraries(${CUDA_CLIENT_OUTPUT} PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+      target_link_libraries(${CLIENT_OUTPUT} PRIVATE OpenSSL::SSL OpenSSL::Crypto ${LUPINE_TLS_EXTRA_LIBS})
     endif()
-    target_link_libraries(${CUDA_CLIENT_OUTPUT} PRIVATE stdc++ ${NGHTTP2_LIBRARY} lupine_lz4)
+    target_link_libraries(${CLIENT_OUTPUT} PRIVATE ${LUPINE_CXX_RUNTIME_LIBS} ${NGHTTP2_LIBRARY} lupine_lz4)
     target_link_options(${CUDA_CLIENT_OUTPUT} PRIVATE
+        ${LUPINE_STATIC_RUNTIME_LINK_OPTIONS}
         "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/cuda_client.exports"
     )
     set_target_properties(${CUDA_CLIENT_OUTPUT} PROPERTIES
@@ -166,10 +215,11 @@ if (NOT WIN32)
     target_include_directories(${NVML_CLIENT_OUTPUT} PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
     if(OpenSSL_FOUND)
       target_compile_definitions(${NVML_CLIENT_OUTPUT} PRIVATE LUPINE_TLS_OPENSSL)
-      target_link_libraries(${NVML_CLIENT_OUTPUT} PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+      target_link_libraries(${NVML_CLIENT_OUTPUT} PRIVATE OpenSSL::SSL OpenSSL::Crypto ${LUPINE_TLS_EXTRA_LIBS})
     endif()
-    target_link_libraries(${NVML_CLIENT_OUTPUT} PRIVATE stdc++ ${NGHTTP2_LIBRARY} lupine_lz4)
+    target_link_libraries(${NVML_CLIENT_OUTPUT} PRIVATE ${LUPINE_CXX_RUNTIME_LIBS} ${NGHTTP2_LIBRARY} lupine_lz4)
     target_link_options(${NVML_CLIENT_OUTPUT} PRIVATE
+        ${LUPINE_STATIC_RUNTIME_LINK_OPTIONS}
         "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/nvml.exports"
     )
     set_target_properties(${NVML_CLIENT_OUTPUT} PROPERTIES
@@ -192,6 +242,7 @@ if (WIN32)
     target_link_libraries(${SERVER_OUTPUT} PRIVATE ws2_32)
 else()
     target_link_libraries(${SERVER_OUTPUT} PRIVATE dl)
+    target_link_options(${SERVER_OUTPUT} PRIVATE ${LUPINE_STATIC_RUNTIME_LINK_OPTIONS})
 
     set(H2_TEST_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/h2.cpp
