@@ -283,7 +283,7 @@ RUN set -eux; \
       -DOPENSSL_ROOT_DIR=/opt/static-deps \
       -DCMAKE_LIBRARY_PATH="${CUDA_HOME}/lib64/stubs"; \
     cmake --build /opt/lupine/build-static --parallel "$(nproc)" \
-      --target lupine_driver lupine_nvml
+      --target lupine_cuda_client lupine_nvml
 
 RUN chmod +x /opt/lupine/deploy/check_static_client.sh \
     && /opt/lupine/deploy/check_static_client.sh \
