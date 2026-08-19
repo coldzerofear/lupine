@@ -1,6 +1,86 @@
 #ifndef LUPINE_PLATFORM_H
 #define LUPINE_PLATFORM_H
 
+#if __has_include(<elf.h>)
+#include <elf.h>
+#else
+
+// CUDA cubins are ELF images even when the client is built for a host
+// platform that does not provide <elf.h> (notably macOS). This is the subset
+// of the ELF64 ABI used by the module-image parser.
+#include <cstdint>
+
+using Elf64_Addr = std::uint64_t;
+using Elf64_Off = std::uint64_t;
+using Elf64_Half = std::uint16_t;
+using Elf64_Word = std::uint32_t;
+using Elf64_Xword = std::uint64_t;
+using Elf64_Sxword = std::int64_t;
+
+constexpr int EI_NIDENT = 16;
+
+struct Elf64_Ehdr {
+  unsigned char e_ident[EI_NIDENT];
+  Elf64_Half e_type;
+  Elf64_Half e_machine;
+  Elf64_Word e_version;
+  Elf64_Addr e_entry;
+  Elf64_Off e_phoff;
+  Elf64_Off e_shoff;
+  Elf64_Word e_flags;
+  Elf64_Half e_ehsize;
+  Elf64_Half e_phentsize;
+  Elf64_Half e_phnum;
+  Elf64_Half e_shentsize;
+  Elf64_Half e_shnum;
+  Elf64_Half e_shstrndx;
+};
+
+struct Elf64_Phdr {
+  Elf64_Word p_type;
+  Elf64_Word p_flags;
+  Elf64_Off p_offset;
+  Elf64_Addr p_vaddr;
+  Elf64_Addr p_paddr;
+  Elf64_Xword p_filesz;
+  Elf64_Xword p_memsz;
+  Elf64_Xword p_align;
+};
+
+struct Elf64_Shdr {
+  Elf64_Word sh_name;
+  Elf64_Word sh_type;
+  Elf64_Xword sh_flags;
+  Elf64_Addr sh_addr;
+  Elf64_Off sh_offset;
+  Elf64_Xword sh_size;
+  Elf64_Word sh_link;
+  Elf64_Word sh_info;
+  Elf64_Xword sh_addralign;
+  Elf64_Xword sh_entsize;
+};
+
+struct Elf64_Sym {
+  Elf64_Word st_name;
+  unsigned char st_info;
+  unsigned char st_other;
+  Elf64_Half st_shndx;
+  Elf64_Addr st_value;
+  Elf64_Xword st_size;
+};
+
+#define ELFMAG "\177ELF"
+#define SELFMAG 4
+#define EI_CLASS 4
+#define ELFCLASS64 2
+#define SHT_SYMTAB 2
+#define SHT_NOBITS 8
+#define SHT_DYNSYM 11
+#define STT_FUNC 2
+#define ELF64_ST_TYPE(info) ((info) & 0x0f)
+
+#endif
+
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -200,7 +280,11 @@ inline ssize_t lupine_socket_sendv(lupine_socket_t socket,
   struct msghdr msg = {};
   msg.msg_iov = const_cast<struct iovec *>(iov);
   msg.msg_iovlen = static_cast<size_t>(count);
+#ifdef MSG_NOSIGNAL
   return sendmsg(socket, &msg, MSG_NOSIGNAL);
+#else
+  return sendmsg(socket, &msg, 0);
+#endif
 }
 
 inline int lupine_fd_dup(int fd) { return dup(fd); }
@@ -259,6 +343,11 @@ inline int lupine_socket_apply_transport_options(lupine_socket_t fd) {
              reinterpret_cast<const char *>(&enabled), sizeof(enabled));
   setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE,
              reinterpret_cast<const char *>(&enabled), sizeof(enabled));
+#ifdef SO_NOSIGPIPE
+  // Darwin has no MSG_NOSIGNAL; apply the equivalent behavior to the socket.
+  setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE,
+             reinterpret_cast<const char *>(&enabled), sizeof(enabled));
+#endif
 
   int keepidle = kKeepidleSec;
   int keepintvl = kKeepintvlSec;
@@ -279,7 +368,11 @@ inline int lupine_socket_apply_transport_options(lupine_socket_t fd) {
 #else
   constexpr int kDeadPeerTimeoutMs =
       (kKeepidleSec + kKeepintvlSec * kKeepcnt) * 1000;
+#if defined(__APPLE__)
+  setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE,
+#else
   setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,
+#endif
              reinterpret_cast<const char *>(&keepidle), sizeof(keepidle));
   setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL,
              reinterpret_cast<const char *>(&keepintvl), sizeof(keepintvl));
