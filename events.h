@@ -23,7 +23,7 @@
 // actually reaches the server, so a locally answered query is legal only while
 // no async copy is waiting to be drained. Other outstanding events may be
 // queried by a separate Lupine RPC to warm this cache.
-constexpr uint32_t kLupineEventQueryBatch = LUPINE_EVENT_QUERY_BATCH_MAX;
+constexpr uint32_t kLupineEventQueryBatch = 16;
 
 struct lupine_event_slot {
   CUevent event;
