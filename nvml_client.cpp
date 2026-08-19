@@ -1,6 +1,7 @@
+#include "lupine_platform.h"
+
 #include <cuda.h>
 #include <nvml.h>
-#include <pthread.h>
 
 #include <algorithm>
 #include <atomic>

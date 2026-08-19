@@ -2,6 +2,14 @@ cmake_minimum_required(VERSION 3.18)
 
 project(LupineProject LANGUAGES C CXX)
 
+if(APPLE)
+  set(LUPINE_BUILD_SERVER_DEFAULT OFF)
+else()
+  set(LUPINE_BUILD_SERVER_DEFAULT ON)
+endif()
+option(LUPINE_BUILD_SERVER "Build the CUDA driver server"
+       ${LUPINE_BUILD_SERVER_DEFAULT})
+
 # Sanitizers are applied only to the CPU-only *_test executables (transport,
 # decoder, ipc, checkpoint), never the nvcc-compiled driver/server. Set to a
 # -fsanitize value such as "address,undefined" or "thread"; empty disables.
@@ -28,13 +36,13 @@ function(lupine_scaled_timeout out base)
     set(${out} ${scaled} PARENT_SCOPE)
 endfunction()
 
-if (NOT WIN32 AND NOT APPLE)
+if (LUPINE_BUILD_SERVER AND NOT WIN32 AND NOT APPLE)
     enable_language(CUDA)
 endif()
 
 set(MIN_CUDA_VERSION 11.0)
 
-if(APPLE)
+if(NOT LUPINE_BUILD_SERVER)
   find_path(LUPINE_CUDA_HEADER_DIR cuda.h REQUIRED)
   find_path(LUPINE_NVML_HEADER_DIR nvml.h REQUIRED)
   set(CUDAToolkit_INCLUDE_DIRS
@@ -45,7 +53,7 @@ if(APPLE)
   string(REGEX REPLACE ".*CUDA_VERSION +([0-9]+).*" "\\1"
          LUPINE_CUDA_HEADER_VERSION "${LUPINE_CUDA_VERSION_LINE}")
   message(STATUS
-      "Using macOS CUDA API headers version: ${LUPINE_CUDA_HEADER_VERSION}")
+      "Using client CUDA API headers version: ${LUPINE_CUDA_HEADER_VERSION}")
 else()
   find_package(CUDAToolkit REQUIRED)
 
@@ -67,7 +75,7 @@ find_package(OpenSSL QUIET)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-if (NOT WIN32 AND NOT APPLE)
+if (LUPINE_BUILD_SERVER AND NOT WIN32 AND NOT APPLE)
     set(CMAKE_CUDA_STANDARD 14)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
     set(CMAKE_CUDA_EXTENSIONS OFF)
@@ -160,61 +168,81 @@ set(CUDA_CLIENT_OUTPUT lupine_cuda_client)
 set(NVML_CLIENT_OUTPUT lupine_nvml)
 set(SERVER_OUTPUT lupine_driver_server)
 
-if (NOT WIN32)
-    add_library(${CUDA_CLIENT_OUTPUT} SHARED
-        ${CUDA_CLIENT_SOURCES}
-        ${CUDA_CLIENT_HEADERS}
+add_library(${CUDA_CLIENT_OUTPUT} SHARED
+    ${CUDA_CLIENT_SOURCES}
+    ${CUDA_CLIENT_HEADERS}
+)
+target_include_directories(${CUDA_CLIENT_OUTPUT} PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+target_compile_definitions(${CUDA_CLIENT_OUTPUT} PRIVATE LUPINE_RPC_CLIENT)
+if(OpenSSL_FOUND)
+  target_compile_definitions(${CUDA_CLIENT_OUTPUT} PRIVATE LUPINE_TLS_OPENSSL)
+  target_link_libraries(${CUDA_CLIENT_OUTPUT} PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+endif()
+target_link_libraries(${CUDA_CLIENT_OUTPUT} PRIVATE ${NGHTTP2_LIBRARY} lupine_lz4)
+set_target_properties(${CUDA_CLIENT_OUTPUT} PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+)
+if(WIN32)
+  target_compile_definitions(${CUDA_CLIENT_OUTPUT} PRIVATE
+      LUPINE_WINDOWS_POSIX_SHIMS
+      _CRT_DECLARE_NONSTDC_NAMES=0
+  )
+  target_link_libraries(${CUDA_CLIENT_OUTPUT} PRIVATE ws2_32)
+  set_target_properties(${CUDA_CLIENT_OUTPUT} PROPERTIES
+      OUTPUT_NAME nvcuda
+      PREFIX ""
+      WINDOWS_EXPORT_ALL_SYMBOLS ON
+  )
+else()
+  set_target_properties(${CUDA_CLIENT_OUTPUT} PROPERTIES OUTPUT_NAME cuda)
+  if(NOT APPLE)
+    target_link_libraries(${CUDA_CLIENT_OUTPUT} PRIVATE stdc++)
+    target_link_options(${CUDA_CLIENT_OUTPUT} PRIVATE
+        "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/cuda_client.exports"
     )
-    target_include_directories(${CUDA_CLIENT_OUTPUT} PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
-    target_compile_definitions(${CUDA_CLIENT_OUTPUT} PRIVATE LUPINE_RPC_CLIENT)
-    if(OpenSSL_FOUND)
-      target_compile_definitions(${CUDA_CLIENT_OUTPUT} PRIVATE LUPINE_TLS_OPENSSL)
-      target_link_libraries(${CUDA_CLIENT_OUTPUT} PRIVATE OpenSSL::SSL OpenSSL::Crypto)
-    endif()
-    target_link_libraries(${CUDA_CLIENT_OUTPUT} PRIVATE ${NGHTTP2_LIBRARY} lupine_lz4)
-    if(NOT APPLE)
-      target_link_libraries(${CUDA_CLIENT_OUTPUT} PRIVATE stdc++)
-      target_link_options(${CUDA_CLIENT_OUTPUT} PRIVATE
-          "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/cuda_client.exports"
-      )
-    endif()
     set_target_properties(${CUDA_CLIENT_OUTPUT} PROPERTIES
-        POSITION_INDEPENDENT_CODE ON
-        OUTPUT_NAME cuda
-    )
-    if(NOT APPLE)
-      set_target_properties(${CUDA_CLIENT_OUTPUT} PROPERTIES
         VERSION 1
         SOVERSION 1
-      )
-    endif()
-
-    add_library(${NVML_CLIENT_OUTPUT} SHARED ${NVML_CLIENT_SOURCES})
-    target_include_directories(${NVML_CLIENT_OUTPUT} PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
-    if(OpenSSL_FOUND)
-      target_compile_definitions(${NVML_CLIENT_OUTPUT} PRIVATE LUPINE_TLS_OPENSSL)
-      target_link_libraries(${NVML_CLIENT_OUTPUT} PRIVATE OpenSSL::SSL OpenSSL::Crypto)
-    endif()
-    target_link_libraries(${NVML_CLIENT_OUTPUT} PRIVATE ${NGHTTP2_LIBRARY} lupine_lz4)
-    if(NOT APPLE)
-      target_link_libraries(${NVML_CLIENT_OUTPUT} PRIVATE stdc++)
-      target_link_options(${NVML_CLIENT_OUTPUT} PRIVATE
-          "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/nvml.exports"
-      )
-    endif()
-    set_target_properties(${NVML_CLIENT_OUTPUT} PROPERTIES
-        POSITION_INDEPENDENT_CODE ON
-        OUTPUT_NAME nvidia-ml
     )
-    if(NOT APPLE)
-      set_target_properties(${NVML_CLIENT_OUTPUT} PROPERTIES
-          VERSION 1
-          SOVERSION 1
-      )
-    endif()
+  endif()
 endif()
 
-if(NOT APPLE)
+add_library(${NVML_CLIENT_OUTPUT} SHARED ${NVML_CLIENT_SOURCES})
+target_include_directories(${NVML_CLIENT_OUTPUT} PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+if(OpenSSL_FOUND)
+  target_compile_definitions(${NVML_CLIENT_OUTPUT} PRIVATE LUPINE_TLS_OPENSSL)
+  target_link_libraries(${NVML_CLIENT_OUTPUT} PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+endif()
+target_link_libraries(${NVML_CLIENT_OUTPUT} PRIVATE ${NGHTTP2_LIBRARY} lupine_lz4)
+set_target_properties(${NVML_CLIENT_OUTPUT} PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+)
+if(WIN32)
+  target_compile_definitions(${NVML_CLIENT_OUTPUT} PRIVATE
+      LUPINE_WINDOWS_POSIX_SHIMS
+      _CRT_DECLARE_NONSTDC_NAMES=0
+  )
+  target_link_libraries(${NVML_CLIENT_OUTPUT} PRIVATE ws2_32)
+  set_target_properties(${NVML_CLIENT_OUTPUT} PROPERTIES
+      OUTPUT_NAME nvml
+      PREFIX ""
+      WINDOWS_EXPORT_ALL_SYMBOLS ON
+  )
+else()
+  set_target_properties(${NVML_CLIENT_OUTPUT} PROPERTIES OUTPUT_NAME nvidia-ml)
+  if(NOT APPLE)
+    target_link_libraries(${NVML_CLIENT_OUTPUT} PRIVATE stdc++)
+    target_link_options(${NVML_CLIENT_OUTPUT} PRIVATE
+        "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/nvml.exports"
+    )
+    set_target_properties(${NVML_CLIENT_OUTPUT} PROPERTIES
+        VERSION 1
+        SOVERSION 1
+    )
+  endif()
+endif()
+
+if(LUPINE_BUILD_SERVER)
 add_executable(${SERVER_OUTPUT} ${SERVER_SOURCES} ${SERVER_HEADERS})
 target_include_directories(${SERVER_OUTPUT} PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
 target_compile_definitions(${SERVER_OUTPUT} PRIVATE
@@ -350,7 +378,7 @@ else()
 endif()
 endif()
 
-if (NOT WIN32 AND NOT APPLE)
+if (LUPINE_BUILD_SERVER AND NOT WIN32 AND NOT APPLE)
     target_compile_options(${SERVER_OUTPUT} PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>: --compiler-options=-fPIC,-g,-Wno-deprecated-declarations>
     )
@@ -358,18 +386,26 @@ if (NOT WIN32 AND NOT APPLE)
 endif()
 
 if(TARGET ${CUDA_CLIENT_OUTPUT})
-    target_compile_options(${CUDA_CLIENT_OUTPUT} PRIVATE
-        $<$<COMPILE_LANGUAGE:CXX>:-Wno-deprecated-declarations>)
+    if(MSVC)
+      target_compile_options(${CUDA_CLIENT_OUTPUT} PRIVATE /wd4996)
+    else()
+      target_compile_options(${CUDA_CLIENT_OUTPUT} PRIVATE
+          $<$<COMPILE_LANGUAGE:CXX>:-Wno-deprecated-declarations>)
+    endif()
     message(STATUS "Building CUDA client output: ${CUDA_CLIENT_OUTPUT}")
     message(STATUS "Client TLS (OpenSSL): ${OpenSSL_FOUND}")
 endif()
 
 if(TARGET ${NVML_CLIENT_OUTPUT})
-    target_compile_options(${NVML_CLIENT_OUTPUT} PRIVATE
-        $<$<COMPILE_LANGUAGE:CXX>:-Wno-deprecated-declarations>)
+    if(MSVC)
+      target_compile_options(${NVML_CLIENT_OUTPUT} PRIVATE /wd4996)
+    else()
+      target_compile_options(${NVML_CLIENT_OUTPUT} PRIVATE
+          $<$<COMPILE_LANGUAGE:CXX>:-Wno-deprecated-declarations>)
+    endif()
     message(STATUS "Building NVML client output: ${NVML_CLIENT_OUTPUT}")
 endif()
 
-if(NOT APPLE)
+if(LUPINE_BUILD_SERVER)
   message(STATUS "Building server output: ${SERVER_OUTPUT}")
 endif()
