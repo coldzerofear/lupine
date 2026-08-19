@@ -113,6 +113,7 @@ set(SERVER_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/checkpoint.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/server_checkpoint.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/server.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/rpc_server.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cuda_server.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/copy_pipeline.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/nvml_server.cpp
@@ -120,6 +121,7 @@ set(SERVER_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/compress.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/ipc.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/codegen/gen_server.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/codegen/registry.cpp
 )
 
 set(NVML_CLIENT_SOURCES
@@ -144,13 +146,13 @@ set(CUDA_CLIENT_HEADERS
 
 set(SERVER_HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/checkpoint_provider.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/codegen/gen_server.h
     ${CMAKE_CURRENT_SOURCE_DIR}/lupine_platform.h
     ${CMAKE_CURRENT_SOURCE_DIR}/cuda_server.h
     ${CMAKE_CURRENT_SOURCE_DIR}/copy_pipeline.h
     ${CMAKE_CURRENT_SOURCE_DIR}/nvml_server.h
     ${CMAKE_CURRENT_SOURCE_DIR}/ipc.h
     ${CMAKE_CURRENT_SOURCE_DIR}/rpc.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/rpc_server.h
     ${CMAKE_CURRENT_SOURCE_DIR}/server_checkpoint.h
 )
 

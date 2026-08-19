@@ -7,9 +7,11 @@ from cxxheaderparser.preprocessor import make_gcc_preprocessor
 from cxxheaderparser.types import Type, Pointer, Parameter, Function, Array
 from typing import Optional, Union
 from dataclasses import dataclass
+from string import Template
 import io
 import os
 import glob
+import re
 import subprocess
 import zlib
 from ops import (
@@ -177,15 +179,6 @@ NVML_RPC_FUNCTIONS = [
     "nvmlDeviceGetCudaComputeCapability",
 ]
 
-NVML_MANUAL_SERVER_FUNCTIONS = {
-    "nvmlDeviceGetComputeRunningProcesses",
-    "nvmlDeviceGetComputeRunningProcesses_v2",
-    "nvmlDeviceGetGraphicsRunningProcesses",
-    "nvmlDeviceGetGraphicsRunningProcesses_v2",
-    "nvmlDeviceGetMPSComputeRunningProcesses",
-    "nvmlDeviceGetMPSComputeRunningProcesses_v2",
-}
-
 PRIVATE_RPC_FUNCTIONS = [
     "cuGetExportTableMetadata",
     "cuGraphAddNode_v2",
@@ -202,6 +195,120 @@ PRIVATE_RPC_FUNCTIONS = [
     "lupineLibrarySnapshot",
     "lupineManagedHostFlush",
 ]
+
+REGISTRY_CPP_TEMPLATE = Template(
+    r'''#include "rpc_server.h"
+
+#include "copy_pipeline.h"
+#include "cuda_server.h"
+#include "gen_api.h"
+#include "nvml_server.h"
+
+// clang-format off
+#define LUPINE_RPC_HANDLERS(HANDLER) \
+$registry_entries
+// clang-format on
+
+#define LUPINE_DECLARE_HANDLER(operation, handler, backend)                    \
+  int handler(conn_t *conn);
+LUPINE_RPC_HANDLERS(LUPINE_DECLARE_HANDLER)
+#undef LUPINE_DECLARE_HANDLER
+
+const rpc_handler_registry &lupine_rpc_handlers() {
+#define LUPINE_REGISTER_HANDLER(operation, handler, backend)                    \
+  {operation, {handler, backend}},
+  static const rpc_handler_registry handlers = {
+      LUPINE_RPC_HANDLERS(LUPINE_REGISTER_HANDLER)
+$guarded_handlers
+  };
+#undef LUPINE_REGISTER_HANDLER
+  return handlers;
+}
+
+#undef LUPINE_RPC_HANDLERS
+'''
+)
+
+
+@dataclass(frozen=True)
+class ServerBinding:
+    name: str
+    backend: str
+    handler: str
+    guard: Optional[str] = None
+
+    @property
+    def backend_symbol(self) -> str:
+        return SERVER_BACKENDS[self.backend]
+
+
+SERVER_BACKENDS = {
+    "CUDA": "rpc_backend::cuda",
+    "NVML": "rpc_backend::nvml",
+}
+
+
+def annotation_directives(annotation: str) -> list[str]:
+    directives = []
+    for line in (annotation or "").splitlines():
+        line = line.strip().lstrip("*").strip()
+        if line.startswith("@"):
+            directives.append(line)
+    return directives
+
+
+def parse_server_binding(name: str, annotation: str) -> Optional[ServerBinding]:
+    backend = None
+    handler = None
+    guard = None
+    for directive in annotation_directives(annotation):
+        parts = directive.split(maxsplit=2)
+        if parts[0] == "@server":
+            if backend is not None or len(parts) < 2:
+                raise RuntimeError(
+                    f"Invalid @server annotation for {name}"
+                )
+            backend = parts[1].upper()
+            if backend not in SERVER_BACKENDS:
+                raise RuntimeError(f"Unknown RPC server backend {backend}")
+            if len(parts) == 3:
+                handler = parts[2]
+        elif parts[0] == "@serverguard":
+            if guard is not None or len(parts) < 2:
+                raise RuntimeError(
+                    f"Invalid @serverguard annotation for {name}"
+                )
+            guard = directive.removeprefix("@serverguard").strip()
+
+    if backend is None:
+        if guard is not None:
+            raise RuntimeError(
+                f"@serverguard without @server for {name}"
+            )
+        return None
+
+    if handler is None:
+        handler = "handle_" + name
+    return ServerBinding(name, backend, handler, guard)
+
+
+def collect_server_bindings(path: str) -> dict[str, ServerBinding]:
+    bindings = {}
+    with open(path) as annotations_file:
+        source = annotations_file.read()
+    for match in re.finditer(r"/\*\*(.*?)\*/\s*([^;{]*?\()", source, re.DOTALL):
+        annotation, declaration = match.groups()
+        name_match = re.search(r"([A-Za-z_]\w*)\s*\($", declaration)
+        if name_match is None:
+            continue
+        binding = parse_server_binding(name_match.group(1), annotation)
+        if binding is None:
+            continue
+        previous = bindings.get(binding.name)
+        if previous is not None and previous != binding:
+            raise RuntimeError(f"Conflicting @server annotations for {binding.name}")
+        bindings[binding.name] = binding
+    return bindings
 
 
 def rpc_id(name: str) -> int:
@@ -322,6 +429,8 @@ def parse_annotation(
                 deferred_dtoh="DEFERRED_DTOH" in options,
                 stdout="STDOUT" in options,
             )
+            continue
+        if line.startswith("@server"):
             continue
         if line.startswith("@routingkey"):
             parts = line.split()
@@ -955,14 +1064,16 @@ def server_call_name(function_name: str) -> str:
     return function_name
 
 
-def collect_nvml_functions(annotations: ParsedData):
+def collect_nvml_functions(
+    annotations: ParsedData, server_bindings: dict[str, ServerBinding]
+):
     by_name = {
         function.name.format(): function
         for function in annotations.namespace.functions
     }
     result = []
     for name in NVML_RPC_FUNCTIONS:
-        if name in NVML_MANUAL_SERVER_FUNCTIONS:
+        if name in server_bindings:
             continue
         function = by_name.get(name)
         if function is None:
@@ -1199,6 +1310,7 @@ def main():
     # Parse the files
     cuda_ast: ParsedData = parse_file(cuda_header, options=options)
     annotations: ParsedData = parse_file(annotations_header, options=options)
+    server_bindings = collect_server_bindings(annotations_header)
     functions = [
         function
         for function in cuda_ast.namespace.functions
@@ -1236,9 +1348,18 @@ def main():
             (function, annotation, metadata.operations, metadata)
         )
 
-    nvml_functions_with_annotations = collect_nvml_functions(annotations)
+    nvml_functions_with_annotations = collect_nvml_functions(
+        annotations, server_bindings
+    )
 
-    annotated_names = annotated_rpc_names(annotations)
+    annotated_names = sorted(
+        set(annotated_rpc_names(annotations))
+        | {
+            name
+            for name, binding in server_bindings.items()
+            if binding.backend == "CUDA"
+        }
+    )
 
     with open("gen_api.h", "w") as f:
         f.write("// Generated by codegen.py. Do not edit by hand.\n")
@@ -1262,8 +1383,12 @@ def main():
 
         for function, _, _, _ in functions_with_annotations:
             name = function.name.format()
+            if name in PRIVATE_RPC_FUNCTIONS:
+                continue
             write_rpc_define(f"RPC_{name}", name)
         for name in annotated_names:
+            if name in PRIVATE_RPC_FUNCTIONS:
+                continue
             write_rpc_define(f"RPC_{name}", name)
         for name in NVML_RPC_FUNCTIONS:
             write_rpc_define(f"RPC_{name}", name)
@@ -1715,17 +1840,17 @@ def main():
             "\n"
             "#include <cstring>\n"
             "#include <string>\n"
-            "#include <unordered_map>\n\n"
             '#include "gen_api.h"\n\n'
             '#include <vector>\n\n'
-            '#include <cstdio>\n\n'
-            '#include "gen_server.h"\n\n'
             '#include <cstdio>\n\n'
             '#include "rpc.h"\n\n'
             '#include "nvml_server.h"\n\n'
         )
         for function, annotation, operations, metadata in functions_with_annotations:
-            if metadata.disabled_server:
+            if (
+                metadata.disabled_server
+                or function.name.format() in server_bindings
+            ):
                 continue
 
             # parse the annotation doxygen
@@ -1820,27 +1945,64 @@ def main():
             f.write("    return -1;\n")
             f.write("}\n\n")
 
-        f.write("static const std::unordered_map<int, RequestHandler> opHandlers = {\n")
-        for function, _, _, metadata in functions_with_annotations:
-            if metadata.disabled_server:
-                continue
-            else:
-                f.write(
-                    "    {{RPC_{name}, handle_{name}}},\n".format(
-                        name=function.name.format()
-                    )
-                )
-        for name in NVML_RPC_FUNCTIONS:
-            f.write("    {{RPC_{name}, handle_{name}}},\n".format(name=name))
-        f.write("};\n\n")
+    cuda_handlers = []
+    for function, _, _, metadata in functions_with_annotations:
+        name = function.name.format()
+        if not metadata.disabled_server and name not in server_bindings:
+            cuda_handlers.append(name)
 
-        f.write("RequestHandler get_handler(const int op)\n")
-        f.write("{\n")
-        f.write("    auto it = opHandlers.find(op);\n")
-        f.write("    if (it == opHandlers.end())\n")
-        f.write("        return nullptr;\n")
-        f.write("    return it->second;\n")
-        f.write("}\n")
+    generated_bindings = [
+        ServerBinding(name, "CUDA", f"handle_{name}") for name in cuda_handlers
+    ]
+    generated_bindings.extend(
+        ServerBinding(name, "NVML", f"handle_{name}")
+        for name in NVML_RPC_FUNCTIONS
+        if name not in server_bindings
+    )
+    bindings = list(server_bindings.values()) + generated_bindings
+
+    operations_by_id = {}
+    for binding in bindings:
+        operation = rpc_id(binding.name)
+        if operation in operations_by_id:
+            raise RuntimeError(
+                f"Duplicate RPC operation for {operations_by_id[operation]} "
+                f"and {binding.name}"
+            )
+        operations_by_id[operation] = binding.name
+
+    def registry_entry(binding: ServerBinding, macro: str) -> str:
+        operation_prefix = (
+            "LUPINE_RPC_" if binding.name in PRIVATE_RPC_FUNCTIONS else "RPC_"
+        )
+        return (
+            f"{macro}({operation_prefix}{binding.name}, {binding.handler}, "
+            f"{binding.backend_symbol})"
+        )
+
+    registry_entries = [
+        "  " + registry_entry(binding, "HANDLER")
+        for binding in bindings
+        if binding.guard is None
+    ]
+
+    guarded_handlers = []
+    for binding in bindings:
+        if binding.guard is None:
+            continue
+        guarded_handlers.append(
+            f"#if {binding.guard}\n"
+            f"      {registry_entry(binding, 'LUPINE_REGISTER_HANDLER')}\n"
+            f'#endif'
+        )
+
+    with open("registry.cpp", "w") as f:
+        f.write(
+            REGISTRY_CPP_TEMPLATE.substitute(
+                registry_entries=" \\\n".join(registry_entries),
+                guarded_handlers="\n".join(guarded_handlers),
+            )
+        )
 
     subprocess.run(
         [
@@ -1851,6 +2013,7 @@ def main():
             "gen_nvml_server.h",
             "gen_nvml_server.inc",
             "gen_server.cpp",
+            "registry.cpp",
         ],
         check=True,
     )
