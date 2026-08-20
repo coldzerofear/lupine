@@ -1,0 +1,261 @@
+name: Publish Platform Client Images
+
+# Windows and macOS client shims packaged into GHCR carrier images, so an
+# internal registry can be the single artifact channel alongside the Linux
+# lupine-client-static images. These artifacts serve OFF-CLUSTER endpoints
+# (developer laptops connecting straight to a GPU pool server); Linux pods can
+# only load ELF objects and never consume them.
+#
+# Compilation cannot happen in Linux containers -- Windows needs MSVC, macOS
+# needs the Apple toolchain -- so native runners build (mirroring upstream's
+# build-windows-client / build-macos-client), and a Linux job packages the
+# results into busybox file-carrier images tagged cuda-<ver>-windows /
+# cuda-<ver>-darwin. Tags carry the PLATFORM, never a distro version: the
+# artifacts are self-contained by construction (Windows: vcpkg *-static
+# triplet + static MSVC runtime; macOS: source-built static nghttp2/OpenSSL,
+# only OS-provided /usr/lib dylibs remain, enforced below).
+#
+# CUDA headers come from the same NVIDIA redist archives the Linux Dockerfile
+# uses (exact component pinning per CUDA release), not from unpinned pip
+# wheels -- the client<=server rule needs per-version artifacts.
+#
+# v1 scope: Windows x86_64 and macOS arm64 (Apple Silicon). Windows arm64 and
+# macOS x86_64 slot into the same structure when needed.
+
+on:
+  release:
+    types: [published]
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  NGHTTP2_VERSION: 1.64.0
+  NGHTTP2_SHA256: 20e73f3cf9db3f05988996ac8b3a99ed529f4565ca91a49eb0550498e10621e8
+  OPENSSL_VERSION: 3.0.18
+  OPENSSL_SHA256: d80c34f5cf902dccf1f1b5df5ebb86d0392e37049e5d73df1b3abae72e4ffe8b
+
+jobs:
+  windows:
+    name: Windows client CUDA ${{ matrix.cuda }} / x86_64
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda: ["13.1.0", "13.0.2", "12.9.1", "12.8.1", "12.6.2", "12.5.1", "12.4.1", "11.8.0", "11.7.1"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Download CUDA headers (pinned redist)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ver = '${{ matrix.cuda }}'
+          $redist = Invoke-RestMethod "https://developer.download.nvidia.com/compute/cuda/redist/redistrib_$ver.json"
+          New-Item -ItemType Directory -Force -Path cuda-sdk/include | Out-Null
+          foreach ($comp in 'cuda_cudart', 'cuda_nvml_dev', 'cuda_profiler_api') {
+            $rel = $redist.$comp.'linux-x86_64'.relative_path
+            if (-not $rel) { throw "component $comp missing from redistrib_$ver.json" }
+            $archive = "$comp.tar.xz"
+            Invoke-WebRequest "https://developer.download.nvidia.com/compute/cuda/redist/$rel" -OutFile $archive
+            New-Item -ItemType Directory -Force -Path "extract-$comp" | Out-Null
+            tar -xJf $archive -C "extract-$comp" --strip-components=1
+            Copy-Item "extract-$comp/include/*" cuda-sdk/include -Recurse -Force
+          }
+          if (-not (Test-Path cuda-sdk/include/cuda.h)) { throw 'cuda.h missing' }
+          if (-not (Test-Path cuda-sdk/include/nvml.h)) { throw 'nvml.h missing' }
+
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe")) {
+            throw 'The runner vcpkg installation was not found'
+          }
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install `
+            "nghttp2:x64-windows-static" `
+            "openssl:x64-windows-static"
+
+      - name: Configure client-only build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake -S . -B build/windows-client `
+            -G "Visual Studio 18 2026" `
+            -A x64 `
+            -DLUPINE_BUILD_SERVER=OFF `
+            -DCMAKE_BUILD_TYPE=Release `
+            "-DCMAKE_PREFIX_PATH=$PWD/cuda-sdk" `
+            "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT\scripts\buildsystems\vcpkg.cmake" `
+            "-DVCPKG_TARGET_TRIPLET=x64-windows-static" `
+            "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded"
+
+      - name: Build client DLLs
+        run: >
+          cmake --build build/windows-client --config Release --parallel
+          --target lupine_cuda_client lupine_nvml
+
+      - name: Stage DLLs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path stage/x86_64 | Out-Null
+          Copy-Item 'build/windows-client/Release/nvcuda.dll' stage/x86_64/nvcuda.dll
+          Copy-Item 'build/windows-client/Release/nvml.dll' stage/x86_64/nvml.dll
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-cuda-${{ matrix.cuda }}
+          path: stage
+
+  macos:
+    name: macOS client CUDA ${{ matrix.cuda }} / arm64
+    runs-on: macos-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda: ["13.1.0", "13.0.2", "12.9.1", "12.8.1", "12.6.2", "12.5.1", "12.4.1", "11.8.0", "11.7.1"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Download CUDA headers (pinned redist)
+        run: |
+          set -euo pipefail
+          ver='${{ matrix.cuda }}'
+          curl -fsSL "https://developer.download.nvidia.com/compute/cuda/redist/redistrib_${ver}.json" -o redist.json
+          mkdir -p cuda-sdk/include
+          for comp in cuda_cudart cuda_nvml_dev cuda_profiler_api; do
+            rel=$(python3 -c "import json;print(json.load(open('redist.json'))['$comp']['linux-x86_64']['relative_path'])")
+            curl -fsSL "https://developer.download.nvidia.com/compute/cuda/redist/${rel}" -o comp.tar.xz
+            mkdir -p "extract-$comp"
+            tar -xJf comp.tar.xz -C "extract-$comp" --strip-components=1
+            cp -R "extract-$comp/include/." cuda-sdk/include/
+          done
+          test -f cuda-sdk/include/cuda.h && test -f cuda-sdk/include/nvml.h
+
+      # brew's nghttp2/openssl dylibs would leave /opt/homebrew references in
+      # the artifact, breaking it on machines without brew. Build both static
+      # from source with the same pins as the Linux Dockerfile.
+      - name: Build static dependencies
+        run: |
+          set -euo pipefail
+          export MACOSX_DEPLOYMENT_TARGET=13.0
+          prefix="$PWD/static-deps"
+          curl -fsSL -o nghttp2.tar.gz "https://github.com/nghttp2/nghttp2/releases/download/v${NGHTTP2_VERSION}/nghttp2-${NGHTTP2_VERSION}.tar.gz"
+          echo "${NGHTTP2_SHA256}  nghttp2.tar.gz" | shasum -a 256 -c -
+          tar xzf nghttp2.tar.gz
+          (cd "nghttp2-${NGHTTP2_VERSION}" && ./configure --prefix="$prefix" --enable-lib-only --enable-static --disable-shared --with-pic && make -j"$(sysctl -n hw.ncpu)" && make install)
+          curl -fsSL -o openssl.tar.gz "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
+          echo "${OPENSSL_SHA256}  openssl.tar.gz" | shasum -a 256 -c -
+          tar xzf openssl.tar.gz
+          (cd "openssl-${OPENSSL_VERSION}" && ./config --prefix="$prefix" --libdir=lib no-shared no-module no-tests -fPIC && make -j"$(sysctl -n hw.ncpu)" build_sw && make install_sw)
+
+      - name: Configure client-only build
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLUPINE_BUILD_SERVER=OFF \
+            -DLUPINE_STATIC_DEPS=ON \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
+            -DCMAKE_PREFIX_PATH="$PWD/cuda-sdk;$PWD/static-deps"
+
+      - name: Build client dylibs
+        run: >
+          cmake --build build --parallel
+          --target lupine_cuda_client lupine_nvml
+
+      # Self-containment gate: only OS-provided /usr/lib dylibs may remain.
+      # A /opt/homebrew or @rpath dependency here means the static linking
+      # regressed and the artifact would break off this machine.
+      - name: Verify self-contained dylibs
+        run: |
+          set -euo pipefail
+          for lib in build/libcuda.dylib build/libnvidia-ml.dylib; do
+            bad=$(otool -L "$lib" | tail -n +2 | awk '{print $1}' | grep -vE '^/usr/lib/' || true)
+            if [ -n "$bad" ]; then
+              echo "FAIL: $lib has non-system dependencies:"; echo "$bad"; exit 1
+            fi
+            echo "ok: $lib"
+          done
+
+      - name: Stage dylibs
+        run: |
+          set -euo pipefail
+          mkdir -p stage/arm64
+          cp build/libcuda.dylib stage/arm64/libcuda.dylib
+          cp build/libnvidia-ml.dylib stage/arm64/libnvidia-ml.dylib
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: darwin-cuda-${{ matrix.cuda }}
+          path: stage
+
+  package:
+    name: Package carrier images CUDA ${{ matrix.cuda }}
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda: ["13.1.0", "13.0.2", "12.9.1", "12.8.1", "12.6.2", "12.5.1", "12.4.1", "11.8.0", "11.7.1"]
+
+    steps:
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: windows-cuda-${{ matrix.cuda }}
+          path: windows
+
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: darwin-cuda-${{ matrix.cuda }}
+          path: darwin
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push carrier images
+        run: |
+          set -euo pipefail
+          ver='${{ matrix.cuda }}'
+          repo="ghcr.io/${{ github.repository_owner }}/lupine-client-static"
+          for plat in windows darwin; do
+            dir="carrier-$plat"
+            mkdir -p "$dir/artifacts"
+            cp -R "$plat/." "$dir/artifacts/"
+            printf 'cuda_version=%s\nplatform=%s\n' "$ver" "$plat" > "$dir/artifacts/metadata"
+            cat > "$dir/Dockerfile" <<EOF
+          FROM busybox:stable-glibc
+          LABEL org.opencontainers.image.title="lupine-client-static-$plat"
+          LABEL org.opencontainers.image.source="${{ github.server_url }}/${{ github.repository }}"
+          LABEL io.lupine.cuda-version="$ver"
+          LABEL io.lupine.platform="$plat"
+          COPY artifacts /artifacts
+          CMD ["sh", "-c", "cp -a /artifacts/. \"\${ARTIFACTS_DEST:-/target}/\" && echo copied"]
+          EOF
+            docker build -t "$repo:cuda-$ver-$plat" "$dir"
+            docker push "$repo:cuda-$ver-$plat"
+            if [ '${{ github.event_name }}' = 'release' ]; then
+              docker tag "$repo:cuda-$ver-$plat" "$repo:${{ github.event.release.tag_name }}-cuda-$ver-$plat"
+              docker push "$repo:${{ github.event.release.tag_name }}-cuda-$ver-$plat"
+            fi
+          done
