@@ -1,6 +1,86 @@
 #ifndef LUPINE_PLATFORM_H
 #define LUPINE_PLATFORM_H
 
+#if __has_include(<elf.h>)
+#include <elf.h>
+#else
+
+// CUDA cubins are ELF images even when the client is built for a host
+// platform that does not provide <elf.h> (notably macOS). This is the subset
+// of the ELF64 ABI used by the module-image parser.
+#include <cstdint>
+
+using Elf64_Addr = std::uint64_t;
+using Elf64_Off = std::uint64_t;
+using Elf64_Half = std::uint16_t;
+using Elf64_Word = std::uint32_t;
+using Elf64_Xword = std::uint64_t;
+using Elf64_Sxword = std::int64_t;
+
+constexpr int EI_NIDENT = 16;
+
+struct Elf64_Ehdr {
+  unsigned char e_ident[EI_NIDENT];
+  Elf64_Half e_type;
+  Elf64_Half e_machine;
+  Elf64_Word e_version;
+  Elf64_Addr e_entry;
+  Elf64_Off e_phoff;
+  Elf64_Off e_shoff;
+  Elf64_Word e_flags;
+  Elf64_Half e_ehsize;
+  Elf64_Half e_phentsize;
+  Elf64_Half e_phnum;
+  Elf64_Half e_shentsize;
+  Elf64_Half e_shnum;
+  Elf64_Half e_shstrndx;
+};
+
+struct Elf64_Phdr {
+  Elf64_Word p_type;
+  Elf64_Word p_flags;
+  Elf64_Off p_offset;
+  Elf64_Addr p_vaddr;
+  Elf64_Addr p_paddr;
+  Elf64_Xword p_filesz;
+  Elf64_Xword p_memsz;
+  Elf64_Xword p_align;
+};
+
+struct Elf64_Shdr {
+  Elf64_Word sh_name;
+  Elf64_Word sh_type;
+  Elf64_Xword sh_flags;
+  Elf64_Addr sh_addr;
+  Elf64_Off sh_offset;
+  Elf64_Xword sh_size;
+  Elf64_Word sh_link;
+  Elf64_Word sh_info;
+  Elf64_Xword sh_addralign;
+  Elf64_Xword sh_entsize;
+};
+
+struct Elf64_Sym {
+  Elf64_Word st_name;
+  unsigned char st_info;
+  unsigned char st_other;
+  Elf64_Half st_shndx;
+  Elf64_Addr st_value;
+  Elf64_Xword st_size;
+};
+
+#define ELFMAG "\177ELF"
+#define SELFMAG 4
+#define EI_CLASS 4
+#define ELFCLASS64 2
+#define SHT_SYMTAB 2
+#define SHT_NOBITS 8
+#define SHT_DYNSYM 11
+#define STT_FUNC 2
+#define ELF64_ST_TYPE(info) ((info) & 0x0f)
+
+#endif
+
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -9,22 +89,31 @@
 #define NOMINMAX
 #endif
 
-#include <BaseTsd.h>
-#include <algorithm>
-#include <climits>
-#include <condition_variable>
-#include <cstdio>
-#include <cstdlib>
-#include <io.h>
-#include <mutex>
-#include <thread>
-#include <vector>
 // clang-format off: Windows extension headers require winsock2.h first.
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <mswsock.h>
 #include <mstcpip.h>
+#include <windows.h>
 // clang-format on
+
+#include <BaseTsd.h>
+#include <algorithm>
+#include <atomic>
+#include <climits>
+#include <condition_variable>
+#include <csignal>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fcntl.h>
+#include <io.h>
+#include <mutex>
+#include <new>
+#include <sys/stat.h>
+#include <thread>
+#include <type_traits>
+#include <vector>
 
 using ssize_t = SSIZE_T;
 using socklen_t = int;
@@ -35,56 +124,74 @@ struct iovec {
   size_t iov_len;
 };
 
-struct pthread_mutex_t {
-  std::mutex mutex;
-};
+using pthread_mutex_t = SRWLOCK;
+using pthread_cond_t = CONDITION_VARIABLE;
+using pthread_t = HANDLE;
+using pthread_once_t = INIT_ONCE;
+using pid_t = int;
 
-struct pthread_cond_t {
-  std::condition_variable_any cond;
-};
-
-using pthread_t = std::thread *;
-
-#define PTHREAD_MUTEX_INITIALIZER                                              \
-  {}
-#define PTHREAD_COND_INITIALIZER                                               \
-  {}
+#define PTHREAD_MUTEX_INITIALIZER SRWLOCK_INIT
+#define PTHREAD_COND_INITIALIZER CONDITION_VARIABLE_INIT
+#define PTHREAD_ONCE_INIT INIT_ONCE_STATIC_INIT
 #define LUPINE_INVALID_SOCKET INVALID_SOCKET
 #define LUPINE_STDOUT_FD _fileno(stdout)
 
-inline int pthread_mutex_init(pthread_mutex_t *, void *) { return 0; }
+inline int pthread_mutex_init(pthread_mutex_t *mutex, void *) {
+  InitializeSRWLock(mutex);
+  return 0;
+}
 inline int pthread_mutex_destroy(pthread_mutex_t *) { return 0; }
 
 inline int pthread_mutex_lock(pthread_mutex_t *mutex) {
-  mutex->mutex.lock();
+  AcquireSRWLockExclusive(mutex);
   return 0;
 }
 
 inline int pthread_mutex_unlock(pthread_mutex_t *mutex) {
-  mutex->mutex.unlock();
+  ReleaseSRWLockExclusive(mutex);
   return 0;
 }
 
-inline int pthread_cond_init(pthread_cond_t *, void *) { return 0; }
+inline int pthread_cond_init(pthread_cond_t *cond, void *) {
+  InitializeConditionVariable(cond);
+  return 0;
+}
 inline int pthread_cond_destroy(pthread_cond_t *) { return 0; }
 
 inline int pthread_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex) {
-  std::unique_lock<std::mutex> lock(mutex->mutex, std::adopt_lock);
-  cond->cond.wait(lock);
-  lock.release();
-  return 0;
+  return SleepConditionVariableSRW(cond, mutex, INFINITE, 0) ? 0 : -1;
 }
 
 inline int pthread_cond_broadcast(pthread_cond_t *cond) {
-  cond->cond.notify_all();
+  WakeAllConditionVariable(cond);
+  return 0;
+}
+
+struct lupine_windows_thread_start {
+  void *(*start)(void *);
+  void *arg;
+};
+
+inline DWORD WINAPI lupine_windows_thread_main(void *opaque) {
+  auto *thread_start = static_cast<lupine_windows_thread_start *>(opaque);
+  void *(*start)(void *) = thread_start->start;
+  void *arg = thread_start->arg;
+  delete thread_start;
+  start(arg);
   return 0;
 }
 
 inline int pthread_create(pthread_t *thread, void *, void *(*start)(void *),
                           void *arg) {
-  try {
-    *thread = new std::thread([start, arg]() { start(arg); });
-  } catch (...) {
+  auto *thread_start =
+      new (std::nothrow) lupine_windows_thread_start{start, arg};
+  if (thread_start == nullptr) {
+    return -1;
+  }
+  *thread = CreateThread(nullptr, 0, lupine_windows_thread_main, thread_start,
+                         0, nullptr);
+  if (*thread == nullptr) {
+    delete thread_start;
     return -1;
   }
   return 0;
@@ -92,11 +199,353 @@ inline int pthread_create(pthread_t *thread, void *, void *(*start)(void *),
 
 inline int pthread_join(pthread_t thread, void **) {
   if (thread != nullptr) {
-    thread->join();
-    delete thread;
+    if (WaitForSingleObject(thread, INFINITE) != WAIT_OBJECT_0) {
+      return -1;
+    }
+    CloseHandle(thread);
   }
   return 0;
 }
+
+inline BOOL CALLBACK lupine_windows_once_callback(PINIT_ONCE, PVOID parameter,
+                                                  PVOID *) {
+  reinterpret_cast<void (*)()>(parameter)();
+  return TRUE;
+}
+
+inline int pthread_once(pthread_once_t *once, void (*init)()) {
+  return InitOnceExecuteOnce(once, lupine_windows_once_callback,
+                             reinterpret_cast<void *>(init), nullptr)
+             ? 0
+             : -1;
+}
+
+inline DWORD lupine_thread_id() { return GetCurrentThreadId(); }
+inline DWORD lupine_process_id() { return GetCurrentProcessId(); }
+
+#ifdef LUPINE_WINDOWS_POSIX_SHIMS
+using off_t = __int64;
+using lupine_file_stat = struct _stat64;
+
+inline int open(const char *path, int flags) { return _open(path, flags); }
+inline int open(const char *path, int flags, int mode) {
+  return _open(path, flags, mode);
+}
+inline int fstat(int fd, lupine_file_stat *status) {
+  return _fstat64(fd, status);
+}
+inline int close(int fd) { return _close(fd); }
+
+inline char *strdup(const char *value) { return _strdup(value); }
+inline int strcasecmp(const char *first, const char *second) {
+  return _stricmp(first, second);
+}
+
+#ifndef O_RDONLY
+#define O_RDONLY _O_RDONLY
+#endif
+#ifndef O_BINARY
+#define O_BINARY _O_BINARY
+#endif
+#endif
+
+// Minimal POSIX virtual-memory compatibility for the client shim. Anonymous
+// mappings use VirtualAlloc; file mappings use CreateFileMapping. munmap
+// distinguishes the two through VirtualQuery so the call sites can retain
+// their existing ownership model.
+#define PROT_NONE 0x0
+#define PROT_READ 0x1
+#define PROT_WRITE 0x2
+#define PROT_EXEC 0x4
+#define MAP_PRIVATE 0x02
+#define MAP_ANONYMOUS 0x20
+#define MAP_FIXED_NOREPLACE 0x100000
+#define MAP_FAILED reinterpret_cast<void *>(static_cast<intptr_t>(-1))
+
+inline DWORD lupine_windows_page_protection(int prot) {
+  if ((prot & PROT_EXEC) != 0) {
+    return (prot & PROT_WRITE) != 0 ? PAGE_EXECUTE_READWRITE
+                                    : PAGE_EXECUTE_READ;
+  }
+  if ((prot & PROT_WRITE) != 0) {
+    return PAGE_READWRITE;
+  }
+  if ((prot & PROT_READ) != 0) {
+    return PAGE_READONLY;
+  }
+  return PAGE_NOACCESS;
+}
+
+inline void *mmap(void *address, size_t length, int prot, int flags, int fd,
+                  long long offset) {
+  if (length == 0) {
+    return MAP_FAILED;
+  }
+  if ((flags & MAP_ANONYMOUS) != 0) {
+    void *mapping = VirtualAlloc(address, length, MEM_RESERVE | MEM_COMMIT,
+                                 lupine_windows_page_protection(prot));
+    return mapping == nullptr ? MAP_FAILED : mapping;
+  }
+  intptr_t os_handle = _get_osfhandle(fd);
+  if (os_handle == -1) {
+    return MAP_FAILED;
+  }
+  DWORD protect = (prot & PROT_WRITE) != 0 ? PAGE_READWRITE : PAGE_READONLY;
+  HANDLE file_mapping = CreateFileMappingA(reinterpret_cast<HANDLE>(os_handle),
+                                           nullptr, protect, 0, 0, nullptr);
+  if (file_mapping == nullptr) {
+    return MAP_FAILED;
+  }
+  DWORD access = (prot & PROT_WRITE) != 0 ? FILE_MAP_WRITE : FILE_MAP_READ;
+  ULARGE_INTEGER view_offset = {};
+  view_offset.QuadPart = static_cast<unsigned long long>(offset);
+  void *mapping = MapViewOfFile(file_mapping, access, view_offset.HighPart,
+                                view_offset.LowPart, length);
+  CloseHandle(file_mapping);
+  return mapping == nullptr ? MAP_FAILED : mapping;
+}
+
+inline int munmap(void *address, size_t) {
+  if (address == nullptr || address == MAP_FAILED) {
+    return -1;
+  }
+  MEMORY_BASIC_INFORMATION info = {};
+  if (VirtualQuery(address, &info, sizeof(info)) == 0) {
+    return -1;
+  }
+  if (info.Type == MEM_MAPPED || info.Type == MEM_IMAGE) {
+    return UnmapViewOfFile(address) ? 0 : -1;
+  }
+  return VirtualFree(info.AllocationBase, 0, MEM_RELEASE) ? 0 : -1;
+}
+
+inline int mprotect(void *address, size_t length, int prot) {
+  DWORD previous = 0;
+  return VirtualProtect(address, length, lupine_windows_page_protection(prot),
+                        &previous)
+             ? 0
+             : -1;
+}
+
+inline int mincore(void *address, size_t, unsigned char *residency) {
+  MEMORY_BASIC_INFORMATION info = {};
+  if (VirtualQuery(address, &info, sizeof(info)) == 0 ||
+      info.State != MEM_COMMIT) {
+    return -1;
+  }
+  if (residency != nullptr) {
+    *residency = 1;
+  }
+  return 0;
+}
+
+// Windows access violations are the native equivalent of the SIGSEGV dirty
+// tracking hook used on Unix. These definitions provide only the subset of
+// sigaction/sigaltstack consumed by memcpy.cpp.
+struct siginfo_t {
+  void *si_addr;
+};
+
+using lupine_signal_handler_t = void (*)(int);
+struct sigaction {
+  void (*sa_sigaction)(int, siginfo_t *, void *);
+  lupine_signal_handler_t sa_handler;
+  int sa_flags;
+  int sa_mask;
+};
+
+struct stack_t {
+  void *ss_sp;
+  size_t ss_size;
+  int ss_flags;
+};
+
+#define SA_SIGINFO 0x1
+#define SA_NODEFER 0x2
+#define SA_ONSTACK 0x4
+
+inline sigaction lupine_windows_sigsegv_action = {};
+inline PVOID lupine_windows_exception_handler_handle = nullptr;
+
+inline LONG CALLBACK
+lupine_windows_exception_handler(EXCEPTION_POINTERS *exception) {
+  if (exception == nullptr || exception->ExceptionRecord == nullptr ||
+      exception->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION ||
+      lupine_windows_sigsegv_action.sa_sigaction == nullptr) {
+    return EXCEPTION_CONTINUE_SEARCH;
+  }
+  siginfo_t info = {reinterpret_cast<void *>(
+      exception->ExceptionRecord->ExceptionInformation[1])};
+  lupine_windows_sigsegv_action.sa_sigaction(SIGSEGV, &info, exception);
+  return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+inline int sigaction(int signal, const struct sigaction *action,
+                     struct sigaction *previous) {
+  if (signal != SIGSEGV) {
+    return -1;
+  }
+  if (previous != nullptr) {
+    *previous = lupine_windows_sigsegv_action;
+  }
+  if (action != nullptr) {
+    lupine_windows_sigsegv_action = *action;
+    if (lupine_windows_exception_handler_handle == nullptr &&
+        action->sa_sigaction != nullptr) {
+      lupine_windows_exception_handler_handle =
+          AddVectoredExceptionHandler(1, lupine_windows_exception_handler);
+      if (lupine_windows_exception_handler_handle == nullptr) {
+        return -1;
+      }
+    }
+  }
+  return 0;
+}
+
+inline int sigemptyset(int *set) {
+  if (set != nullptr) {
+    *set = 0;
+  }
+  return 0;
+}
+
+inline int sigaltstack(const stack_t *, stack_t *) { return 0; }
+
+inline long sysconf(int) {
+  SYSTEM_INFO info = {};
+  GetSystemInfo(&info);
+  return static_cast<long>(info.dwPageSize);
+}
+
+#define _SC_PAGESIZE 30
+
+inline int sched_yield() {
+  SwitchToThread();
+  return 0;
+}
+
+#if defined(_MSC_VER) && !defined(__clang__)
+// MSVC does not expose GCC's __atomic_* builtins. The client state fields are
+// deliberately plain scalars because they are shared with signal/exception
+// handlers; use the equivalent std::atomic operations at those call sites.
+#ifndef __ATOMIC_RELAXED
+#define __ATOMIC_RELAXED 0
+#define __ATOMIC_CONSUME 1
+#define __ATOMIC_ACQUIRE 2
+#define __ATOMIC_RELEASE 3
+#define __ATOMIC_ACQ_REL 4
+#define __ATOMIC_SEQ_CST 5
+#endif
+
+inline std::memory_order lupine_atomic_order(int order) {
+  switch (order) {
+  case __ATOMIC_RELAXED:
+    return std::memory_order_relaxed;
+  case __ATOMIC_ACQUIRE:
+  case __ATOMIC_CONSUME:
+    return std::memory_order_acquire;
+  case __ATOMIC_RELEASE:
+    return std::memory_order_release;
+  case __ATOMIC_ACQ_REL:
+    return std::memory_order_acq_rel;
+  default:
+    return std::memory_order_seq_cst;
+  }
+}
+
+inline std::memory_order lupine_atomic_failure_order(int order) {
+  if (order == __ATOMIC_ACQ_REL || order == __ATOMIC_ACQUIRE ||
+      order == __ATOMIC_CONSUME) {
+    return std::memory_order_acquire;
+  }
+  if (order == __ATOMIC_SEQ_CST) {
+    return std::memory_order_seq_cst;
+  }
+  return std::memory_order_relaxed;
+}
+
+template <typename T> struct lupine_atomic_identity {
+  using type = T;
+};
+
+template <typename T>
+inline std::atomic<T> *lupine_atomic_pointer(volatile T *value) {
+  static_assert(std::is_trivially_copyable<T>::value,
+                "atomic compatibility requires a scalar type");
+  return reinterpret_cast<std::atomic<T> *>(const_cast<T *>(value));
+}
+
+template <typename T>
+inline const std::atomic<T> *lupine_atomic_pointer(const volatile T *value) {
+  static_assert(std::is_trivially_copyable<T>::value,
+                "atomic compatibility requires a scalar type");
+  return reinterpret_cast<const std::atomic<T> *>(const_cast<const T *>(value));
+}
+
+template <typename T>
+inline T lupine_atomic_load_n(const volatile T *value, int order) {
+  return lupine_atomic_pointer(value)->load(lupine_atomic_order(order));
+}
+
+template <typename T>
+inline void
+lupine_atomic_store_n(volatile T *value,
+                      typename lupine_atomic_identity<T>::type desired,
+                      int order) {
+  lupine_atomic_pointer(value)->store(desired, lupine_atomic_order(order));
+}
+
+template <typename T>
+inline T
+lupine_atomic_exchange_n(volatile T *value,
+                         typename lupine_atomic_identity<T>::type desired,
+                         int order) {
+  return lupine_atomic_pointer(value)->exchange(desired,
+                                                lupine_atomic_order(order));
+}
+
+template <typename T>
+inline T
+lupine_atomic_add_fetch(volatile T *value,
+                        typename lupine_atomic_identity<T>::type amount,
+                        int order) {
+  return lupine_atomic_pointer(value)->fetch_add(amount,
+                                                 lupine_atomic_order(order)) +
+         amount;
+}
+
+template <typename T>
+inline T
+lupine_atomic_sub_fetch(volatile T *value,
+                        typename lupine_atomic_identity<T>::type amount,
+                        int order) {
+  return lupine_atomic_pointer(value)->fetch_sub(amount,
+                                                 lupine_atomic_order(order)) -
+         amount;
+}
+
+template <typename T>
+inline bool lupine_atomic_compare_exchange_n(
+    volatile T *value, T *expected,
+    typename lupine_atomic_identity<T>::type desired, bool weak,
+    int success_order, int failure_order) {
+  if (weak) {
+    return lupine_atomic_pointer(value)->compare_exchange_weak(
+        *expected, desired, lupine_atomic_order(success_order),
+        lupine_atomic_failure_order(failure_order));
+  }
+  return lupine_atomic_pointer(value)->compare_exchange_strong(
+      *expected, desired, lupine_atomic_order(success_order),
+      lupine_atomic_failure_order(failure_order));
+}
+
+#define __atomic_load_n lupine_atomic_load_n
+#define __atomic_store_n lupine_atomic_store_n
+#define __atomic_exchange_n lupine_atomic_exchange_n
+#define __atomic_add_fetch lupine_atomic_add_fetch
+#define __atomic_sub_fetch lupine_atomic_sub_fetch
+#define __atomic_compare_exchange_n lupine_atomic_compare_exchange_n
+#endif
 
 inline int lupine_socket_init() {
   static int result = []() {
@@ -171,10 +620,16 @@ inline int lupine_fd_truncate(int fd, long length) {
 #include <poll.h>
 #include <pthread.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
 using lupine_socket_t = int;
+using lupine_file_stat = struct stat;
+
+#ifndef O_BINARY
+#define O_BINARY 0
+#endif
 
 #define LUPINE_INVALID_SOCKET (-1)
 #define LUPINE_STDOUT_FD STDOUT_FILENO
@@ -200,7 +655,11 @@ inline ssize_t lupine_socket_sendv(lupine_socket_t socket,
   struct msghdr msg = {};
   msg.msg_iov = const_cast<struct iovec *>(iov);
   msg.msg_iovlen = static_cast<size_t>(count);
+#ifdef MSG_NOSIGNAL
   return sendmsg(socket, &msg, MSG_NOSIGNAL);
+#else
+  return sendmsg(socket, &msg, 0);
+#endif
 }
 
 inline int lupine_fd_dup(int fd) { return dup(fd); }
@@ -259,6 +718,11 @@ inline int lupine_socket_apply_transport_options(lupine_socket_t fd) {
              reinterpret_cast<const char *>(&enabled), sizeof(enabled));
   setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE,
              reinterpret_cast<const char *>(&enabled), sizeof(enabled));
+#ifdef SO_NOSIGPIPE
+  // Darwin has no MSG_NOSIGNAL; apply the equivalent behavior to the socket.
+  setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE,
+             reinterpret_cast<const char *>(&enabled), sizeof(enabled));
+#endif
 
   int keepidle = kKeepidleSec;
   int keepintvl = kKeepintvlSec;
@@ -279,7 +743,11 @@ inline int lupine_socket_apply_transport_options(lupine_socket_t fd) {
 #else
   constexpr int kDeadPeerTimeoutMs =
       (kKeepidleSec + kKeepintvlSec * kKeepcnt) * 1000;
+#if defined(__APPLE__)
+  setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE,
+#else
   setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,
+#endif
              reinterpret_cast<const char *>(&keepidle), sizeof(keepidle));
   setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL,
              reinterpret_cast<const char *>(&keepintvl), sizeof(keepintvl));

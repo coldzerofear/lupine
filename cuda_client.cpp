@@ -1,43 +1,41 @@
+#include "lupine_platform.h"
+
 #include <algorithm>
-#include <arpa/inet.h>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <cuda.h>
-#include <cudaProfiler.h>
-#include <dlfcn.h>
-#include <elf.h>
-#include <fcntl.h>
-#include <features.h>
 #include <fstream>
 #include <functional>
 #include <iostream>
 #include <map>
 #include <mutex>
-#include <netdb.h>
-#include <netinet/tcp.h>
-#ifdef LUPINE_TLS_OPENSSL
-#include <openssl/ssl.h>
-#endif
-#include <pthread.h>
 #include <sstream>
 #include <stdio.h>
 #include <string.h>
 #include <string>
-#include <strings.h>
-#include <sys/mman.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/syscall.h>
-#include <sys/types.h>
 #include <thread>
-#include <unistd.h>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
-#if !defined(__GLIBC__)
-#error "Lupine CUDA client requires glibc"
+#ifndef _WIN32
+#include <arpa/inet.h>
+#include <dlfcn.h>
+#include <netdb.h>
+#include <netinet/tcp.h>
+#include <pthread.h>
+#include <strings.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#elif !defined(__GLIBC__)
+#error "Lupine CUDA client requires glibc, macOS, or Windows"
+#endif
 #endif
 
 #define LUPINE_CUDA_COMPAT_TYPES_ONLY
@@ -50,8 +48,9 @@
 #include "cache.h"
 #include "checkpoint.h"
 #include "client_routing.h"
-#include "codegen/gen_api.h"
+#include "codegen/gen_rpc_ids.h"
 #include "codegen/gen_cuda_client.h"
+#include "cuda_profiler_compat.h"
 #include "events.h"
 #include "ipc.h"
 #include "lupine_attr_sizes.h"
@@ -60,42 +59,42 @@
 #include "memcpy.h"
 #include "rpc.h"
 #include "third_party/libcuckoo/libcuckoo/cuckoohash_map.hh"
-
-pthread_mutex_t conn_mutex;
-conn_t conns[16];
-int nconns = 0;
-static bool lupine_rpc_shutting_down = false;
-
-void rpc_destroy_thread_lane(uint64_t lane_id) {
-  conn_t *active_conns[sizeof(conns) / sizeof(*conns)];
-  int count = 0;
-
-  if (pthread_mutex_lock(&conn_mutex) != 0) {
-    return;
-  }
-  if (!lupine_rpc_shutting_down) {
-    for (int i = 0; i < nconns; ++i) {
-      if (!conns[i].closed) {
-        active_conns[count++] = &conns[i];
-      }
-    }
-  }
-  pthread_mutex_unlock(&conn_mutex);
-
-  for (int i = 0; i < count; ++i) {
-    rpc_write_lane_termination(active_conns[i], lane_id);
-  }
-}
-
-const char *DEFAULT_PORT = "14833";
+#include "transport.h"
 
 void *rpc_client_dispatch_thread(void *arg);
 
-struct lupine_server_endpoint {
-  std::string host;
-  std::string port;
-  bool tls = false;
-};
+static void lupine_cuda_transport_connection_changed(conn_t *) {
+  lupine_invalidate_current_context_cache();
+}
+
+static const lupine_client_transport_config &lupine_cuda_transport_config() {
+  static const auto config = [] {
+    lupine_client_transport_config config;
+    config.dispatch = rpc_client_dispatch_thread;
+    config.connection_opened = lupine_cuda_transport_connection_changed;
+    config.connection_closed = lupine_cuda_transport_connection_changed;
+    return config;
+  }();
+  return config;
+}
+
+void rpc_destroy_thread_lane(uint64_t lane_id) {
+  lupine_client_transport_retire_lane(lane_id);
+}
+
+static void lupine_rpc_connection_closed(conn_t *) {
+  lupine_invalidate_current_context_cache();
+}
+
+static pthread_once_t lupine_rpc_lifecycle_once = PTHREAD_ONCE_INIT;
+
+static void lupine_install_rpc_lifecycle_hooks() {
+  const rpc_lifecycle_hooks hooks = {lupine_rpc_connection_closed,
+                                     rpc_destroy_thread_lane};
+  if (rpc_set_lifecycle_hooks(&hooks) < 0) {
+    LUPINE_LOG_ERROR("Failed to install CUDA RPC lifecycle hooks");
+  }
+}
 
 static CUresult lupine_remote_cuInit(conn_t *conn, unsigned int flags);
 
@@ -163,6 +162,15 @@ static bool lupine_symbol_looks_like_driver_api(const char *symbol) {
 
 using lupine_dlsym_fn = void *(*)(void *, const char *);
 
+#if defined(_WIN32)
+static void *lupine_real_dlsym(void *handle, const char *name) {
+  if (handle == nullptr || name == nullptr) {
+    return nullptr;
+  }
+  return reinterpret_cast<void *>(
+      GetProcAddress(static_cast<HMODULE>(handle), name));
+}
+#elif defined(__GLIBC__)
 static const char *lupine_dlsym_glibc_version() {
 #if defined(__x86_64__)
   return "GLIBC_2.2.5";
@@ -186,6 +194,11 @@ static void *lupine_real_dlsym(void *handle, const char *name) {
   }
   return real_dlsym != nullptr ? real_dlsym(handle, name) : nullptr;
 }
+#else
+static void *lupine_real_dlsym(void *handle, const char *name) {
+  return ::dlsym(handle, name);
+}
+#endif
 
 extern "C" CUresult lupine_unsupported_driver_api() {
   LUPINE_LOG_ERROR("LUPINE unsupported generic Driver API called");
@@ -420,7 +433,7 @@ lupine_device_attribute_cache() {
 }
 
 struct lupine_device_snapshot_info {
-  char name[LUPINE_DEVICE_SNAPSHOT_NAME_BYTES] = {};
+  char name[256] = {};
   CUuuid uuid = {};
   uint64_t total_mem = 0;
 };
@@ -676,100 +689,12 @@ extern "C" void lupine_remember_loaded_module_for_rpc(CUmodule module) {
   lupine_remember_loaded_module(module);
 }
 
-static std::vector<lupine_server_endpoint> &lupine_server_endpoints() {
-  static auto *endpoints = new std::vector<lupine_server_endpoint>();
-  return *endpoints;
-}
-
-static int lupine_connect_endpoint(conn_t *conn,
-                                   const lupine_server_endpoint &endpoint,
-                                   unsigned int logical_index) {
-  if (conn == nullptr) {
-    return -1;
-  }
-
-  lupine_socket_t sockfd =
-      lupine_tcp_connect(endpoint.host.c_str(), endpoint.port.c_str());
-  if (sockfd == LUPINE_INVALID_SOCKET) {
-    LUPINE_LOG_ERROR("Connecting to " << endpoint.host << " port "
-                                      << endpoint.port << " failed");
-    return -1;
-  }
-
-  rpc_write_queue_free(conn);
-  // A new transport gets fresh server lane threads with no CUDA context.
-  lupine_invalidate_current_context_cache();
-  *conn = {};
-  conn->connfd = sockfd;
-  conn->request_id = 0;
-  conn->closed = 0;
-  conn->local_request_parity = conn->request_id & 1;
-  conn->logical_index = static_cast<int>(logical_index);
-  if (endpoint.tls) {
-#ifdef LUPINE_TLS_OPENSSL
-    static SSL_CTX *tls_ctx = []() {
-      SSL_CTX *c = SSL_CTX_new(TLS_client_method());
-      if (c != nullptr) {
-        SSL_CTX_set_min_proto_version(c, TLS1_2_VERSION);
-        SSL_CTX_set_default_verify_paths(c);
-        SSL_CTX_set_verify(c, SSL_VERIFY_PEER, nullptr);
-      }
-      return c;
-    }();
-    SSL *ssl = tls_ctx != nullptr ? SSL_new(tls_ctx) : nullptr;
-    if (ssl != nullptr &&
-        SSL_set_tlsext_host_name(ssl, endpoint.host.c_str()) == 1 &&
-        SSL_set1_host(ssl, endpoint.host.c_str()) == 1 &&
-        SSL_set_fd(ssl, static_cast<int>(sockfd)) == 1 &&
-        SSL_connect(ssl) == 1) {
-      conn->tls_session = ssl;
-    } else {
-      if (ssl != nullptr) {
-        SSL_free(ssl);
-      }
-      LUPINE_LOG_ERROR("TLS handshake with " << endpoint.host << " failed");
-      lupine_socket_close(sockfd);
-      return -1;
-    }
-#else
-    LUPINE_LOG_ERROR("LUPINE_SERVER entry "
-                     << endpoint.host << ":" << endpoint.port
-                     << " uses https:// but this client was built "
-                        "without TLS support");
-    lupine_socket_close(sockfd);
-    return -1;
-#endif
-  }
-  if (pthread_mutex_init(&conn->read_mutex, NULL) != 0 ||
-      pthread_mutex_init(&conn->write_mutex, NULL) != 0 ||
-      pthread_mutex_init(&conn->call_mutex, NULL) != 0 ||
-      pthread_cond_init(&conn->read_cond, NULL) != 0 ||
-      rpc_http2_client_init(conn) < 0 ||
-      pthread_create(&conn->read_thread, NULL, rpc_client_dispatch_thread,
-                     (void *)conn) != 0) {
-    lupine_socket_close(sockfd);
-    return -1;
-  }
-  rpc_http2_client_start_heartbeat(conn);
-
-  return 0;
-}
-
-static void lupine_join_connection_threads(conn_t *conn) {
-  if (conn->read_thread != 0) {
-    pthread_join(conn->read_thread, nullptr);
-    conn->read_thread = 0;
-  }
-  if (conn->rpc_thread != 0) {
-    pthread_join(conn->rpc_thread, nullptr);
-    conn->rpc_thread = 0;
-  }
-}
-
 static bool lupine_env_enabled(const char *name) {
   const char *value = getenv(name);
-  return value != nullptr && strcmp(value, "0") != 0 &&
-         strcasecmp(value, "false") != 0 && strcasecmp(value, "no") != 0;
+  if (value == nullptr || strcmp(value, "0") == 0) {
+    return false;
+  }
+  return strcasecmp(value, "false") != 0 && strcasecmp(value, "no") != 0;
 }
 
 static void *lupine_local_libcuda_handle() {
@@ -780,12 +705,30 @@ static void *lupine_local_libcuda_handle() {
       return;
     }
     const char *override_path = getenv("LUPINE_REAL_LIBCUDA");
+#if defined(_WIN32)
+    if (override_path != nullptr && override_path[0] != '\0') {
+      handle = reinterpret_cast<void *>(LoadLibraryA(override_path));
+      if (handle != nullptr) {
+        return;
+      }
+    }
+    char system_directory[MAX_PATH + 1] = {};
+    UINT length = GetSystemDirectoryA(system_directory, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) {
+      return;
+    }
+    std::string path(system_directory, length);
+    path += "\\nvcuda.dll";
+    handle = reinterpret_cast<void *>(LoadLibraryA(path.c_str()));
+#else
     const char *paths[] = {
         override_path,
+#if !defined(__APPLE__)
         "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
         "/usr/lib/aarch64-linux-gnu/libcuda.so.1",
         "/usr/lib64/libcuda.so.1",
         "/usr/lib/wsl/lib/libcuda.so.1",
+#endif
         nullptr,
     };
     for (const char *path : paths) {
@@ -797,6 +740,7 @@ static void *lupine_local_libcuda_handle() {
         return;
       }
     }
+#endif
   });
   return handle;
 }
@@ -846,8 +790,9 @@ extern "C" CUresult cuInit(unsigned int flags) {
     }
   }
   if (rpc_open() == 0) {
-    for (int i = 0; i < nconns; ++i) {
-      CUresult result = lupine_remote_cuInit(&conns[i], flags);
+    for (int i = 0; i < rpc_size(); ++i) {
+      CUresult result =
+          lupine_remote_cuInit(rpc_client_get_connection(i), flags);
       if (result != CUDA_SUCCESS && first_error == CUDA_SUCCESS) {
         first_error = result;
       } else if (result == CUDA_SUCCESS) {
@@ -1335,12 +1280,12 @@ extern "C" CUresult cuModuleLoad(CUmodule *module, const char *fname) {
   CUresult result = CUDA_ERROR_DEVICE_UNAVAILABLE;
   void *mapping = MAP_FAILED;
   size_t mapped_size = 0;
-  int fd = open(fname, O_RDONLY);
+  int fd = open(fname, O_RDONLY | O_BINARY);
   if (fd < 0) {
     return CUDA_ERROR_FILE_NOT_FOUND;
   }
   // FILE_NOT_FOUND is reserved for open() failing.
-  struct stat st = {};
+  lupine_file_stat st = {};
   if (fstat(fd, &st) < 0) {
     close(fd);
     return CUDA_ERROR_OUT_OF_MEMORY;
@@ -1431,7 +1376,6 @@ static CUresult lupine_load_recorded_library_on_route(CUlibrary source_library,
         rpc_write(conn, &zero_options, sizeof(zero_options)) < 0 ||
         rpc_wait_for_response(conn) < 0 ||
         rpc_read(conn, &loaded, sizeof(loaded)) < 0 ||
-        rpc_read_jit_outputs(conn, {}) < 0 ||
         rpc_read(conn, &result, sizeof(result)) < 0 || rpc_read_end(conn) < 0) {
       return CUDA_ERROR_DEVICE_UNAVAILABLE;
     }
@@ -1732,6 +1676,9 @@ static CUfunction lupine_resolve_host_function(CUfunction function) {
     }
   }
 
+#if defined(_WIN32)
+  return function;
+#else
   Dl_info info = {};
   if (dladdr(reinterpret_cast<void *>(function), &info) == 0) {
     return function;
@@ -1776,6 +1723,7 @@ static CUfunction lupine_resolve_host_function(CUfunction function) {
                                          << " loaded modules");
 
   return function;
+#endif
 }
 
 static CUfunction lupine_translate_private_function(CUfunction function) {
@@ -2821,7 +2769,14 @@ static void lupine_a64_emit_mov_imm64(uint32_t *out, unsigned reg,
 #endif
 
 static void *lupine_make_private_export_stub(int slot, const char *table_name) {
-#if defined(__x86_64__)
+#if defined(_WIN32)
+  (void)slot;
+  (void)table_name;
+  // NVIDIA's private export tables are undocumented and use a different
+  // calling convention on Windows. Public CUDA Driver API entry points remain
+  // fully available; return the standard unsupported stub for private slots.
+  return reinterpret_cast<void *>(&lupine_unsupported_driver_api);
+#elif defined(__x86_64__)
   constexpr size_t stub_size = 52;
   unsigned char *code = static_cast<unsigned char *>(
       mmap(nullptr, stub_size, PROT_READ | PROT_WRITE | PROT_EXEC,
@@ -3712,7 +3667,7 @@ extern "C" CUresult cuCtxGetStreamPriorityRange(int *leastPriority,
 }
 
 struct lupine_jit_client_state {
-  std::vector<rpc_jit_output_binding> bindings;
+  std::vector<void *> option_values;
   std::vector<unsigned char> cubin;
 };
 
@@ -3725,47 +3680,6 @@ static std::unordered_map<CUlinkState, lupine_jit_client_state> &
 lupine_jit_client_states() {
   static std::unordered_map<CUlinkState, lupine_jit_client_state> states;
   return states;
-}
-
-static size_t lupine_jit_option_size(unsigned int numOptions,
-                                     const CUjit_option *options,
-                                     void *const *optionValues,
-                                     CUjit_option size_option) {
-  if (options == nullptr || optionValues == nullptr) {
-    return 0;
-  }
-  for (unsigned int i = 0; i < numOptions; ++i) {
-    if (options[i] == size_option) {
-      return static_cast<size_t>(reinterpret_cast<uintptr_t>(optionValues[i]));
-    }
-  }
-  return 0;
-}
-
-static std::vector<rpc_jit_output_binding>
-lupine_capture_jit_client_bindings(unsigned int numOptions,
-                                   const CUjit_option *options,
-                                   void *const *optionValues) {
-  std::vector<rpc_jit_output_binding> bindings;
-  if (options == nullptr || optionValues == nullptr) {
-    return bindings;
-  }
-  size_t info_size = lupine_jit_option_size(numOptions, options, optionValues,
-                                            CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES);
-  size_t error_size = lupine_jit_option_size(
-      numOptions, options, optionValues, CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES);
-  for (unsigned int i = 0; i < numOptions; ++i) {
-    if (options[i] == CU_JIT_WALL_TIME && optionValues[i] != nullptr) {
-      bindings.push_back({options[i], optionValues[i], sizeof(float)});
-    } else if (options[i] == CU_JIT_INFO_LOG_BUFFER &&
-               optionValues[i] != nullptr && info_size != 0) {
-      bindings.push_back({options[i], optionValues[i], info_size});
-    } else if (options[i] == CU_JIT_ERROR_LOG_BUFFER &&
-               optionValues[i] != nullptr && error_size != 0) {
-      bindings.push_back({options[i], optionValues[i], error_size});
-    }
-  }
-  return bindings;
 }
 
 extern "C" CUresult cuLinkCreate_v2(unsigned int numOptions,
@@ -3796,8 +3710,10 @@ extern "C" CUresult cuLinkCreate_v2(unsigned int numOptions,
   }
   if (return_value == CUDA_SUCCESS) {
     std::lock_guard<std::mutex> lock(lupine_jit_client_mutex());
-    lupine_jit_client_states()[*stateOut].bindings =
-        lupine_capture_jit_client_bindings(numOptions, options, optionValues);
+    auto &jit_state = lupine_jit_client_states()[*stateOut];
+    if (numOptions != 0) {
+      jit_state.option_values.assign(optionValues, optionValues + numOptions);
+    }
   }
   return return_value;
 }
@@ -3820,8 +3736,7 @@ extern "C" CUresult cuLinkAddData_v2(CUlinkState state, CUjitInputType type,
   conn_t *conn = lupine_route_remote_conn(route);
   CUresult return_value;
   size_t name_len = name == nullptr ? 0 : strlen(name) + 1;
-  auto bindings =
-      lupine_capture_jit_client_bindings(numOptions, options, optionValues);
+  size_t jit_output_length = 0;
   if (rpc_write_start_request(conn, RPC_cuLinkAddData_v2) < 0 ||
       rpc_write(conn, &state, sizeof(state)) < 0 ||
       rpc_write(conn, &type, sizeof(type)) < 0 ||
@@ -3832,9 +3747,16 @@ extern "C" CUresult cuLinkAddData_v2(CUlinkState state, CUjitInputType type,
       rpc_write(conn, &numOptions, sizeof(numOptions)) < 0 ||
       rpc_write(conn, options, numOptions * sizeof(*options)) < 0 ||
       rpc_write(conn, optionValues, numOptions * sizeof(*optionValues)) < 0 ||
-      rpc_wait_for_response(conn) < 0 ||
-      rpc_read_jit_outputs(conn, bindings) < 0 ||
-      rpc_read(conn, &return_value, sizeof(return_value)) < 0 ||
+      rpc_wait_for_response(conn) < 0) {
+    return CUDA_ERROR_DEVICE_UNAVAILABLE;
+  }
+  for (unsigned int i = 0; i < numOptions; ++i) {
+    if (rpc_read(conn, &jit_output_length, sizeof(jit_output_length)) < 0 ||
+        rpc_read(conn, optionValues[i], jit_output_length) < 0) {
+      return CUDA_ERROR_DEVICE_UNAVAILABLE;
+    }
+  }
+  if (rpc_read(conn, &return_value, sizeof(return_value)) < 0 ||
       rpc_read_end(conn) < 0) {
     return CUDA_ERROR_DEVICE_UNAVAILABLE;
   }
@@ -3862,14 +3784,13 @@ extern "C" CUresult cuLinkAddFile_v2(CUlinkState state, CUjitInputType type,
   size_t mapped_file_size = 0;
   uint64_t file_size = 0;
   uint8_t has_file_data = 0;
-  auto bindings =
-      lupine_capture_jit_client_bindings(numOptions, options, optionValues);
-  int file_fd = open(path, O_RDONLY);
+  size_t jit_output_length = 0;
+  int file_fd = open(path, O_RDONLY | O_BINARY);
   if (file_fd < 0) {
     return CUDA_ERROR_FILE_NOT_FOUND;
   }
   // FILE_NOT_FOUND is reserved for open() failing.
-  struct stat st = {};
+  lupine_file_stat st = {};
   if (fstat(file_fd, &st) < 0) {
     close(file_fd);
     return CUDA_ERROR_OUT_OF_MEMORY;
@@ -3899,9 +3820,18 @@ extern "C" CUresult cuLinkAddFile_v2(CUlinkState state, CUjitInputType type,
       rpc_write(conn, &numOptions, sizeof(numOptions)) < 0 ||
       rpc_write(conn, options, numOptions * sizeof(*options)) < 0 ||
       rpc_write(conn, optionValues, numOptions * sizeof(*optionValues)) < 0 ||
-      rpc_wait_for_response(conn) < 0 ||
-      rpc_read_jit_outputs(conn, bindings) < 0 ||
-      rpc_read(conn, &return_value, sizeof(return_value)) < 0 ||
+      rpc_wait_for_response(conn) < 0) {
+    munmap(file_mapping, mapped_file_size);
+    return CUDA_ERROR_DEVICE_UNAVAILABLE;
+  }
+  for (unsigned int i = 0; i < numOptions; ++i) {
+    if (rpc_read(conn, &jit_output_length, sizeof(jit_output_length)) < 0 ||
+        rpc_read(conn, optionValues[i], jit_output_length) < 0) {
+      munmap(file_mapping, mapped_file_size);
+      return CUDA_ERROR_DEVICE_UNAVAILABLE;
+    }
+  }
+  if (rpc_read(conn, &return_value, sizeof(return_value)) < 0 ||
       rpc_read_end(conn) < 0) {
     munmap(file_mapping, mapped_file_size);
     return CUDA_ERROR_DEVICE_UNAVAILABLE;
@@ -3925,7 +3855,8 @@ extern "C" CUresult cuLinkComplete(CUlinkState state, void **cubinOut,
   conn_t *conn = lupine_route_remote_conn(route);
   CUresult return_value;
   size_t cubin_size = 0;
-  std::vector<rpc_jit_output_binding> bindings;
+  std::vector<void *> option_values;
+  size_t jit_output_length = 0;
   if (rpc_write_start_request(conn, RPC_cuLinkComplete) < 0 ||
       rpc_write(conn, &state, sizeof(state)) < 0 ||
       rpc_wait_for_response(conn) < 0 ||
@@ -3944,13 +3875,18 @@ extern "C" CUresult cuLinkComplete(CUlinkState state, void **cubinOut,
         rpc_read(conn, jit_state.cubin.data(), cubin_size) < 0) {
       return CUDA_ERROR_DEVICE_UNAVAILABLE;
     }
-    bindings = jit_state.bindings;
+    option_values = jit_state.option_values;
     *cubinOut = jit_state.cubin.empty() ? nullptr : jit_state.cubin.data();
     *sizeOut = jit_state.cubin.size();
   }
 
-  if (rpc_read_jit_outputs(conn, bindings) < 0 ||
-      rpc_read(conn, &return_value, sizeof(return_value)) < 0 ||
+  for (size_t i = 0; i < option_values.size(); ++i) {
+    if (rpc_read(conn, &jit_output_length, sizeof(jit_output_length)) < 0 ||
+        rpc_read(conn, option_values[i], jit_output_length) < 0) {
+      return CUDA_ERROR_DEVICE_UNAVAILABLE;
+    }
+  }
+  if (rpc_read(conn, &return_value, sizeof(return_value)) < 0 ||
       rpc_read_end(conn) < 0) {
     return CUDA_ERROR_DEVICE_UNAVAILABLE;
   }
@@ -4693,11 +4629,10 @@ cuLibraryLoadData(CUlibrary *library, const void *code,
                                   libraryOptionValues, numLibraryOptions);
   }
 
-  auto bindings = lupine_capture_jit_client_bindings(numJitOptions, jitOptions,
-                                                     jitOptionsValues);
   conn_t *conn = lupine_route_remote_conn(route);
   CUresult return_value;
   size_t image_size = image_bytes.size();
+  size_t jit_output_length = 0;
   if (rpc_write_start_request(conn, RPC_cuLibraryLoadData) < 0 ||
       rpc_copy_alloc(conn, libraryOptionValues == nullptr
                                ? numLibraryOptions * sizeof(uintptr_t)
@@ -4727,9 +4662,16 @@ cuLibraryLoadData(CUlibrary *library, const void *code,
     }
   }
   if (rpc_wait_for_response(conn) < 0 ||
-      rpc_read(conn, library, sizeof(CUlibrary)) < 0 ||
-      rpc_read_jit_outputs(conn, bindings) < 0 ||
-      rpc_read(conn, &return_value, sizeof(CUresult)) < 0 ||
+      rpc_read(conn, library, sizeof(CUlibrary)) < 0) {
+    return CUDA_ERROR_DEVICE_UNAVAILABLE;
+  }
+  for (unsigned int i = 0; i < numJitOptions; ++i) {
+    if (rpc_read(conn, &jit_output_length, sizeof(jit_output_length)) < 0 ||
+        rpc_read(conn, jitOptionsValues[i], jit_output_length) < 0) {
+      return CUDA_ERROR_DEVICE_UNAVAILABLE;
+    }
+  }
+  if (rpc_read(conn, &return_value, sizeof(return_value)) < 0 ||
       rpc_read_end(conn) < 0) {
     return CUDA_ERROR_DEVICE_UNAVAILABLE;
   }
@@ -6808,6 +6750,35 @@ static bool lupine_is_writable_user_pointer(const void *ptr, size_t size) {
     return false;
   }
 
+#if defined(_WIN32)
+  MEMORY_BASIC_INFORMATION info = {};
+  if (VirtualQuery(ptr, &info, sizeof(info)) == 0 || info.State != MEM_COMMIT) {
+    return false;
+  }
+  uintptr_t region_start = reinterpret_cast<uintptr_t>(info.BaseAddress);
+  uintptr_t region_end = region_start + info.RegionSize;
+  DWORD protection = info.Protect & 0xff;
+  bool writable = protection == PAGE_READWRITE ||
+                  protection == PAGE_WRITECOPY ||
+                  protection == PAGE_EXECUTE_READWRITE ||
+                  protection == PAGE_EXECUTE_WRITECOPY;
+  return start >= region_start && end <= region_end && writable &&
+         (info.Protect & PAGE_GUARD) == 0;
+#elif defined(__APPLE__)
+  mach_vm_address_t region = static_cast<mach_vm_address_t>(start);
+  mach_vm_size_t region_size = 0;
+  vm_region_basic_info_data_64_t info = {};
+  mach_msg_type_number_t info_count = VM_REGION_BASIC_INFO_COUNT_64;
+  mach_port_t object_name = MACH_PORT_NULL;
+  kern_return_t result = mach_vm_region(
+      mach_task_self(), &region, &region_size, VM_REGION_BASIC_INFO_64,
+      reinterpret_cast<vm_region_info_t>(&info), &info_count, &object_name);
+  if (object_name != MACH_PORT_NULL) {
+    mach_port_deallocate(mach_task_self(), object_name);
+  }
+  return result == KERN_SUCCESS && region <= start &&
+         end <= region + region_size && (info.protection & VM_PROT_WRITE) != 0;
+#else
   std::ifstream maps("/proc/self/maps");
   std::string line;
   while (std::getline(maps, line)) {
@@ -6823,6 +6794,7 @@ static bool lupine_is_writable_user_pointer(const void *ptr, size_t size) {
     }
   }
   return false;
+#endif
 }
 
 static CUresult lupine_cuStreamGetCaptureInfo(
@@ -7698,11 +7670,19 @@ extern "C" CUresult lupine_integrity_check(unsigned int version,
   unsigned char state[66] = {};
   lupine_integrity_hash_pass(state, pass1_result, sizeof(pass1_result), 0x36);
 
+#ifdef _WIN32
+  uint32_t process_id = static_cast<uint32_t>(lupine_process_id());
+  uint32_t thread_id = static_cast<uint32_t>(lupine_thread_id());
+#else
+  uint32_t process_id = static_cast<uint32_t>(getpid());
+  uint32_t thread_id =
+      static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pthread_self()));
+#endif
   lupine_integrity_pass3_input input = {
       static_cast<uint32_t>(driver_version),
       version,
-      static_cast<uint32_t>(getpid()),
-      static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pthread_self())),
+      process_id,
+      thread_id,
       lupine_get_cudart_export_table(),
       lupine_get_integrity_check_table(),
       reinterpret_cast<const void *>(&lupine_integrity_check),
@@ -7946,14 +7926,14 @@ static void *lupine_make_missing_stub(const char *symbol) {
     return nullptr;
   }
 
-#if defined(__x86_64__) || defined(__aarch64__)
+#if defined(__x86_64__) || defined(__aarch64__) || defined(_M_X64)
   static std::unordered_map<std::string, void *> stubs;
   auto existing = stubs.find(symbol);
   if (existing != stubs.end()) {
     return existing->second;
   }
 
-#if defined(__x86_64__)
+#if defined(__x86_64__) || defined(_M_X64)
   constexpr size_t stub_size = 22;
 #else
   constexpr size_t stub_words = 9;
@@ -7968,7 +7948,17 @@ static void *lupine_make_missing_stub(const char *symbol) {
 
   char *stable_symbol = strdup(symbol);
   void *handler = reinterpret_cast<void *>(&lupine_missing_driver_api_called);
-#if defined(__x86_64__)
+#if defined(_WIN32)
+  // Microsoft x64 passes the first argument in rcx.
+  code[0] = 0x48;
+  code[1] = 0xb9;
+  memcpy(code + 2, &stable_symbol, sizeof(stable_symbol));
+  code[10] = 0x48;
+  code[11] = 0xb8;
+  memcpy(code + 12, &handler, sizeof(handler));
+  code[20] = 0xff;
+  code[21] = 0xe0;
+#elif defined(__x86_64__)
   code[0] = 0x48;
   code[1] = 0xbf;
   memcpy(code + 2, &stable_symbol, sizeof(stable_symbol));
@@ -8206,60 +8196,19 @@ static void *lupine_get_unsupported_stub(const char *symbol) {
   return it == stubs.end() ? nullptr : it->second;
 }
 
-void rpc_close(conn_t *conn) {
-  if (conn == nullptr) {
-    return;
-  }
+void rpc_close(conn_t *conn) { lupine_client_transport_close_connection(conn); }
 
-  // A reopened connection reuses the static conn_t slot but gets fresh server
-  // lane threads with no CUDA context. Invalidate all per-lane context hints.
-  lupine_invalidate_current_context_cache();
+static void lupine_rpc_shutdown() { lupine_client_transport_close(); }
 
-  rpc_close_transport_socket(conn);
-
-  pthread_mutex_lock(&conn->read_mutex);
-  pthread_cond_broadcast(&conn->read_cond);
-  pthread_mutex_unlock(&conn->read_mutex);
-}
-
-static void lupine_rpc_shutdown() {
-  if (pthread_mutex_lock(&conn_mutex) < 0) {
-    return;
-  }
-  if (lupine_rpc_shutting_down) {
-    pthread_mutex_unlock(&conn_mutex);
-    return;
-  }
-  lupine_rpc_shutting_down = true;
-  int count = nconns;
-  for (int i = 0; i < count; ++i) {
-    rpc_close(&conns[i]);
-  }
-  pthread_mutex_unlock(&conn_mutex);
-
-  for (int i = 0; i < count; ++i) {
-    lupine_join_connection_threads(&conns[i]);
-#ifdef LUPINE_TLS_OPENSSL
-    // Safe now: the read thread is joined, so nothing touches the SSL*.
-    if (conns[i].tls_session != nullptr) {
-      SSL_free(static_cast<SSL *>(conns[i].tls_session));
-      conns[i].tls_session = nullptr;
-    }
-#endif
-    rpc_conn_destroy(&conns[i]);
-  }
-
-  if (pthread_mutex_lock(&conn_mutex) == 0) {
-    nconns = 0;
-    lupine_server_endpoints().clear();
-    lupine_rpc_shutting_down = false;
-    pthread_mutex_unlock(&conn_mutex);
-  }
-}
-
+#ifdef _WIN32
+static void lupine_rpc_destructor() { lupine_rpc_shutdown(); }
+static const int lupine_rpc_destructor_registration =
+    std::atexit(lupine_rpc_destructor);
+#else
 __attribute__((destructor)) static void lupine_rpc_destructor() {
   lupine_rpc_shutdown();
 }
+#endif
 
 void *rpc_client_dispatch_thread(void *arg) {
   conn_t *conn = (conn_t *)arg;
@@ -8381,81 +8330,21 @@ close_connection:
 }
 
 int rpc_open() {
-  if (pthread_mutex_lock(&conn_mutex) < 0)
-    return -1;
-
-  if (nconns > 0) {
-    if (pthread_mutex_unlock(&conn_mutex) < 0)
-      return -1;
-    return 0;
-  }
-
-  char *server_ips = getenv("LUPINE_SERVER");
-  if (server_ips == NULL) {
-    if (pthread_mutex_unlock(&conn_mutex) < 0)
-      return -1;
+  if (pthread_once(&lupine_rpc_lifecycle_once,
+                   lupine_install_rpc_lifecycle_hooks) != 0) {
     return -1;
   }
-
-  lupine_server_endpoints().clear();
-
-  char *server_ip = strdup(server_ips);
-  char *server_ip_cursor = server_ip;
-  char *token;
-  while ((token = strsep(&server_ip_cursor, ","))) {
-    if (nconns >= static_cast<int>(sizeof(conns) / sizeof(*conns))) {
-      LUPINE_LOG_ERROR("Too many LUPINE_SERVER entries; ignoring the rest");
-      break;
-    }
-
-    char *host;
-    char *port;
-    bool tls = false;
-
-    // Optional URL scheme: https:// enables TLS on this connection.
-    if (strncmp(token, "https://", 8) == 0) {
-      tls = true;
-      token += 8;
-    } else if (strncmp(token, "http://", 7) == 0) {
-      token += 7;
-    }
-
-    // Split the remaining string into host and port.
-    char *colon = strchr(token, ':');
-    if (colon == NULL) {
-      host = token;
-      port = const_cast<char *>(tls ? "443" : DEFAULT_PORT);
-    } else {
-      *colon = '\0';
-      host = token;
-      port = colon + 1;
-    }
-
-    lupine_server_endpoint endpoint{host, port, tls};
-    if (lupine_connect_endpoint(&conns[nconns], endpoint,
-                                static_cast<unsigned int>(nconns)) < 0) {
-      continue;
-    }
-    lupine_server_endpoints().push_back(endpoint);
-    nconns++;
-  }
-  free(server_ip);
-
-  if (pthread_mutex_unlock(&conn_mutex) < 0)
-    return -1;
-  if (nconns == 0)
-    return -1;
-  return 0;
+  return lupine_client_transport_open(lupine_cuda_transport_config());
 }
 
 conn_t *rpc_client_get_connection(unsigned int index) {
-  if (rpc_open() < 0 || index >= static_cast<unsigned int>(nconns)) {
+  if (rpc_open() < 0) {
     return nullptr;
   }
-  return &conns[index];
+  return lupine_client_transport_connection(index);
 }
 
-int rpc_size() { return nconns; }
+int rpc_size() { return static_cast<int>(lupine_client_transport_size()); }
 
 #if CUDA_VERSION >= 12000
 extern "C" CUresult cuTensorMapEncodeTiled(
@@ -8633,7 +8522,11 @@ CUresult cuGetProcAddress_v2(const char *symbol, void **pfn, int cudaVersion,
                    << symbol << "' not found in cudaFunctionMap.");
 
   // fall back to the real loader before creating a local missing-symbol stub
+#if defined(_WIN32)
+  *pfn = lupine_real_cuda_symbol(symbol);
+#else
   *pfn = lupine_real_dlsym(RTLD_DEFAULT, symbol);
+#endif
   if (*pfn != nullptr) {
     if (symbolStatus != nullptr) {
       *symbolStatus = CU_GET_PROC_ADDRESS_SUCCESS;
@@ -8641,7 +8534,15 @@ CUresult cuGetProcAddress_v2(const char *symbol, void **pfn, int cudaVersion,
     return CUDA_SUCCESS;
   }
 
-  void *libCudaHandle = dlopen("libcuda.so", RTLD_NOW | RTLD_GLOBAL);
+#if defined(_WIN32)
+  void *libCudaHandle = lupine_local_libcuda_handle();
+#elif defined(__APPLE__)
+  const char *libcuda_name = "libcuda.dylib";
+  void *libCudaHandle = dlopen(libcuda_name, RTLD_NOW | RTLD_GLOBAL);
+#else
+  const char *libcuda_name = "libcuda.so";
+  void *libCudaHandle = dlopen(libcuda_name, RTLD_NOW | RTLD_GLOBAL);
+#endif
   if (!libCudaHandle) {
     if (lupine_stub_missing_enabled() &&
         lupine_symbol_looks_like_driver_api(symbol)) {
@@ -8703,7 +8604,8 @@ extern "C" CUresult cuGetProcAddress(const char *symbol, void **pfn,
   return CUDA_SUCCESS;
 }
 
-void *dlsym(void *handle, const char *name) __THROW {
+#if defined(__GLIBC__)
+void *dlsym(void *handle, const char *name) noexcept {
   LUPINE_TRACE_LOG("dlsym: " << name);
 
   if (!lupine_symbol_looks_like_driver_api(name)) {
@@ -8763,6 +8665,7 @@ void *dlsym(void *handle, const char *name) __THROW {
   // std::endl;
   return lupine_real_dlsym(handle, name);
 }
+#endif
 
 static const std::unordered_map<std::string, void *> &
 lupine_manual_function_map() {
