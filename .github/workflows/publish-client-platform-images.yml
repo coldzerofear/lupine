@@ -61,8 +61,11 @@ jobs:
           $ver = '${{ matrix.cuda }}'
           $redist = Invoke-RestMethod "https://developer.download.nvidia.com/compute/cuda/redist/redistrib_$ver.json"
           New-Item -ItemType Directory -Force -Path cuda-sdk/include | Out-Null
-          foreach ($comp in 'cuda_cudart', 'cuda_nvml_dev', 'cuda_profiler_api') {
-            $rel = $redist.$comp.'linux-x86_64'.relative_path
+          # cuda_profiler_api first shipped in 11.8; on 11.7 cudaProfiler.h
+          # lives in cuda_nvprof instead.
+          $profiler = if ($redist.cuda_profiler_api) { "cuda_profiler_api" } else { "cuda_nvprof" }
+          foreach ($comp in "cuda_cudart", "cuda_nvml_dev", $profiler) {
+            $rel = $redist.$comp."linux-x86_64".relative_path
             if (-not $rel) { throw "component $comp missing from redistrib_$ver.json" }
             $archive = "$comp.tar.xz"
             Invoke-WebRequest "https://developer.download.nvidia.com/compute/cuda/redist/$rel" -OutFile $archive
@@ -71,7 +74,8 @@ jobs:
             Copy-Item "extract-$comp/include/*" cuda-sdk/include -Recurse -Force
           }
           if (-not (Test-Path cuda-sdk/include/cuda.h)) { throw 'cuda.h missing' }
-          if (-not (Test-Path cuda-sdk/include/nvml.h)) { throw 'nvml.h missing' }
+          if (-not (Test-Path cuda-sdk/include/nvml.h)) { throw "nvml.h missing" }
+          if (-not (Test-Path cuda-sdk/include/cudaProfiler.h)) { throw "cudaProfiler.h missing" }
 
       - name: Install build dependencies
         shell: pwsh
@@ -136,14 +140,18 @@ jobs:
           ver='${{ matrix.cuda }}'
           curl -fsSL "https://developer.download.nvidia.com/compute/cuda/redist/redistrib_${ver}.json" -o redist.json
           mkdir -p cuda-sdk/include
-          for comp in cuda_cudart cuda_nvml_dev cuda_profiler_api; do
+          # cuda_profiler_api first shipped in 11.8; on 11.7 cudaProfiler.h lives
+          # in cuda_nvprof instead.
+          profiler=$(python3 -c "import json;d=json.load(open('redist.json'));print('cuda_profiler_api' if 'cuda_profiler_api' in d else 'cuda_nvprof')")
+          for comp in cuda_cudart cuda_nvml_dev "$profiler"; do
             rel=$(python3 -c "import json;print(json.load(open('redist.json'))['$comp']['linux-x86_64']['relative_path'])")
             curl -fsSL "https://developer.download.nvidia.com/compute/cuda/redist/${rel}" -o comp.tar.xz
             mkdir -p "extract-$comp"
             tar -xJf comp.tar.xz -C "extract-$comp" --strip-components=1
             cp -R "extract-$comp/include/." cuda-sdk/include/
           done
-          test -f cuda-sdk/include/cuda.h && test -f cuda-sdk/include/nvml.h
+          test -f cuda-sdk/include/cuda.h && test -f cuda-sdk/include/nvml.h \
+            && test -f cuda-sdk/include/cudaProfiler.h
 
       # brew's nghttp2/openssl dylibs would leave /opt/homebrew references in
       # the artifact, breaking it on machines without brew. Build both static
@@ -177,18 +185,22 @@ jobs:
           cmake --build build --parallel
           --target lupine_cuda_client lupine_nvml
 
-      # Self-containment gate: only OS-provided /usr/lib dylibs may remain.
-      # A /opt/homebrew or @rpath dependency here means the static linking
-      # regressed and the artifact would break off this machine.
+      # Self-containment gate: only OS-provided libraries may remain. otool -L
+      # prints the file header on line 1 and, for a dylib, its OWN install
+      # name on line 2 (a build path -- flagging it was the false positive
+      # that failed every macOS lane on the first run), so dependencies start
+      # at line 3. /usr/lib and /System/Library are both OS-provided; anything
+      # else (/opt/homebrew, @rpath) means static linking regressed.
       - name: Verify self-contained dylibs
         run: |
           set -euo pipefail
           for lib in build/libcuda.dylib build/libnvidia-ml.dylib; do
-            bad=$(otool -L "$lib" | tail -n +2 | awk '{print $1}' | grep -vE '^/usr/lib/' || true)
+            bad=$(otool -L "$lib" | tail -n +3 | awk '{print $1}' | grep -vE '^(/usr/lib/|/System/Library/)' || true)
             if [ -n "$bad" ]; then
-              echo "FAIL: $lib has non-system dependencies:"; echo "$bad"; exit 1
+              echo "FAIL: $lib has non-system dependencies:"; echo "$bad"
+              echo "---- full otool -L ----"; otool -L "$lib"; exit 1
             fi
-            echo "ok: $lib"
+            echo "ok: $lib"; otool -L "$lib" | sed 's/^/    /'
           done
 
       - name: Stage dylibs
