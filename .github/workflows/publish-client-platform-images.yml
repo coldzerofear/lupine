@@ -48,7 +48,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        cuda: ["13.1.0", "13.0.2", "12.9.1", "12.8.1", "12.6.2", "12.5.1", "12.4.1", "11.8.0", "11.7.1"]
+        cuda: ["13.1.0", "12.9.1", "11.8.0"]
 
     steps:
       - name: Check out repository
@@ -128,7 +128,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        cuda: ["13.1.0", "13.0.2", "12.9.1", "12.8.1", "12.6.2", "12.5.1", "12.4.1", "11.8.0", "11.7.1"]
+        cuda: ["13.1.0", "12.9.1", "11.8.0"]
 
     steps:
       - name: Check out repository
@@ -223,7 +223,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        cuda: ["13.1.0", "13.0.2", "12.9.1", "12.8.1", "12.6.2", "12.5.1", "12.4.1", "11.8.0", "11.7.1"]
+        cuda: ["13.1.0", "12.9.1", "11.8.0"]
 
     steps:
       - name: Download Windows artifact

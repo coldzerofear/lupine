@@ -513,7 +513,11 @@ lupine_function_attribute_cache() {
 static int lupine_read_function_attributes(conn_t *conn, lupine_route route,
                                            CUfunction function) {
   int route_id = lupine_route_identity(route);
-  for (;;) {
+  uint32_t attribute_count = 0;
+  if (rpc_read_buffer(conn, &attribute_count, sizeof(attribute_count)) < 0) {
+    return -1;
+  }
+  for (uint32_t i = 0; i < attribute_count; ++i) {
     CUresult result = CUDA_ERROR_UNKNOWN;
     int attribute = 0;
     int value = 0;
@@ -521,9 +525,6 @@ static int lupine_read_function_attributes(conn_t *conn, lupine_route route,
         rpc_read_buffer(conn, &attribute, sizeof(attribute)) < 0 ||
         rpc_read_buffer(conn, &value, sizeof(value)) < 0) {
       return -1;
-    }
-    if (result == CUDA_ERROR_INVALID_VALUE) {
-      return 0;
     }
     if (result != CUDA_SUCCESS) {
       continue;
@@ -531,12 +532,17 @@ static int lupine_read_function_attributes(conn_t *conn, lupine_route route,
     lupine_function_attribute_cache().insert_or_assign(
         lupine_function_attribute_key{route_id, function, attribute}, value);
   }
+  return 0;
 }
 
 static int lupine_read_kernel_attributes(conn_t *conn, lupine_route route,
                                          CUkernel kernel, CUdevice device) {
   int route_id = lupine_route_identity(route);
-  for (;;) {
+  uint32_t attribute_count = 0;
+  if (rpc_read_buffer(conn, &attribute_count, sizeof(attribute_count)) < 0) {
+    return -1;
+  }
+  for (uint32_t i = 0; i < attribute_count; ++i) {
     CUresult result = CUDA_ERROR_UNKNOWN;
     int attribute = 0;
     int value = 0;
@@ -544,9 +550,6 @@ static int lupine_read_kernel_attributes(conn_t *conn, lupine_route route,
         rpc_read_buffer(conn, &attribute, sizeof(attribute)) < 0 ||
         rpc_read_buffer(conn, &value, sizeof(value)) < 0) {
       return -1;
-    }
-    if (result == CUDA_ERROR_INVALID_VALUE) {
-      return 0;
     }
     if (result != CUDA_SUCCESS) {
       continue;
@@ -555,6 +558,7 @@ static int lupine_read_kernel_attributes(conn_t *conn, lupine_route route,
         lupine_kernel_attribute_key{route_id, kernel, attribute, device},
         value);
   }
+  return 0;
 }
 
 static libcuckoo::cuckoohash_map<lupine_param_info_key, lupine_param_info_value,
@@ -4876,7 +4880,7 @@ cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY,
   bool used_managed_mapping = false;
   uint32_t param_count = static_cast<uint32_t>(param_sizes.size());
   std::vector<CUdeviceptr> translated_params(param_count);
-  std::vector<struct iovec> rpc_params(param_count);
+  std::vector<rpc_write_cursor> rpc_params(param_count);
   status = lupine_sync_mapped_host_to_device_for_launch(
       kernelParams, param_sizes.data(), param_count, translated_params.data(),
       rpc_params.data(), &used_managed_mapping);
@@ -4903,7 +4907,7 @@ cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY,
       rpc_write(conn, &param_count, sizeof(param_count)) < 0 ||
       rpc_write(conn, param_sizes.data(),
                 param_sizes.size() * sizeof(*param_sizes.data())) < 0 ||
-      rpc_write_iovecs(conn, rpc_params.data(), rpc_params.size()) < 0 ||
+      rpc_write_cursors(conn, rpc_params.data(), rpc_params.size()) < 0 ||
       rpc_write_end(conn) < 0) {
     return CUDA_ERROR_DEVICE_UNAVAILABLE;
   }
@@ -4989,7 +4993,7 @@ extern "C" CUresult cuLaunchKernelEx(const CUlaunchConfig *config, CUfunction f,
   bool used_managed_mapping = false;
   uint32_t param_count = static_cast<uint32_t>(param_sizes.size());
   std::vector<CUdeviceptr> translated_params(param_count);
-  std::vector<struct iovec> rpc_params(param_count);
+  std::vector<rpc_write_cursor> rpc_params(param_count);
   status = lupine_sync_mapped_host_to_device_for_launch(
       kernelParams, param_sizes.data(), param_count, translated_params.data(),
       rpc_params.data(), &used_managed_mapping);
@@ -5016,7 +5020,7 @@ extern "C" CUresult cuLaunchKernelEx(const CUlaunchConfig *config, CUfunction f,
       rpc_write(conn, &param_count, sizeof(param_count)) < 0 ||
       rpc_write(conn, param_sizes.data(),
                 param_sizes.size() * sizeof(*param_sizes.data())) < 0 ||
-      rpc_write_iovecs(conn, rpc_params.data(), rpc_params.size()) < 0) {
+      rpc_write_cursors(conn, rpc_params.data(), rpc_params.size()) < 0) {
     return CUDA_ERROR_DEVICE_UNAVAILABLE;
   }
   if (fire_and_forget) {
@@ -5080,7 +5084,7 @@ cuLaunchCooperativeKernel(CUfunction f, unsigned int gridDimX,
 
   uint32_t param_count = static_cast<uint32_t>(param_sizes.size());
   std::vector<CUdeviceptr> translated_params(param_count);
-  std::vector<struct iovec> rpc_params(param_count);
+  std::vector<rpc_write_cursor> rpc_params(param_count);
   status = lupine_sync_mapped_host_to_device_for_launch(
       kernelParams, param_sizes.data(), param_count, translated_params.data(),
       rpc_params.data());
@@ -5103,7 +5107,7 @@ cuLaunchCooperativeKernel(CUfunction f, unsigned int gridDimX,
       rpc_write(conn, &param_count, sizeof(param_count)) < 0 ||
       rpc_write(conn, param_sizes.data(),
                 param_sizes.size() * sizeof(*param_sizes.data())) < 0 ||
-      rpc_write_iovecs(conn, rpc_params.data(), rpc_params.size()) < 0 ||
+      rpc_write_cursors(conn, rpc_params.data(), rpc_params.size()) < 0 ||
       rpc_wait_for_response(conn) < 0 ||
       rpc_read(conn, &return_value, sizeof(return_value)) < 0 ||
       rpc_read_end(conn) < 0) {

@@ -34,7 +34,7 @@ RUN cmake -S /opt/lupine -B /opt/lupine/build \
 
 FROM builder AS client-build
 
-RUN cmake --build /opt/lupine/build --parallel --target lupine_cuda_client lupine_nvml
+RUN cmake --build /opt/lupine/build --parallel --target lupine_cuda_client lupine_nvml_client
 
 RUN test -e /opt/lupine/build/libcuda.so.1 \
     && test -e /opt/lupine/build/libnvidia-ml.so.1 \
@@ -283,7 +283,7 @@ RUN set -eux; \
       -DOPENSSL_ROOT_DIR=/opt/static-deps \
       -DCMAKE_LIBRARY_PATH="${CUDA_HOME}/lib64/stubs"; \
     cmake --build /opt/lupine/build-static --parallel "$(nproc)" \
-      --target lupine_cuda_client lupine_nvml
+      --target lupine_cuda_client lupine_nvml_client
 
 RUN chmod +x /opt/lupine/deploy/check_static_client.sh \
     && /opt/lupine/deploy/check_static_client.sh \

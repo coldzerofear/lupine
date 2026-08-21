@@ -37,25 +37,16 @@ jobs:
       fail-fast: false
       matrix:
         cuda:
+          # Latest release per CUDA major, mirroring upstream ci (#563). The
+          # client<=server rule keeps these usable against any server at the
+          # same or newer version within the wire-compat window.
           # gcc_toolset: empty = the rocky8 system gcc 8.5 (accepted by nvcc
           # 11.x/12.x); CUDA 13 requires a newer host compiler.
           - version: 13.1.0
             gcc_toolset: gcc-toolset-13
-          - version: 13.0.2
-            gcc_toolset: gcc-toolset-13
           - version: 12.9.1
             gcc_toolset: ""
-          - version: 12.8.1
-            gcc_toolset: ""
-          - version: 12.6.2
-            gcc_toolset: ""
-          - version: 12.5.1
-            gcc_toolset: ""
-          - version: 12.4.1
-            gcc_toolset: ""
           - version: 11.8.0
-            gcc_toolset: ""
-          - version: 11.7.1
             gcc_toolset: ""
         platform:
           - arch: amd64
@@ -126,14 +117,8 @@ jobs:
       matrix:
         cuda:
           - version: 13.1.0
-          - version: 13.0.2
           - version: 12.9.1
-          - version: 12.8.1
-          - version: 12.6.2
-          - version: 12.5.1
-          - version: 12.4.1
           - version: 11.8.0
-          - version: 11.7.1
 
     steps:
       - name: Set up Docker Buildx

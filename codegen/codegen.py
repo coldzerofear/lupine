@@ -200,33 +200,49 @@ PRIVATE_RPC_FUNCTIONS = [
 REGISTRY_CPP_TEMPLATE = Template(
     r'''#include "rpc_server.h"
 
-#include "copy_pipeline.h"
-#include "cuda_server.h"
+#ifdef LUPINE_BUILD_CUDA_BACKEND
+#include <cuda.h>
+#endif
 #include "gen_rpc_ids.h"
-#include "nvml_server.h"
 
 // clang-format off
-#define LUPINE_RPC_HANDLERS(HANDLER) \
-$registry_entries
+#define LUPINE_CUDA_RPC_HANDLERS(HANDLER) \
+$cuda_registry_entries
+#define LUPINE_NVML_RPC_HANDLERS(HANDLER) \
+$nvml_registry_entries
 // clang-format on
 
 #define LUPINE_DECLARE_HANDLER(operation, handler, backend)                    \
   int handler(conn_t *conn);
-LUPINE_RPC_HANDLERS(LUPINE_DECLARE_HANDLER)
+#ifdef LUPINE_BUILD_CUDA_BACKEND
+LUPINE_CUDA_RPC_HANDLERS(LUPINE_DECLARE_HANDLER)
+$cuda_guarded_declarations
+#endif
+#ifdef LUPINE_BUILD_NVML_BACKEND
+LUPINE_NVML_RPC_HANDLERS(LUPINE_DECLARE_HANDLER)
+$nvml_guarded_declarations
+#endif
 #undef LUPINE_DECLARE_HANDLER
 
 const rpc_handler_registry &lupine_rpc_handlers() {
 #define LUPINE_REGISTER_HANDLER(operation, handler, backend)                    \
   {operation, {handler, backend}},
   static const rpc_handler_registry handlers = {
-      LUPINE_RPC_HANDLERS(LUPINE_REGISTER_HANDLER)
-$guarded_handlers
+#ifdef LUPINE_BUILD_CUDA_BACKEND
+      LUPINE_CUDA_RPC_HANDLERS(LUPINE_REGISTER_HANDLER)
+$cuda_guarded_handlers
+#endif
+#ifdef LUPINE_BUILD_NVML_BACKEND
+      LUPINE_NVML_RPC_HANDLERS(LUPINE_REGISTER_HANDLER)
+$nvml_guarded_handlers
+#endif
   };
 #undef LUPINE_REGISTER_HANDLER
   return handlers;
 }
 
-#undef LUPINE_RPC_HANDLERS
+#undef LUPINE_CUDA_RPC_HANDLERS
+#undef LUPINE_NVML_RPC_HANDLERS
 '''
 )
 
@@ -430,6 +446,12 @@ def parse_annotation(
                 deferred_dtoh="DEFERRED_DTOH" in options,
                 stdout="STDOUT" in options,
             )
+            continue
+        if line.strip().startswith("@guard"):
+            guard = line.strip().removeprefix("@guard").strip()
+            if not guard or metadata.guard is not None:
+                raise RuntimeError("Invalid @guard annotation")
+            metadata.guard = guard
             continue
         if line.startswith("@server"):
             continue
@@ -1495,6 +1517,9 @@ def main():
             if metadata.disabled_client:
                 continue
 
+            if metadata.guard is not None:
+                f.write(f"#if {metadata.guard}\n")
+
             joined_params = ", ".join(format_function_params(function))
 
             f.write(
@@ -1715,6 +1740,8 @@ def main():
                 else:
                     f.write("    return CUDA_SUCCESS;\n")
                 f.write("}\n\n")
+                if metadata.guard is not None:
+                    f.write("#endif\n\n")
                 continue
 
             f.write(
@@ -1761,6 +1788,8 @@ def main():
             if metadata.routing_kind == "ALL":
                 f.write("        });\n")
             f.write("}\n\n")
+            if metadata.guard is not None:
+                f.write("#endif\n\n")
 
         function_by_name = {
             function.name.format(): function
@@ -1801,11 +1830,15 @@ def main():
             if metadata.disabled_client and metadata.disabled_server:
                 continue
 
+            if metadata.guard is not None:
+                f.write(f"#if {metadata.guard}\n")
             f.write(
                 '    {{"{name}", (void *){name}}},\n'.format(
                     name=function.name.format()
                 )
             )
+            if metadata.guard is not None:
+                f.write("#endif\n")
         # write manual overrides
         function_names = set(
             f.name.format()
@@ -1852,6 +1885,9 @@ def main():
                 or function.name.format() in server_bindings
             ):
                 continue
+
+            if metadata.guard is not None:
+                f.write(f"#if {metadata.guard}\n")
 
             # parse the annotation doxygen
             f.write(
@@ -1922,6 +1958,8 @@ def main():
                 write_server_buffer_cleanup(f, owned_buffers, "    ")
                 f.write("    return -1;\n")
                 f.write("}\n\n")
+                if metadata.guard is not None:
+                    f.write("#endif\n\n")
                 continue
 
             f.write("    if (rpc_write_start_response(conn, request_id) < 0 ||\n")
@@ -1944,15 +1982,19 @@ def main():
             write_server_buffer_cleanup(f, owned_buffers, "    ")
             f.write("    return -1;\n")
             f.write("}\n\n")
-
-    cuda_handlers = []
-    for function, _, _, metadata in functions_with_annotations:
-        name = function.name.format()
-        if not metadata.disabled_server and name not in server_bindings:
-            cuda_handlers.append(name)
+            if metadata.guard is not None:
+                f.write("#endif\n\n")
 
     generated_bindings = [
-        ServerBinding(name, "CUDA", f"handle_{name}") for name in cuda_handlers
+        ServerBinding(
+            function.name.format(),
+            "CUDA",
+            f"handle_{function.name.format()}",
+            metadata.guard,
+        )
+        for function, _, _, metadata in functions_with_annotations
+        if not metadata.disabled_server
+        and function.name.format() not in server_bindings
     ]
     generated_bindings.extend(
         ServerBinding(name, "NVML", f"handle_{name}")
@@ -1980,27 +2022,39 @@ def main():
             f"{binding.backend_symbol})"
         )
 
-    registry_entries = [
-        "  " + registry_entry(binding, "HANDLER")
-        for binding in bindings
-        if binding.guard is None
-    ]
-
-    guarded_handlers = []
+    registry_entries = {backend: [] for backend in SERVER_BACKENDS}
+    guarded_handlers = {backend: [] for backend in SERVER_BACKENDS}
+    guarded_declarations = {backend: [] for backend in SERVER_BACKENDS}
     for binding in bindings:
         if binding.guard is None:
-            continue
-        guarded_handlers.append(
-            f"#if {binding.guard}\n"
-            f"      {registry_entry(binding, 'LUPINE_REGISTER_HANDLER')}\n"
-            f'#endif'
-        )
+            registry_entries[binding.backend].append(
+                "  " + registry_entry(binding, "HANDLER")
+            )
+        else:
+            guarded_declarations[binding.backend].append(
+                f"#if {binding.guard}\n"
+                f"{registry_entry(binding, 'LUPINE_DECLARE_HANDLER')}\n"
+                f'#endif'
+            )
+            guarded_handlers[binding.backend].append(
+                f"#if {binding.guard}\n"
+                f"      {registry_entry(binding, 'LUPINE_REGISTER_HANDLER')}\n"
+                f'#endif'
+            )
 
     with open("registry.cpp", "w") as f:
         f.write(
             REGISTRY_CPP_TEMPLATE.substitute(
-                registry_entries=" \\\n".join(registry_entries),
-                guarded_handlers="\n".join(guarded_handlers),
+                cuda_registry_entries=" \\\n".join(registry_entries["CUDA"]),
+                nvml_registry_entries=" \\\n".join(registry_entries["NVML"]),
+                cuda_guarded_declarations="\n".join(
+                    guarded_declarations["CUDA"]
+                ),
+                nvml_guarded_declarations="\n".join(
+                    guarded_declarations["NVML"]
+                ),
+                cuda_guarded_handlers="\n".join(guarded_handlers["CUDA"]),
+                nvml_guarded_handlers="\n".join(guarded_handlers["NVML"]),
             )
         )
 

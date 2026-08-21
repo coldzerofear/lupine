@@ -32,8 +32,8 @@ template <typename T>
 struct has_owned_member<T, std::void_t<decltype(std::declval<T>().owned)>>
     : std::true_type {};
 
-static_assert(!has_owned_member<rpc_write_entry>::value,
-              "RPC write entries must not own individual iovecs");
+static_assert(!has_owned_member<rpc_write_cursor>::value,
+              "RPC write cursors must not own their bytes");
 
 struct h2_pair {
   conn_t client = {};
@@ -117,14 +117,17 @@ void read_rpc_prefix(conn_t *conn) {
 }
 
 void write_all(conn_t *conn, const std::vector<std::string> &chunks) {
-  std::vector<rpc_write_entry> entries;
-  entries.reserve(chunks.size());
+  std::vector<rpc_write_cursor> cursors;
+  cursors.reserve(chunks.size());
   for (const std::string &chunk : chunks) {
-    entries.push_back({{const_cast<char *>(chunk.data()), chunk.size()}, 0});
+    cursors.push_back(rpc_write_cursor::plain(chunk.data(), chunk.size()));
   }
-  require(rpc_http2_writev(conn, entries.data(),
-                           static_cast<int>(entries.size())) == 0,
-          "h2 write failed");
+  require(rpc_http2_write(conn, cursors) == 0, "h2 write failed");
+}
+
+int write_bytes(conn_t *conn, const void *data, size_t size) {
+  std::vector<rpc_write_cursor> cursors = {rpc_write_cursor::plain(data, size)};
+  return rpc_http2_write(conn, cursors);
 }
 
 std::string read_string(conn_t *conn, size_t size) {
@@ -255,7 +258,13 @@ void test_head_probe_cuda_version_metadata() {
   const char *cuda_version = nullptr;
   std::thread probe(
       [&] { cuda_version = rpc_http2_client_probe(&pair.client); });
+#ifdef LUPINE_CUDA_VERSION
+  const rpc_http2_server_metadata metadata = {LUPINE_CUDA_VERSION};
+  int server_result =
+      rpc_http2_server_init_with_metadata(&pair.server, &metadata);
+#else
   int server_result = rpc_http2_server_init(&pair.server);
+#endif
   probe.join();
 
   require(server_result == 1, "HEAD / was not handled as a metadata request");
@@ -268,7 +277,7 @@ void test_head_probe_cuda_version_metadata() {
 #endif
 }
 
-void test_fragmented_iovec() {
+void test_fragmented_cursors() {
   h2_pair pair = make_pair();
   std::vector<std::string> chunks = {"alpha", "", ":", "beta", ":gamma"};
   std::string received;
@@ -601,8 +610,7 @@ void test_payload_larger_than_flow_control_window() {
     (void)rpc_http2_read(&pair.client, &unused, sizeof(unused));
   });
 
-  rpc_write_entry entry = {{payload, payload_size}, 0};
-  int write_result = rpc_http2_writev(&pair.client, &entry, 1);
+  int write_result = write_bytes(&pair.client, payload, payload_size);
   if (write_result != 0) {
     shutdown(pair.client.connfd, SHUT_RDWR);
     shutdown(pair.server.connfd, SHUT_RDWR);
@@ -644,8 +652,8 @@ void test_server_window_hold_caps_and_releases() {
             "held payload read failed");
     held = rpc_http2_window_hold_end(&pair.server);
   });
-  rpc_write_entry entry = {{payload.data(), payload.size()}, 0};
-  require(rpc_http2_writev(&pair.client, &entry, 1) == 0, "held write failed");
+  require(write_bytes(&pair.client, payload.data(), payload.size()) == 0,
+          "held write failed");
   reader.join();
   require(received == payload, "held payload mismatch");
   require(held == LUPINE_FF_STAGING_WINDOW_BYTES / 2,
@@ -659,7 +667,7 @@ void test_server_window_hold_caps_and_releases() {
                 static_cast<int>(received.size()),
             "read under an outstanding hold failed");
   });
-  require(rpc_http2_writev(&pair.client, &entry, 1) == 0,
+  require(write_bytes(&pair.client, payload.data(), payload.size()) == 0,
           "write under an outstanding hold failed");
   held_reader.join();
   require(received == payload, "payload under an outstanding hold mismatch");
@@ -746,8 +754,7 @@ void test_reset_wakes_flow_controlled_writer() {
   });
 
   std::string payload(128 * 1024, 'x');
-  rpc_write_entry entry = {{payload.data(), payload.size()}, 0};
-  int write_result = rpc_http2_writev(&pair.client, &entry, 1);
+  int write_result = write_bytes(&pair.client, payload.data(), payload.size());
   shutdown(pair.client.connfd, SHUT_RDWR);
   shutdown(pair.server.connfd, SHUT_RDWR);
   server_reset.join();
@@ -762,7 +769,7 @@ void test_reset_wakes_flow_controlled_writer() {
 // lazily block by block (h2.cpp) and rpc_read_payload_part decodes it with
 // chunked, block-aligned reads (compress.cpp). The payload mixes
 // compressible and random data so both compressed and raw block tokens are
-// exercised, and plain iovecs surround the framed one as in a real message.
+// exercised, and plain cursors surround the framed one as in a real message.
 void test_framed_payload_round_trip() {
   h2_pair pair = make_pair();
   exchange_settings(&pair);
@@ -795,13 +802,11 @@ void test_framed_payload_round_trip() {
     received_suffix = read_string(&pair.server, suffix.size());
   });
 
-  rpc_write_entry entries[3] = {
-      {{const_cast<char *>(prefix.data()), prefix.size()}, 0},
-      {{payload.data(), payload.size()}, 1},
-      {{const_cast<char *>(suffix.data()), suffix.size()}, 0},
-  };
-  require(rpc_http2_writev(&pair.client, entries, 3) == 0,
-          "framed write failed");
+  std::vector<rpc_write_cursor> cursors = {
+      rpc_write_cursor::plain(prefix.data(), prefix.size()),
+      rpc_write_cursor::framed(payload.data(), payload.size()),
+      rpc_write_cursor::plain(suffix.data(), suffix.size())};
+  require(rpc_http2_write(&pair.client, cursors) == 0, "framed write failed");
   reader.join();
   require(received_prefix == prefix, "framed prefix mismatch");
   require(received == payload, "framed payload mismatch");
@@ -814,9 +819,8 @@ void test_rpc_write_queue_grows() {
           "zero-length rpc_write failed");
   require(rpc_write_payload(&zero_length, nullptr, 0) == 0,
           "zero-length rpc_write_payload failed");
-  require(zero_length.write_queue_count == 0,
+  require(zero_length.write_queue.empty(),
           "zero-length write consumed a queue entry");
-  rpc_write_queue_free(&zero_length);
 
   h2_pair pair = make_pair();
   init_rpc_write(&pair.client);
@@ -848,7 +852,7 @@ void test_rpc_write_queue_grows() {
     require(rpc_write(&pair.client, &values[i], sizeof(values[i])) == 0,
             "large queue rpc_write failed");
   }
-  require(pair.client.write_queue_count == kCount + 3,
+  require(pair.client.write_queue.size() == kCount + 3,
           "large queue count mismatch");
   require(rpc_write_end(&pair.client) == 17, "large queue write_end failed");
   reader.join();
@@ -883,22 +887,20 @@ void test_rpc_write_buffer_uses_fixed_allocation() {
   *direct = third;
   require(rpc_write_buffer(&pair.client, 1, alignof(uint8_t)) == nullptr,
           "rpc_write_buffer exceeded its fixed allocation");
-  require(pair.client.write_queue_count == 6,
+  require(pair.client.write_queue.size() == 6,
           "fixed copy queue count mismatch");
   require(pair.client.write_copy_offset == 20, "fixed copy cursor mismatch");
-  require(pair.client.write_queue[3].iov.iov_base ==
-                  pair.client.write_copy_buffer &&
-              pair.client.write_queue[4].iov.iov_base ==
+  require(pair.client.write_queue[3].data == pair.client.write_copy_buffer &&
+              pair.client.write_queue[4].data ==
                   pair.client.write_copy_buffer + 8 &&
-              pair.client.write_queue[5].iov.iov_base ==
+              pair.client.write_queue[5].data ==
                   pair.client.write_copy_buffer + 16,
           "fixed copy queued the wrong spans");
-  require(*static_cast<uint8_t *>(pair.client.write_queue[3].iov.iov_base) ==
-                  first &&
-              *static_cast<uint64_t *>(
-                  pair.client.write_queue[4].iov.iov_base) == second &&
-              *static_cast<uint32_t *>(
-                  pair.client.write_queue[5].iov.iov_base) == third,
+  require(*pair.client.write_queue[3].data == first &&
+              *reinterpret_cast<const uint64_t *>(
+                  pair.client.write_queue[4].data) == second &&
+              *reinterpret_cast<const uint32_t *>(
+                  pair.client.write_queue[5].data) == third,
           "fixed copy changed buffered values");
   require(rpc_write_end(&pair.client) == 21, "fixed response write end failed");
   require(pair.client.write_copy_buffer == nullptr,
@@ -1030,7 +1032,7 @@ int main() {
   test_server_receives_session_id();
   test_server_to_client_after_request_headers();
   test_head_probe_cuda_version_metadata();
-  test_fragmented_iovec();
+  test_fragmented_cursors();
   test_fragmented_frames_direct();
   test_partial_read_stages_only_overflow();
   test_truncated_read_clears_direct_destination();
