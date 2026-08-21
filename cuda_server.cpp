@@ -986,7 +986,27 @@ static void lupine_note_event_record(conn_t *conn, CUevent event,
       [event, stream](lupine_pending_dtoh_streams &streams,
                       libcuckoo::UpsertContext) {
         lupine_remove_event_dtoh_markers(&streams, event);
-        streams[stream].push_back({event});
+        if (stream != nullptr) {
+          streams[stream].push_back({event});
+          return;
+        }
+
+        // The legacy default stream orders this event after every blocking
+        // stream's prior work. The null queue is its sentinel.
+        streams.try_emplace(nullptr);
+        for (auto &entry : streams) {
+          if (entry.first != nullptr) {
+            if (entry.first == CU_STREAM_PER_THREAD) {
+              continue;
+            }
+            unsigned int flags = 0;
+            if (cuStreamGetFlags(entry.first, &flags) != CUDA_SUCCESS ||
+                (flags & CU_STREAM_NON_BLOCKING) != 0) {
+              continue;
+            }
+          }
+          entry.second.push_back({event});
+        }
       },
       std::move(initial));
 }
@@ -1004,14 +1024,14 @@ lupine_detach_event_dtoh_copies(conn_t *conn, CUevent event) {
   std::vector<lupine_pending_dtoh_item> copies;
   lupine_pending_dtoh_copies().erase_fn(
       conn, [&](lupine_pending_dtoh_streams &streams) {
-        for (auto stream_it = streams.begin(); stream_it != streams.end();
-             ++stream_it) {
+        for (auto stream_it = streams.begin(); stream_it != streams.end();) {
           auto &items = stream_it->second;
           auto marker = std::find_if(
               items.begin(), items.end(), [event](const auto &item) {
                 return lupine_is_event_dtoh_marker(item, event);
               });
           if (marker == items.end()) {
+            ++stream_it;
             continue;
           }
           auto through_marker = std::next(marker);
@@ -1019,11 +1039,12 @@ lupine_detach_event_dtoh_copies(conn_t *conn, CUevent event) {
                                             &copies);
           items.erase(items.begin(), through_marker);
           if (items.empty()) {
-            streams.erase(stream_it);
+            stream_it = streams.erase(stream_it);
+          } else {
+            ++stream_it;
           }
-          return streams.empty();
         }
-        return false;
+        return streams.empty();
       });
   return copies;
 }
@@ -1829,52 +1850,6 @@ int handle_cuPointerGetAttributes(conn_t *conn) {
     }
   }
   if (rpc_write(conn, &result, sizeof(result)) < 0 || rpc_write_end(conn) < 0) {
-    return -1;
-  }
-  return 0;
-}
-
-int handle_cuMemPrefetchAsync(conn_t *conn) {
-  CUdeviceptr devPtr;
-  size_t count;
-  int location_type;
-  int location_id;
-  unsigned int flags;
-  CUstream hStream;
-  int request_id;
-  CUresult result;
-  if (rpc_read(conn, &devPtr, sizeof(devPtr)) < 0 ||
-      rpc_read(conn, &count, sizeof(count)) < 0 ||
-      rpc_read(conn, &location_type, sizeof(location_type)) < 0 ||
-      rpc_read(conn, &location_id, sizeof(location_id)) < 0 ||
-      rpc_read(conn, &flags, sizeof(flags)) < 0 ||
-      rpc_read(conn, &hStream, sizeof(hStream)) < 0) {
-    return -1;
-  }
-  request_id = rpc_read_end(conn);
-  if (request_id < 0) {
-    return -1;
-  }
-
-  CUmemLocation location = {};
-  location.type = static_cast<CUmemLocationType>(location_type);
-  location.id = location_id;
-#if CUDA_VERSION >= 12020
-  result = cuMemPrefetchAsync_v2(devPtr, count, location, flags, hStream);
-#else
-  if (flags != 0 || (location.type != CU_MEM_LOCATION_TYPE_DEVICE &&
-                     location.type != LUPINE_CU_MEM_LOCATION_TYPE_HOST)) {
-    result = CUDA_ERROR_INVALID_VALUE;
-  } else {
-    CUdevice dstDevice = location.type == CU_MEM_LOCATION_TYPE_DEVICE
-                             ? location.id
-                             : CU_DEVICE_CPU;
-    result = cuMemPrefetchAsync(devPtr, count, dstDevice, hStream);
-  }
-#endif
-
-  if (rpc_write_start_response(conn, request_id) < 0 ||
-      rpc_write(conn, &result, sizeof(result)) < 0 || rpc_write_end(conn) < 0) {
     return -1;
   }
   return 0;
@@ -4330,6 +4305,32 @@ int handle_cuCtxSynchronize(conn_t *conn) {
   lupine_cleanup_pending_dtoh_copies(&pending);
   return failed ? -1 : 0;
 }
+
+#if CUDA_VERSION >= 13000
+int handle_cuCtxSynchronize_v2(conn_t *conn) {
+  CUcontext ctx = nullptr;
+  if (rpc_read(conn, &ctx, sizeof(ctx)) < 0) {
+    return -1;
+  }
+  int request_id = rpc_read_end(conn);
+  if (request_id < 0) {
+    return -1;
+  }
+  lupine_captured_stdout capture;
+  lupine_start_stdout_capture(&capture);
+  CUresult result = cuCtxSynchronize_v2(ctx);
+  lupine_finish_stdout_capture(&capture);
+  auto pending = lupine_detach_pending_dtoh_copies(conn, nullptr, true);
+  bool failed = rpc_write_start_response(conn, request_id) < 0 ||
+                rpc_copy_alloc(conn, 2 * sizeof(uint64_t)) < 0 ||
+                lupine_write_pending_dtoh_copies(conn, pending, true) < 0 ||
+                lupine_write_captured_stdout(conn, capture) < 0 ||
+                rpc_write(conn, &result, sizeof(result)) < 0 ||
+                rpc_write_end(conn) < 0;
+  lupine_cleanup_pending_dtoh_copies(&pending);
+  return failed ? -1 : 0;
+}
+#endif
 
 int handle_cuStreamSynchronize(conn_t *conn) {
   CUstream stream = nullptr;
