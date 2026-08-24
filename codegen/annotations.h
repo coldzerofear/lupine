@@ -2365,6 +2365,7 @@ CUresult cuModuleLoadDataEx(CUmodule *module, const void *image,
 CUresult cuModuleLoadFatBinary(CUmodule *module, const void *fatCubin);
 /**
  * @routingkey MODULE hmod
+ * @release MODULE hmod
  * @param hmod SEND_ONLY
  */
 CUresult cuModuleUnload(CUmodule hmod);
@@ -2499,6 +2500,7 @@ CUresult cuLibraryLoadFromFile(CUlibrary *library, const char *fileName,
  * @disabled server - manual server keeps the library loaded, see the handler
  * @async
  * @routingkey LIBRARY library
+ * @release LIBRARY library
  * @param library SEND_ONLY
  * @server CUDA
  */
@@ -2515,6 +2517,7 @@ CUresult cuLibraryGetKernel(CUkernel *pKernel, CUlibrary library,
 /**
  * @routingkey LIBRARY library
  * @recordowner MODULE pMod
+ * @recordparent LIBRARY pMod library
  * @param pMod RECV_ONLY
  * @param library SEND_ONLY
  * @server CUDA
@@ -2606,6 +2609,14 @@ CUresult cuKernelSetAttribute(CUfunction_attribute attrib, int val,
 CUresult cuKernelSetCacheConfig(CUkernel kernel, CUfunc_cache config,
                                 CUdevice dev);
 /**
+ * @guard CUDA_VERSION >= 12030
+ * @routingkey FUNCTION hfunc
+ * @retain name hfunc
+ * @param name RECV_ONLY NULL_TERMINATED
+ * @param hfunc SEND_ONLY
+ */
+CUresult cuKernelGetName(const char **name, CUkernel hfunc);
+/**
  * @routingkey CURRENT_CONTEXT
  * @param free SEND_RECV
  * @param total SEND_RECV
@@ -2632,7 +2643,9 @@ CUresult cuMemAllocPitch_v2(CUdeviceptr *dptr, size_t *pPitch,
                             unsigned int ElementSizeBytes);
 /**
  * @disabled client - manual client handles managed host alias
+ * @disabled server - manual server releases identity-mapped allocations
  * @param dptr SEND_ONLY
+ * @server CUDA
  */
 CUresult cuMemFree_v2(CUdeviceptr dptr);
 /**
@@ -2651,7 +2664,9 @@ CUresult cuMemGetAddressRange_v2(CUdeviceptr *pbase, size_t *psize,
 CUresult cuMemAllocHost_v2(void **pp, size_t bytesize);
 /**
  * @disabled client - manual client frees the substituted local address
+ * @disabled server - manual server releases identity-mapped allocations
  * @param p SEND_ONLY
+ * @server CUDA
  */
 CUresult cuMemFreeHost(void *p);
 /**
@@ -2680,9 +2695,11 @@ CUresult cuMemHostGetDevicePointer_v2(CUdeviceptr *pdptr, void *p,
 CUresult cuMemHostGetFlags(unsigned int *pFlags, void *p);
 /**
  * @disabled client - manual client creates managed host alias
+ * @disabled server - manual server allocates in the negotiated VA arena
  * @param dptr SEND_RECV
  * @param bytesize SEND_ONLY
  * @param flags SEND_ONLY
+ * @server CUDA
  */
 CUresult cuMemAllocManaged(CUdeviceptr *dptr, size_t bytesize,
                            unsigned int flags);
@@ -2756,6 +2773,7 @@ CUresult cuMemcpyPeer(CUdeviceptr dstDevice, CUcontext dstContext,
                       size_t ByteCount);
 /**
  * @disabled server - manual server pipelines large host-to-device copies
+ * @synchronize
  * @routingkey DEVICEPTR dstDevice
  * @param dstDevice SEND_ONLY
  * @param ByteCount SEND_ONLY
@@ -2775,6 +2793,7 @@ CUresult cuMemcpyHtoD_v2(CUdeviceptr dstDevice, const void *srcHost,
 CUresult cuMemcpyDtoH_v2(void *dstHost, CUdeviceptr srcDevice,
                          size_t ByteCount);
 /**
+ * @synchronize
  * @routingkey DEVICEPTR dstDevice
  * @crossservercopy dstDevice srcDevice ByteCount
  * @param dstDevice SEND_ONLY
@@ -2946,6 +2965,7 @@ CUresult cuMemcpy3DAsync_v2(const CUDA_MEMCPY3D *pCopy, CUstream hStream);
  */
 CUresult cuMemcpy3DPeerAsync(const CUDA_MEMCPY3D_PEER *pCopy, CUstream hStream);
 /**
+ * @synchronize
  * @routingkey DEVICEPTR dstDevice
  * @param dstDevice SEND_ONLY
  * @param uc SEND_ONLY
@@ -2953,6 +2973,7 @@ CUresult cuMemcpy3DPeerAsync(const CUDA_MEMCPY3D_PEER *pCopy, CUstream hStream);
  */
 CUresult cuMemsetD8_v2(CUdeviceptr dstDevice, unsigned char uc, size_t N);
 /**
+ * @synchronize
  * @routingkey DEVICEPTR dstDevice
  * @param dstDevice SEND_ONLY
  * @param us SEND_ONLY
@@ -2960,6 +2981,7 @@ CUresult cuMemsetD8_v2(CUdeviceptr dstDevice, unsigned char uc, size_t N);
  */
 CUresult cuMemsetD16_v2(CUdeviceptr dstDevice, unsigned short us, size_t N);
 /**
+ * @synchronize
  * @routingkey DEVICEPTR dstDevice
  * @param dstDevice SEND_ONLY
  * @param ui SEND_ONLY
@@ -2967,6 +2989,7 @@ CUresult cuMemsetD16_v2(CUdeviceptr dstDevice, unsigned short us, size_t N);
  */
 CUresult cuMemsetD32_v2(CUdeviceptr dstDevice, unsigned int ui, size_t N);
 /**
+ * @synchronize
  * @routingkey DEVICEPTR dstDevice
  * @param dstDevice SEND_ONLY
  * @param dstPitch SEND_ONLY
@@ -2977,6 +3000,7 @@ CUresult cuMemsetD32_v2(CUdeviceptr dstDevice, unsigned int ui, size_t N);
 CUresult cuMemsetD2D8_v2(CUdeviceptr dstDevice, size_t dstPitch,
                          unsigned char uc, size_t Width, size_t Height);
 /**
+ * @synchronize
  * @routingkey DEVICEPTR dstDevice
  * @param dstDevice SEND_ONLY
  * @param dstPitch SEND_ONLY
@@ -2987,6 +3011,7 @@ CUresult cuMemsetD2D8_v2(CUdeviceptr dstDevice, size_t dstPitch,
 CUresult cuMemsetD2D16_v2(CUdeviceptr dstDevice, size_t dstPitch,
                           unsigned short us, size_t Width, size_t Height);
 /**
+ * @synchronize
  * @routingkey DEVICEPTR dstDevice
  * @param dstDevice SEND_ONLY
  * @param dstPitch SEND_ONLY
@@ -3389,7 +3414,11 @@ CUresult cuMemPrefetchAsync(CUdeviceptr devPtr, size_t count,
 CUresult cuMemPrefetchAsync_v2(CUdeviceptr devPtr, size_t count,
                                CUmemLocation location, unsigned int flags,
                                CUstream hStream);
+#ifdef cuMemAdvise
+#undef cuMemAdvise
+#endif
 /**
+ * @disabled client - manual client handles managed-pointer and target routing
  * @param devPtr SEND_ONLY
  * @param count SEND_ONLY
  * @param advice SEND_ONLY
@@ -3397,6 +3426,16 @@ CUresult cuMemPrefetchAsync_v2(CUdeviceptr devPtr, size_t count,
  */
 CUresult cuMemAdvise(CUdeviceptr devPtr, size_t count, CUmem_advise advice,
                      CUdevice device);
+/**
+ * @guard CUDA_VERSION >= 12020
+ * @disabled client - manual client handles managed-pointer and target routing
+ * @param devPtr SEND_ONLY
+ * @param count SEND_ONLY
+ * @param advice SEND_ONLY
+ * @param location SEND_ONLY
+ */
+CUresult cuMemAdvise_v2(CUdeviceptr devPtr, size_t count, CUmem_advise advice,
+                        CUmemLocation location);
 /**
  * @param data SEND_RECV
  * @param dataSize SEND_ONLY
@@ -3480,12 +3519,120 @@ CUresult cuStreamGetId(CUstream hStream, unsigned long long *streamId);
  */
 CUresult cuStreamGetCtx(CUstream hStream, CUcontext *pctx);
 /**
+ * @guard CUDA_VERSION >= 13010
+ * @routingkey STREAM hStream
+ * @param hStream SEND_ONLY
+ * @param resource RECV_ONLY
+ * @param type SEND_ONLY
+ */
+CUresult cuStreamGetDevResource(CUstream hStream, CUdevResource *resource,
+                                CUdevResourceType type);
+/**
  * @guard CUDA_VERSION >= 12040
  * @routingkey STREAM hStream
  * @param hStream SEND_ONLY
  * @param phCtx RECV_ONLY
  */
 CUresult cuStreamGetGreenCtx(CUstream hStream, CUgreenCtx *phCtx);
+/**
+ * @guard CUDA_VERSION >= 12040
+ * @routingkey CURRENT_CONTEXT
+ * @param hCtx SEND_ONLY
+ * @param resource RECV_ONLY
+ * @param type SEND_ONLY
+ */
+CUresult cuGreenCtxGetDevResource(CUgreenCtx hCtx, CUdevResource *resource,
+                                  CUdevResourceType type);
+/**
+ * @guard CUDA_VERSION >= 12040
+ * @param device SEND_ONLY
+ * @param resource RECV_ONLY
+ * @param type SEND_ONLY
+ */
+CUresult cuDeviceGetDevResource(CUdevice device, CUdevResource *resource,
+                                CUdevResourceType type);
+/**
+ * @guard CUDA_VERSION >= 12040
+ * @param hCtx SEND_ONLY
+ * @param resource RECV_ONLY
+ * @param type SEND_ONLY
+ */
+CUresult cuCtxGetDevResource(CUcontext hCtx, CUdevResource *resource,
+                             CUdevResourceType type);
+/**
+ * @guard CUDA_VERSION >= 12040
+ * @routingkey CURRENT_CONTEXT
+ * @param nbGroups SEND_RECV
+ * @param result RECV_ONLY NULLABLE LENGTH:nbGroups
+ * @param input SEND_ONLY DEREF
+ * @param remainder RECV_ONLY NULLABLE
+ * @param flags SEND_ONLY
+ * @param minCount SEND_ONLY
+ */
+CUresult cuDevSmResourceSplitByCount(CUdevResource *result,
+                                     unsigned int *nbGroups,
+                                     const CUdevResource *input,
+                                     CUdevResource *remainder,
+                                     unsigned int flags,
+                                     unsigned int minCount);
+/**
+ * @guard CUDA_VERSION >= 13010
+ * @routingkey CURRENT_CONTEXT
+ * @param nbGroups SEND_ONLY
+ * @param result RECV_ONLY NULLABLE LENGTH:nbGroups
+ * @param input SEND_ONLY DEREF
+ * @param remainder RECV_ONLY NULLABLE
+ * @param flags SEND_ONLY
+ * @param groupParams SEND_RECV LENGTH:nbGroups
+ */
+CUresult cuDevSmResourceSplit(
+    CUdevResource *result, unsigned int nbGroups,
+    const CUdevResource *input, CUdevResource *remainder, unsigned int flags,
+    CU_DEV_SM_RESOURCE_GROUP_PARAMS *groupParams);
+/**
+ * @guard CUDA_VERSION >= 12040
+ * @routingkey CURRENT_CONTEXT
+ * @param nbResources SEND_ONLY
+ * @param resources SEND_ONLY LENGTH:nbResources
+ * @param phDesc RECV_ONLY
+ */
+CUresult cuDevResourceGenerateDesc(CUdevResourceDesc *phDesc,
+                                   CUdevResource *resources,
+                                   unsigned int nbResources);
+/**
+ * @guard CUDA_VERSION >= 12040
+ * @param phCtx RECV_ONLY
+ * @param desc SEND_ONLY
+ * @param dev SEND_ONLY
+ * @param flags SEND_ONLY
+ */
+CUresult cuGreenCtxCreate(CUgreenCtx *phCtx, CUdevResourceDesc desc,
+                          CUdevice dev, unsigned int flags);
+/**
+ * @guard CUDA_VERSION >= 12040
+ * @routingkey CURRENT_CONTEXT
+ * @recordowner CONTEXT pContext
+ * @param pContext RECV_ONLY
+ * @param hCtx SEND_ONLY
+ */
+CUresult cuCtxFromGreenCtx(CUcontext *pContext, CUgreenCtx hCtx);
+/**
+ * @guard CUDA_VERSION >= 12040
+ * @routingkey CURRENT_CONTEXT
+ * @param hCtx SEND_ONLY
+ */
+CUresult cuGreenCtxDestroy(CUgreenCtx hCtx);
+/**
+ * @guard CUDA_VERSION >= 12050
+ * @routingkey CURRENT_CONTEXT
+ * @recordowner STREAM phStream
+ * @param phStream RECV_ONLY
+ * @param greenCtx SEND_ONLY
+ * @param flags SEND_ONLY
+ * @param priority SEND_ONLY
+ */
+CUresult cuGreenCtxStreamCreate(CUstream *phStream, CUgreenCtx greenCtx,
+                                unsigned int flags, int priority);
 /**
  * @disabled - manual client handles cross-server event waits
  * @routingkey STREAM hStream
@@ -3564,7 +3711,7 @@ CUresult cuStreamUpdateCaptureDependencies(CUstream hStream,
  * @routingkey STREAM hStream
  * @routingfallback DEVICEPTR dptr
  * @param hStream SEND_ONLY
- * @param dptr SEND_ONLY TRANSLATE_DEVICEPTR
+ * @param dptr SEND_ONLY
  * @param length SEND_ONLY
  * @param flags SEND_ONLY
  */
@@ -3803,6 +3950,14 @@ CUresult cuFuncSetSharedMemConfig(CUfunction hfunc, CUsharedconfig config);
  * @param hfunc SEND_ONLY
  */
 CUresult cuFuncGetModule(CUmodule *hmod, CUfunction hfunc);
+/**
+ * @guard CUDA_VERSION >= 12030
+ * @routingkey FUNCTION hfunc
+ * @retain name hfunc
+ * @param name RECV_ONLY NULL_TERMINATED
+ * @param hfunc SEND_ONLY
+ */
+CUresult cuFuncGetName(const char **name, CUfunction hfunc);
 
 /**
  * @disabled

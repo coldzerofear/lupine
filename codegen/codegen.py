@@ -26,8 +26,10 @@ from ops import (
     DereferenceOperation,
     Operation,
     OwnerAnnotation,
+    RetainAnnotation,
+    ReleaseAnnotation,
+    ParentAnnotation,
     CrossServerCopyAnnotation,
-    DevicePtrTranslationAnnotation,
     FunctionAnnotationMetadata,
     RoutingFallbackAnnotation,
     SynchronizeAnnotation,
@@ -472,6 +474,42 @@ def parse_annotation(
             param = annotation_param(params, parts[2])
             metadata.record_owners.append(OwnerAnnotation(parts[1].upper(), param))
             continue
+        if line.startswith("@retain"):
+            parts = line.split()
+            if len(parts) != 3:
+                raise RuntimeError("@retain requires an output parameter and a handle")
+            metadata.retains.append(
+                RetainAnnotation(
+                    parameter=annotation_param(params, parts[1]),
+                    handle=annotation_param(params, parts[2]),
+                )
+            )
+            continue
+        if line.startswith("@release"):
+            parts = line.split()
+            if len(parts) != 3:
+                raise RuntimeError("@release requires a handle kind and parameter")
+            metadata.releases.append(
+                ReleaseAnnotation(
+                    kind=parts[1].upper(),
+                    parameter=annotation_param(params, parts[2]),
+                )
+            )
+            continue
+        if line.startswith("@recordparent"):
+            parts = line.split()
+            if len(parts) != 4:
+                raise RuntimeError(
+                    "@recordparent requires a parent kind, child, and parent"
+                )
+            metadata.parents.append(
+                ParentAnnotation(
+                    kind=parts[1].upper(),
+                    child=annotation_param(params, parts[2]),
+                    parent=annotation_param(params, parts[3]),
+                )
+            )
+            continue
         if line.startswith("@crossservercopy"):
             parts = line.split()
             if len(parts) < 4:
@@ -508,10 +546,6 @@ def parse_annotation(
             send = parts[2] == "SEND_ONLY" or parts[2] == "SEND_RECV"
             recv = parts[2] == "RECV_ONLY" or parts[2] == "SEND_RECV"
 
-            if "TRANSLATE_DEVICEPTR" in args:
-                metadata.translate_deviceptrs.append(
-                    DevicePtrTranslationAnnotation(parameter=param)
-                )
             # if there's a length or size arg, use the type, otherwise use the ptr_to type
             length_arg = next((arg for arg in args if arg.startswith("LENGTH:")), None)
 
@@ -606,10 +640,15 @@ def parse_annotation(
                     )
                 elif null_terminated:
                     if recv:
-                        raise NotImplementedError(
-                            "NULL_TERMINATED parameters cannot be received; use LENGTH or SIZE for output buffers"
-                        )
-                    # if it's null terminated, it's a null terminated operation
+                        if (
+                            send
+                            or not isinstance(param.type.ptr_to, Pointer)
+                            or param.type.ptr_to.ptr_to.format() != "const char"
+                        ):
+                            raise NotImplementedError(
+                                "received NULL_TERMINATED parameters must be "
+                                "RECV_ONLY const char **"
+                            )
                     operations.append(
                         NullTerminatedOperation(
                             send=send,
@@ -814,21 +853,23 @@ def parse_annotation(
         if source is not None and source > i:
             operations.insert(i, operations.pop(source))
 
+    retained_names = set()
+    for retain in metadata.retains:
+        name = retain.parameter.name
+        if name in retained_names:
+            raise RuntimeError(f"Duplicate @retain for parameter {name}")
+        retained_names.add(name)
+        operation = next(
+            (op for op in operations if op.parameter.name == name), None
+        )
+        if not isinstance(operation, NullTerminatedOperation) or not operation.recv:
+            raise NotImplementedError(
+                "@retain currently requires a RECV_ONLY NULL_TERMINATED parameter"
+            )
+
     if metadata.routing_kind is None:
         metadata.routing_kind, metadata.routing_parameter = infer_routing_key(params)
     return metadata
-
-
-def client_translated_deviceptr_names(
-    metadata: FunctionAnnotationMetadata,
-) -> set[str]:
-    return {translation.parameter.name for translation in metadata.translate_deviceptrs}
-
-
-def client_param_expr(metadata: FunctionAnnotationMetadata, param: Parameter) -> str:
-    if param.name in client_translated_deviceptr_names(metadata):
-        return f"{param.name}_rpc"
-    return param.name
 
 
 def client_routing_key_expr(
@@ -840,7 +881,7 @@ def client_routing_key_expr(
         return "lupine_route_for_current_context()"
     if param is None:
         raise NotImplementedError(f"Routing key {kind} requires a parameter")
-    name = client_param_expr(metadata, param)
+    name = param.name
     if kind == "DEVICE":
         return f"lupine_route_for_device(&{name})"
     if kind == "CONTEXT":
@@ -850,6 +891,8 @@ def client_routing_key_expr(
     if kind == "LIBRARY":
         return f"lupine_route_for_library({name})"
     if kind == "FUNCTION":
+        if param.type.format() == "CUkernel":
+            name = f"reinterpret_cast<CUfunction>({name})"
         return f"lupine_route_for_function({name})"
     if kind == "STREAM":
         if metadata.routing_fallback is not None:
@@ -882,26 +925,10 @@ def client_routing_route_expr(metadata: FunctionAnnotationMetadata) -> str:
 
 
 def client_call_args(function: Function, metadata: FunctionAnnotationMetadata) -> list[str]:
-    return [
-        client_param_expr(metadata, param)
-        for param in function.parameters
-        if param.name
-    ]
+    return [param.name for param in function.parameters if param.name]
 
 
 def write_client_rpc_write(f, operation: Operation, metadata: FunctionAnnotationMetadata):
-    if (
-        isinstance(operation, OpaqueTypeOperation)
-        and operation.send
-        and operation.parameter.name in client_translated_deviceptr_names(metadata)
-    ):
-        f.write(
-            "        rpc_write(conn, &{param_name}_rpc, sizeof({param_type})) < 0 ||\n".format(
-                param_name=operation.parameter.name,
-                param_type=operation.type_.format(),
-            )
-        )
-        return
     operation.client_rpc_write(f)
 
 
@@ -950,6 +977,30 @@ def write_client_post_call(f, function: Function, metadata: FunctionAnnotationMe
 
     for owner in metadata.record_owners:
         f.write(client_record_owner_stmt(owner))
+    for parent in metadata.parents:
+        if parent.kind != "LIBRARY":
+            raise NotImplementedError(
+                f"Unsupported recorded parent kind: {parent.kind}"
+            )
+        f.write(
+            f"    if (return_value == CUDA_SUCCESS && "
+            f"{parent.child.name} != nullptr) "
+            f"lupine_record_library_module(*{parent.child.name}, "
+            f"{parent.parent.name});\n"
+        )
+    for release in metadata.releases:
+        if release.kind == "MODULE":
+            release_fn = "lupine_release_module_retained_strings"
+        elif release.kind == "LIBRARY":
+            release_fn = "lupine_release_library_retained_strings"
+        else:
+            raise NotImplementedError(
+                f"Unsupported retained-string release kind: {release.kind}"
+            )
+        f.write(
+            f"    if (return_value == CUDA_SUCCESS) "
+            f"{release_fn}({release.parameter.name});\n"
+        )
 
     if function.name.format() == "cuMemAlloc_v2":
         f.write("    if (return_value == CUDA_SUCCESS && dptr != nullptr) lupine_note_deviceptr_allocation_route(*dptr, bytesize, route);\n")
@@ -974,6 +1025,10 @@ def write_client_post_call(f, function: Function, metadata: FunctionAnnotationMe
 
     if function.name.format() == "cuCtxDestroy_v2":
         f.write("    if (return_value == CUDA_SUCCESS) lupine_forget_destroyed_context(ctx);\n")
+    if function.name.format() == "cuCtxFromGreenCtx":
+        f.write("    if (return_value == CUDA_SUCCESS && pContext != nullptr) lupine_mark_context_green(*pContext);\n")
+    if function.name.format() == "cuGreenCtxDestroy":
+        f.write("    if (return_value == CUDA_SUCCESS) lupine_forget_destroyed_context(reinterpret_cast<CUcontext>(hCtx));\n")
     if function.name.format() in {
         "cuCtxDestroy_v2",
         "cuCtxDetach",
@@ -1524,12 +1579,13 @@ def main():
             'extern "C" void lupine_note_deviceptr_allocation(CUdeviceptr ptr, size_t size, conn_t *conn);\n\n'
             'extern "C" void lupine_forget_deviceptr_owner(CUdeviceptr ptr);\n\n'
             'extern "C" void lupine_forget_stream_owner(CUstream stream);\n\n'
+            'extern "C" const char *lupine_retain_returned_string(const void *handle, const char *data, size_t size);\n\n'
+            'extern "C" void lupine_release_module_retained_strings(CUmodule module);\n'
+            'extern "C" void lupine_release_library_retained_strings(CUlibrary library);\n\n'
+            'extern "C" void lupine_record_library_module(CUmodule module, CUlibrary library);\n\n'
             'extern "C" CUresult lupine_record_library_kernel(CUkernel kernel, CUlibrary library, const char *name, lupine_route route);\n\n'
             'extern "C" CUresult lupine_record_module_function(CUfunction function, CUmodule module, const char *name, lupine_route route);\n\n'
-            'extern "C" void lupine_prepare_host_range_write(void *host, size_t size);\n'
-            'extern "C" void lupine_mark_host_range_clean(void *host, size_t size);\n'
             'extern "C" bool lupine_deviceptrs_share_route(CUdeviceptr first, CUdeviceptr second);\n'
-            'extern "C" bool lupine_translate_managed_host_ptr(CUdeviceptr ptr, CUdeviceptr *translated);\n'
             'extern "C" CUresult lupine_cuMemcpyDtoD_via_client(CUdeviceptr dstDevice,\n'
             '                                                   CUdeviceptr srcDevice,\n'
             '                                                   size_t ByteCount,\n'
@@ -1537,15 +1593,15 @@ def main():
             '                                                   bool async);\n\n'
             'extern "C" void lupine_invalidate_current_context_cache();\n'
             'extern "C" void lupine_forget_destroyed_context(CUcontext ctx);\n'
+            'extern "C" void lupine_mark_context_green(CUcontext ctx);\n'
             'extern "C" void lupine_invalidate_function_caches();\n'
             'extern "C" void lupine_invalidate_kernel_attribute_cache();\n'
             'extern "C" void lupine_kernel_attribute_cache_erase(int route_id, CUkernel kernel, int attrib, int dev);\n'
             'extern "C" void lupine_invalidate_function_attribute_cache();\n'
-            'extern "C" CUresult lupine_flush_dirty_host_pages_to_server();\n\n'
             'extern "C" int lupine_read_deferred_dtoh_copies(conn_t *conn);\n'
             'extern "C" int lupine_forward_remote_stdout(conn_t *conn);\n'
             'extern "C" CUresult lupine_sync_mapped_device_to_host();\n'
-            'extern "C" void lupine_ensure_mapped_host_readable(const void *host, size_t size);\n\n'
+            'extern "C" const void *lupine_mapped_host_read_source(const void *host, size_t size);\n\n'
         )
         for function, annotation, operations, metadata in functions_with_annotations:
             # We don't generate client function definitions for client-disabled
@@ -1566,39 +1622,6 @@ def main():
                 )
             )
             f.write("{\n")
-
-            if metadata.synchronize:
-                f.write(
-                    "    CUresult lupine_sync_result = "
-                    "lupine_flush_dirty_host_pages_to_server();\n"
-                    "    if (lupine_sync_result != CUDA_SUCCESS) {\n"
-                    "        return lupine_sync_result;\n"
-                    "    }\n"
-                )
-
-            for translation in metadata.translate_deviceptrs:
-                name = translation.parameter.name
-                f.write("    CUdeviceptr {name}_rpc = {name};\n".format(name=name))
-                f.write(
-                    "    bool {name}_is_managed_host = "
-                    "lupine_translate_managed_host_ptr({name}, &{name}_rpc);\n".format(
-                        name=name
-                    )
-                )
-            if metadata.translate_deviceptrs:
-                translated_condition = " || ".join(
-                    "{name}_is_managed_host".format(name=item.parameter.name)
-                    for item in metadata.translate_deviceptrs
-                )
-                f.write("    if ({condition}) {{\n".format(condition=translated_condition))
-                f.write(
-                    "        CUresult managed_result = "
-                    "lupine_flush_dirty_host_pages_to_server();\n"
-                )
-                f.write("        if (managed_result != CUDA_SUCCESS) {\n")
-                f.write("            return managed_result;\n")
-                f.write("        }\n")
-                f.write("    }\n")
 
             all_output = metadata.routing_parameter
             if metadata.routing_kind == "ALL":
@@ -1657,22 +1680,22 @@ def main():
             if metadata.cross_server_copy is not None:
                 copy = metadata.cross_server_copy
                 stream_arg = (
-                    client_param_expr(metadata, copy.stream)
+                    copy.stream.name
                     if copy.stream is not None
                     else "nullptr"
                 )
                 async_arg = "true" if copy.async_ else "false"
                 f.write(
                     "    if (!lupine_deviceptrs_share_route({dst}, {src})) {{\n".format(
-                        dst=client_param_expr(metadata, copy.dst),
-                        src=client_param_expr(metadata, copy.src),
+                        dst=copy.dst.name,
+                        src=copy.src.name,
                     )
                 )
                 f.write(
                     "        return lupine_cuMemcpyDtoD_via_client({dst}, {src}, {bytes}, {stream}, {async_});\n".format(
-                        dst=client_param_expr(metadata, copy.dst),
-                        src=client_param_expr(metadata, copy.src),
-                        bytes=client_param_expr(metadata, copy.bytes),
+                        dst=copy.dst.name,
+                        src=copy.src.name,
+                        bytes=copy.bytes.name,
                         stream=stream_arg,
                         async_=async_arg,
                     )
@@ -1719,24 +1742,20 @@ def main():
                     isinstance(operation, InOutCountOperation)
                     or isinstance(operation, NullableArrayOperation)
                     or isinstance(operation, DeepStructOperation)
+                    or (
+                        isinstance(operation, NullTerminatedOperation)
+                        and operation.recv
+                    )
                 ):
                     f.write(operation.client_declaration())
 
-            # compute the strlen's for null-terminated operations.
             for operation in operations:
-                if isinstance(operation, NullTerminatedOperation):
-                    if operation.send:
-                        f.write(
-                            "    std::size_t {param_name}_len = std::strlen({param_name}) + 1;\n".format(
-                                param_name=operation.parameter.name
-                            )
+                if isinstance(operation, NullTerminatedOperation) and operation.send:
+                    f.write(
+                        "    std::size_t {param_name}_len = std::strlen({param_name}) + 1;\n".format(
+                            param_name=operation.parameter.name
                         )
-                    else:
-                        f.write(
-                            "    std::size_t {param_name}_len;\n".format(
-                                param_name=operation.parameter.name
-                            )
-                        )
+                    )
                 if isinstance(operation, NullableOperation) and operation.recv:
                     f.write(
                         "    {server_type} {param_name}_null_check;\n".format(
@@ -1745,12 +1764,20 @@ def main():
                         )
                     )
 
-            # Reject invalid send buffers before rpc_write_start_request()
-            # acquires the connection's call/write locks. Conditions in the
-            # builder below may skip optional writes, but only rpc_write* calls
-            # themselves are allowed to fail the builder.
+            # Reject invalid send buffers before lupine_prepare_rpc() flushes
+            # pending writes and rpc_write_start_request() acquires the
+            # connection's call/write locks. Conditions in the builder below
+            # may skip optional writes, but only rpc_write* calls themselves
+            # are allowed to fail the builder.
             for operation in operations:
                 if isinstance(operation, ArrayOperation):
+                    operation.client_preflight(
+                        f, invalid_argument_const(function.return_type.format())
+                    )
+                elif (
+                    isinstance(operation, NullTerminatedOperation)
+                    and operation.recv
+                ):
                     operation.client_preflight(
                         f, invalid_argument_const(function.return_type.format())
                     )
@@ -1758,7 +1785,8 @@ def main():
             if metadata.async_fire_forget:
                 error_return = error_const(function.return_type.format())
                 f.write(
-                    "    if (rpc_write_start_request(conn, RPC_{name}) < 0 ||\n".format(
+                    "    if (lupine_prepare_rpc(conn) < 0 ||\n"
+                    "        rpc_write_start_request(conn, RPC_{name}) < 0 ||\n".format(
                         name=function.name.format()
                     )
                 )
@@ -1781,7 +1809,8 @@ def main():
                 continue
 
             f.write(
-                "    if (rpc_write_start_request(conn, RPC_{name}) < 0 ||\n".format(
+                "    if (lupine_prepare_rpc(conn) < 0 ||\n"
+                "        rpc_write_start_request(conn, RPC_{name}) < 0 ||\n".format(
                     name=function.name.format()
                 )
             )
@@ -1795,10 +1824,6 @@ def main():
                 f.write("        lupine_read_deferred_dtoh_copies(conn) < 0 ||\n")
             if metadata.synchronize and metadata.synchronize.stdout:
                 f.write("        lupine_forward_remote_stdout(conn) < 0 ||\n")
-
-            for operation in operations:
-                if isinstance(operation, ArrayOperation):
-                    operation.client_prepare_rpc_read(f)
 
             for operation in operations:
                 operation.client_rpc_read(f)
@@ -1815,11 +1840,28 @@ def main():
                 )
             )
 
-            write_client_post_call(f, function, metadata)
             for operation in operations:
-                if isinstance(operation, ArrayOperation):
-                    operation.client_post_rpc_read_success(f)
+                if isinstance(operation, NullTerminatedOperation) and operation.recv:
+                    retain = next(
+                        (
+                            item
+                            for item in metadata.retains
+                            if item.parameter.name == operation.parameter.name
+                        ),
+                        None,
+                    )
+                    if retain is None:
+                        raise RuntimeError(
+                            f"{function.name.format()}: returned string requires @retain"
+                        )
+                    operation.client_post_rpc(
+                        f,
+                        "CUDA_SUCCESS",
+                        "CUDA_ERROR_OUT_OF_MEMORY",
+                        retain.handle.name,
+                    )
 
+            write_client_post_call(f, function, metadata)
             f.write("    return return_value;\n")
             if metadata.routing_kind == "ALL":
                 f.write("        });\n")

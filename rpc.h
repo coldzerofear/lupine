@@ -39,6 +39,28 @@ struct rpc_http2_read_stats {
   uint64_t peak_staged_bytes;
 };
 
+// Remote accelerator and pinned-host addresses live in this upper canonical
+// VA band. Driver shims map their application and transport views at fixed
+// offsets from that address, so the RPC core can translate without knowing
+// which accelerator backend owns the allocation.
+static constexpr uintptr_t LUPINE_MIRROR_SERVER_BASE = UINT64_C(0x700000000000);
+static constexpr uintptr_t LUPINE_MIRROR_WINDOW_SIZE = UINT64_C(0x100000000000);
+static constexpr intptr_t LUPINE_MIRROR_R_OFFSET = -INT64_C(0x500000000000);
+static constexpr intptr_t LUPINE_MIRROR_W_OFFSET = -INT64_C(0x400000000000);
+
+// Each connection owns a disjoint identity-mapped arena. The client also
+// reserves a writable alias so pointers embedded in mirrored memory retain
+// their server values while transport reads avoid the protected R view.
+static constexpr uintptr_t LUPINE_VA_FIRST_BASE = LUPINE_MIRROR_SERVER_BASE;
+static constexpr size_t LUPINE_VA_ARENA_SIZE = UINT64_C(0x010000000000);
+static constexpr unsigned int LUPINE_VA_ARENA_COUNT = 8;
+static constexpr intptr_t LUPINE_VA_WRITE_OFFSET = -INT64_C(0x200000000000);
+
+struct rpc_mirror_write {
+  uintptr_t start;
+  size_t size;
+};
+
 // The server's HTTP/2 receive window, and with it the ceiling on the pinned
 // staging a client can hold there: fire-and-forget device-bound payload bytes
 // stay uncredited until the staging buffer they landed in retires.
@@ -57,6 +79,8 @@ struct conn_t {
   pthread_t read_thread;
   pthread_mutex_t write_mutex, call_mutex;
   std::vector<rpc_write_cursor> write_queue;
+  std::vector<rpc_mirror_write> mirror_writes;
+  int mirror_writes_pending;
   unsigned char *write_copy_buffer;
   size_t write_copy_capacity;
   size_t write_copy_offset;
@@ -65,7 +89,24 @@ struct conn_t {
   int closed;
   void *http2;
   void *tls_session; // SSL* for https:// client connections; otherwise null.
+  uintptr_t va_base;
+  size_t va_size;
+  uintptr_t va_next;
+  intptr_t w_offset;
 };
+
+static inline bool lupine_va_contains(const conn_t *conn, uintptr_t address,
+                                      size_t size) {
+  return conn != nullptr && conn->va_size != 0 && size <= conn->va_size &&
+         address >= conn->va_base &&
+         address - conn->va_base <= conn->va_size - size;
+}
+
+// Returns 0 with an arena reserved, 1 when unsupported on this platform, and
+// -1 when no candidate remains. min_slot skips ranges rejected by the peer.
+extern int lupine_va_reserve_client(conn_t *conn, unsigned int min_slot,
+                                    unsigned int *slot);
+extern int lupine_va_reserve_server(conn_t *conn, uintptr_t base, size_t size);
 
 // Backends install these hooks before opening connections. They let the
 // transport report lifecycle changes without depending on backend state.
@@ -108,8 +149,8 @@ extern int rpc_write(conn_t *conn, const void *data, const size_t size);
 extern int rpc_write_pitched(conn_t *conn, const void *data, size_t width,
                              size_t rows, size_t row_stride, size_t slices,
                              size_t slice_stride);
-extern int rpc_read_pitched(conn_t *conn, void *data, size_t width,
-                            size_t rows, size_t row_stride, size_t slices,
+extern int rpc_read_pitched(conn_t *conn, void *data, size_t width, size_t rows,
+                            size_t row_stride, size_t slices,
                             size_t slice_stride);
 // Reserves the request-owned storage used by subsequent rpc_write_buffer
 // calls. The reservation must be made once before the first buffered write in
@@ -145,6 +186,7 @@ extern lupine_socket_t lupine_tcp_connect(const char *host, const char *port,
                                           unsigned int max_retries = 5);
 
 constexpr int LUPINE_RPC_HTTP2_STREAM_END = -2;
+constexpr int LUPINE_RPC_HTTP2_VA_CONFLICT = -3;
 extern int rpc_http2_read(conn_t *conn, void *data, size_t size);
 extern int rpc_http2_read_stream(conn_t *conn, int32_t stream_id, void *data,
                                  size_t size);

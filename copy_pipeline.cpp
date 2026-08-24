@@ -10,11 +10,8 @@
 
 #include "client_routing.h"
 
-extern "C" void lupine_prepare_host_range_write(void *host, size_t size);
-extern "C" void lupine_mark_host_range_clean(void *host, size_t size);
-extern "C" void lupine_ensure_mapped_host_readable(const void *host,
-                                                   size_t size);
-
+extern "C" const void *lupine_mapped_host_read_source(const void *host,
+                                                      size_t size);
 extern "C" CUresult cuMemcpyDtoH_v2(void *dstHost, CUdeviceptr srcDevice,
                                     size_t ByteCount) {
   lupine_route route = lupine_route_for_deviceptr(srcDevice);
@@ -26,7 +23,8 @@ extern "C" CUresult cuMemcpyDtoH_v2(void *dstHost, CUdeviceptr srcDevice,
     return return_value;
   }
   conn_t *conn = lupine_route_remote_conn(route);
-  if (rpc_write_start_request(conn, RPC_cuMemcpyDtoH_v2) < 0 ||
+  if (lupine_prepare_rpc(conn) < 0 ||
+      rpc_write_start_request(conn, RPC_cuMemcpyDtoH_v2) < 0 ||
       rpc_write(conn, &srcDevice, sizeof(srcDevice)) < 0 ||
       rpc_write(conn, &ByteCount, sizeof(ByteCount)) < 0) {
     return CUDA_ERROR_DEVICE_UNAVAILABLE;
@@ -36,7 +34,6 @@ extern "C" CUresult cuMemcpyDtoH_v2(void *dstHost, CUdeviceptr srcDevice,
     return CUDA_ERROR_DEVICE_UNAVAILABLE;
   }
 
-  lupine_prepare_host_range_write(dstHost, ByteCount);
   auto *copy_dst = static_cast<unsigned char *>(dstHost);
   size_t offset = 0;
   do {
@@ -46,26 +43,21 @@ extern "C" CUresult cuMemcpyDtoH_v2(void *dstHost, CUdeviceptr srcDevice,
         (return_value == CUDA_SUCCESS && chunk != 0 &&
          rpc_read_payload(conn, copy_dst + offset, chunk) < 0)) {
       rpc_read_end(conn);
-      lupine_mark_host_range_clean(dstHost, ByteCount);
       return CUDA_ERROR_DEVICE_UNAVAILABLE;
     }
     bool final_chunk =
         return_value != CUDA_SUCCESS || offset + chunk == ByteCount;
     if (rpc_read_end(conn) < 0) {
-      lupine_mark_host_range_clean(dstHost, ByteCount);
       return CUDA_ERROR_DEVICE_UNAVAILABLE;
     }
     if (return_value != CUDA_SUCCESS) {
-      lupine_mark_host_range_clean(dstHost, ByteCount);
       return return_value;
     }
     offset += chunk;
     if (!final_chunk && rpc_read_start(conn, request_id) < 0) {
-      lupine_mark_host_range_clean(dstHost, ByteCount);
       return CUDA_ERROR_DEVICE_UNAVAILABLE;
     }
   } while (offset < ByteCount);
-  lupine_mark_host_range_clean(dstHost, ByteCount);
   return return_value;
 }
 
@@ -90,9 +82,10 @@ extern "C" CUresult cuMemcpyHtoDAsync_v2(CUdeviceptr dstDevice,
   if (ByteCount != 0 && srcHost == nullptr) {
     return CUDA_ERROR_INVALID_VALUE;
   }
-  lupine_ensure_mapped_host_readable(srcHost, ByteCount);
+  srcHost = lupine_mapped_host_read_source(srcHost, ByteCount);
   conn_t *conn = lupine_route_remote_conn(route);
-  if (rpc_write_start_request(conn, RPC_cuMemcpyHtoDAsync_v2) < 0 ||
+  if (lupine_prepare_rpc(conn) < 0 ||
+      rpc_write_start_request(conn, RPC_cuMemcpyHtoDAsync_v2) < 0 ||
       rpc_write(conn, &dstDevice, sizeof(dstDevice)) < 0 ||
       rpc_write(conn, &ByteCount, sizeof(ByteCount)) < 0 ||
       rpc_write(conn, &hStream, sizeof(hStream)) < 0 ||

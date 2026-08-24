@@ -28,8 +28,11 @@
   HANDLER(RPC_cuLibraryLoadData, handle_cuLibraryLoadData, rpc_backend::cuda) \
   HANDLER(RPC_cuLibraryUnload, handle_cuLibraryUnload, rpc_backend::cuda) \
   HANDLER(RPC_cuLibraryGetModule, handle_cuLibraryGetModule, rpc_backend::cuda) \
+  HANDLER(RPC_cuMemFree_v2, handle_cuMemFree_v2, rpc_backend::cuda) \
+  HANDLER(RPC_cuMemFreeHost, handle_cuMemFreeHost, rpc_backend::cuda) \
   HANDLER(RPC_cuMemHostAlloc, handle_cuMemHostAlloc, rpc_backend::cuda) \
   HANDLER(RPC_cuMemHostGetFlags, handle_cuMemHostGetFlags, rpc_backend::cuda) \
+  HANDLER(RPC_cuMemAllocManaged, handle_cuMemAllocManaged, rpc_backend::cuda) \
   HANDLER(RPC_cuMemcpyHtoD_v2, handle_cuMemcpyHtoD_v2, rpc_backend::cuda) \
   HANDLER(RPC_cuMemcpyDtoH_v2, handle_cuMemcpyDtoH_v2, rpc_backend::cuda) \
   HANDLER(RPC_cuMemcpyAtoH_v2, handle_cuMemcpyAtoH_v2, rpc_backend::cuda) \
@@ -154,12 +157,9 @@
   HANDLER(RPC_cuMemGetInfo_v2, handle_cuMemGetInfo_v2, rpc_backend::cuda) \
   HANDLER(RPC_cuMemAlloc_v2, handle_cuMemAlloc_v2, rpc_backend::cuda) \
   HANDLER(RPC_cuMemAllocPitch_v2, handle_cuMemAllocPitch_v2, rpc_backend::cuda) \
-  HANDLER(RPC_cuMemFree_v2, handle_cuMemFree_v2, rpc_backend::cuda) \
   HANDLER(RPC_cuMemGetAddressRange_v2, handle_cuMemGetAddressRange_v2, rpc_backend::cuda) \
   HANDLER(RPC_cuMemAllocHost_v2, handle_cuMemAllocHost_v2, rpc_backend::cuda) \
-  HANDLER(RPC_cuMemFreeHost, handle_cuMemFreeHost, rpc_backend::cuda) \
   HANDLER(RPC_cuMemHostGetDevicePointer_v2, handle_cuMemHostGetDevicePointer_v2, rpc_backend::cuda) \
-  HANDLER(RPC_cuMemAllocManaged, handle_cuMemAllocManaged, rpc_backend::cuda) \
   HANDLER(RPC_cuDeviceGetByPCIBusId, handle_cuDeviceGetByPCIBusId, rpc_backend::cuda) \
   HANDLER(RPC_cuDeviceGetPCIBusId, handle_cuDeviceGetPCIBusId, rpc_backend::cuda) \
   HANDLER(RPC_cuIpcGetEventHandle, handle_cuIpcGetEventHandle, rpc_backend::cuda) \
@@ -256,7 +256,6 @@
   HANDLER(RPC_cuFuncSetCacheConfig, handle_cuFuncSetCacheConfig, rpc_backend::cuda) \
   HANDLER(RPC_cuFuncGetModule, handle_cuFuncGetModule, rpc_backend::cuda) \
   HANDLER(RPC_cuFuncGetParamInfo, handle_cuFuncGetParamInfo, rpc_backend::cuda) \
-  HANDLER(RPC_cuLaunchCooperativeKernelMultiDevice, handle_cuLaunchCooperativeKernelMultiDevice, rpc_backend::cuda) \
   HANDLER(RPC_cuFuncSetBlockShape, handle_cuFuncSetBlockShape, rpc_backend::cuda) \
   HANDLER(RPC_cuFuncSetSharedSize, handle_cuFuncSetSharedSize, rpc_backend::cuda) \
   HANDLER(RPC_cuParamSetSize, handle_cuParamSetSize, rpc_backend::cuda) \
@@ -265,6 +264,7 @@
   HANDLER(RPC_cuLaunch, handle_cuLaunch, rpc_backend::cuda) \
   HANDLER(RPC_cuLaunchGrid, handle_cuLaunchGrid, rpc_backend::cuda) \
   HANDLER(RPC_cuLaunchGridAsync, handle_cuLaunchGridAsync, rpc_backend::cuda) \
+  HANDLER(RPC_cuLaunchCooperativeKernelMultiDevice, handle_cuLaunchCooperativeKernelMultiDevice, rpc_backend::cuda) \
   HANDLER(RPC_cuParamSetTexRef, handle_cuParamSetTexRef, rpc_backend::cuda) \
   HANDLER(RPC_cuFuncSetSharedMemConfig, handle_cuFuncSetSharedMemConfig, rpc_backend::cuda) \
   HANDLER(RPC_cuGraphCreate, handle_cuGraphCreate, rpc_backend::cuda) \
@@ -374,7 +374,8 @@
   HANDLER(RPC_cuGraphicsResourceSetMapFlags_v2, handle_cuGraphicsResourceSetMapFlags_v2, rpc_backend::cuda) \
   HANDLER(RPC_cuGraphicsMapResources, handle_cuGraphicsMapResources, rpc_backend::cuda) \
   HANDLER(RPC_cuGraphicsUnmapResources, handle_cuGraphicsUnmapResources, rpc_backend::cuda) \
-  HANDLER(RPC_cuMemPrefetchAsync, handle_cuMemPrefetchAsync, rpc_backend::cuda)
+  HANDLER(RPC_cuMemPrefetchAsync, handle_cuMemPrefetchAsync, rpc_backend::cuda) \
+  HANDLER(RPC_cuMemAdvise, handle_cuMemAdvise, rpc_backend::cuda)
 #define LUPINE_NVML_RPC_HANDLERS(HANDLER) \
   HANDLER(RPC_nvmlDeviceGetComputeRunningProcesses, handle_nvmlDeviceGetComputeRunningProcesses, rpc_backend::nvml) \
   HANDLER(RPC_nvmlDeviceGetComputeRunningProcesses_v2, handle_nvmlDeviceGetComputeRunningProcesses_v2, rpc_backend::nvml) \
@@ -457,13 +458,69 @@ LUPINE_DECLARE_HANDLER(RPC_cuTensorMapEncodeTiled,
 LUPINE_DECLARE_HANDLER(RPC_cuCtxGetDevice_v2, handle_cuCtxGetDevice_v2,
                        rpc_backend::cuda)
 #endif
+#if CUDA_VERSION >= 12030
+LUPINE_DECLARE_HANDLER(RPC_cuKernelGetName, handle_cuKernelGetName,
+                       rpc_backend::cuda)
+#endif
 #if CUDA_VERSION >= 12020
 LUPINE_DECLARE_HANDLER(RPC_cuMemPrefetchAsync_v2, handle_cuMemPrefetchAsync_v2,
                        rpc_backend::cuda)
 #endif
+#if CUDA_VERSION >= 12020
+LUPINE_DECLARE_HANDLER(RPC_cuMemAdvise_v2, handle_cuMemAdvise_v2,
+                       rpc_backend::cuda)
+#endif
+#if CUDA_VERSION >= 12030
+LUPINE_DECLARE_HANDLER(RPC_cuFuncGetName, handle_cuFuncGetName,
+                       rpc_backend::cuda)
+#endif
+#if CUDA_VERSION >= 12040
+LUPINE_DECLARE_HANDLER(RPC_cuGreenCtxCreate, handle_cuGreenCtxCreate,
+                       rpc_backend::cuda)
+#endif
+#if CUDA_VERSION >= 12040
+LUPINE_DECLARE_HANDLER(RPC_cuGreenCtxDestroy, handle_cuGreenCtxDestroy,
+                       rpc_backend::cuda)
+#endif
+#if CUDA_VERSION >= 12040
+LUPINE_DECLARE_HANDLER(RPC_cuCtxFromGreenCtx, handle_cuCtxFromGreenCtx,
+                       rpc_backend::cuda)
+#endif
+#if CUDA_VERSION >= 12040
+LUPINE_DECLARE_HANDLER(RPC_cuDeviceGetDevResource,
+                       handle_cuDeviceGetDevResource, rpc_backend::cuda)
+#endif
+#if CUDA_VERSION >= 12040
+LUPINE_DECLARE_HANDLER(RPC_cuCtxGetDevResource, handle_cuCtxGetDevResource,
+                       rpc_backend::cuda)
+#endif
+#if CUDA_VERSION >= 12040
+LUPINE_DECLARE_HANDLER(RPC_cuGreenCtxGetDevResource,
+                       handle_cuGreenCtxGetDevResource, rpc_backend::cuda)
+#endif
+#if CUDA_VERSION >= 12040
+LUPINE_DECLARE_HANDLER(RPC_cuDevSmResourceSplitByCount,
+                       handle_cuDevSmResourceSplitByCount, rpc_backend::cuda)
+#endif
+#if CUDA_VERSION >= 13010
+LUPINE_DECLARE_HANDLER(RPC_cuDevSmResourceSplit, handle_cuDevSmResourceSplit,
+                       rpc_backend::cuda)
+#endif
+#if CUDA_VERSION >= 12040
+LUPINE_DECLARE_HANDLER(RPC_cuDevResourceGenerateDesc,
+                       handle_cuDevResourceGenerateDesc, rpc_backend::cuda)
+#endif
 #if CUDA_VERSION >= 12040
 LUPINE_DECLARE_HANDLER(RPC_cuStreamGetGreenCtx, handle_cuStreamGetGreenCtx,
                        rpc_backend::cuda)
+#endif
+#if CUDA_VERSION >= 12050
+LUPINE_DECLARE_HANDLER(RPC_cuGreenCtxStreamCreate,
+                       handle_cuGreenCtxStreamCreate, rpc_backend::cuda)
+#endif
+#if CUDA_VERSION >= 13010
+LUPINE_DECLARE_HANDLER(RPC_cuStreamGetDevResource,
+                       handle_cuStreamGetDevResource, rpc_backend::cuda)
 #endif
 #endif
 #ifdef LUPINE_BUILD_NVML_BACKEND
@@ -492,19 +549,108 @@ const rpc_handler_registry &lupine_rpc_handlers() {
                                           handle_cuCtxGetDevice_v2,
                                           rpc_backend::cuda)
 #endif
+#if CUDA_VERSION >= 12030
+                      LUPINE_REGISTER_HANDLER(RPC_cuKernelGetName,
+                                              handle_cuKernelGetName,
+                                              rpc_backend::cuda)
+#endif
 #if CUDA_VERSION >= 12020
-                      LUPINE_REGISTER_HANDLER(RPC_cuMemPrefetchAsync_v2,
-                                              handle_cuMemPrefetchAsync_v2,
+                          LUPINE_REGISTER_HANDLER(RPC_cuMemPrefetchAsync_v2,
+                                                  handle_cuMemPrefetchAsync_v2,
+                                                  rpc_backend::cuda)
+#endif
+#if CUDA_VERSION >= 12020
+                              LUPINE_REGISTER_HANDLER(RPC_cuMemAdvise_v2,
+                                                      handle_cuMemAdvise_v2,
+                                                      rpc_backend::cuda)
+#endif
+#if CUDA_VERSION >= 12030
+                                  LUPINE_REGISTER_HANDLER(RPC_cuFuncGetName,
+                                                          handle_cuFuncGetName,
+                                                          rpc_backend::cuda)
+#endif
+#if CUDA_VERSION >= 12040
+                                      LUPINE_REGISTER_HANDLER(
+                                          RPC_cuGreenCtxCreate,
+                                          handle_cuGreenCtxCreate,
+                                          rpc_backend::cuda)
+#endif
+#if CUDA_VERSION >= 12040
+                                          LUPINE_REGISTER_HANDLER(
+                                              RPC_cuGreenCtxDestroy,
+                                              handle_cuGreenCtxDestroy,
                                               rpc_backend::cuda)
 #endif
 #if CUDA_VERSION >= 12040
-                          LUPINE_REGISTER_HANDLER(RPC_cuStreamGetGreenCtx,
-                                                  handle_cuStreamGetGreenCtx,
+                                              LUPINE_REGISTER_HANDLER(
+                                                  RPC_cuCtxFromGreenCtx,
+                                                  handle_cuCtxFromGreenCtx,
                                                   rpc_backend::cuda)
+#endif
+#if CUDA_VERSION >= 12040
+                                                  LUPINE_REGISTER_HANDLER(
+                                                      RPC_cuDeviceGetDevResource,
+                                                      handle_cuDeviceGetDevResource,
+                                                      rpc_backend::cuda)
+#endif
+#if CUDA_VERSION >= 12040
+                                                      LUPINE_REGISTER_HANDLER(
+                                                          RPC_cuCtxGetDevResource,
+                                                          handle_cuCtxGetDevResource,
+                                                          rpc_backend::cuda)
+#endif
+#if CUDA_VERSION >= 12040
+                                                          LUPINE_REGISTER_HANDLER(
+                                                              RPC_cuGreenCtxGetDevResource,
+                                                              handle_cuGreenCtxGetDevResource,
+                                                              rpc_backend::cuda)
+#endif
+#if CUDA_VERSION >= 12040
+                                                              LUPINE_REGISTER_HANDLER(
+                                                                  RPC_cuDevSmResourceSplitByCount,
+                                                                  handle_cuDevSmResourceSplitByCount,
+                                                                  rpc_backend::
+                                                                      cuda)
+#endif
+#if CUDA_VERSION >= 13010
+                                                                  LUPINE_REGISTER_HANDLER(
+                                                                      RPC_cuDevSmResourceSplit,
+                                                                      handle_cuDevSmResourceSplit,
+                                                                      rpc_backend::
+                                                                          cuda)
+#endif
+#if CUDA_VERSION >= 12040
+                                                                      LUPINE_REGISTER_HANDLER(
+                                                                          RPC_cuDevResourceGenerateDesc,
+                                                                          handle_cuDevResourceGenerateDesc,
+                                                                          rpc_backend::
+                                                                              cuda)
+#endif
+#if CUDA_VERSION >= 12040
+                                                                          LUPINE_REGISTER_HANDLER(
+                                                                              RPC_cuStreamGetGreenCtx,
+                                                                              handle_cuStreamGetGreenCtx,
+                                                                              rpc_backend::
+                                                                                  cuda)
+#endif
+#if CUDA_VERSION >= 12050
+                                                                              LUPINE_REGISTER_HANDLER(
+                                                                                  RPC_cuGreenCtxStreamCreate,
+                                                                                  handle_cuGreenCtxStreamCreate,
+                                                                                  rpc_backend::
+                                                                                      cuda)
+#endif
+#if CUDA_VERSION >= 13010
+                                                                                  LUPINE_REGISTER_HANDLER(
+                                                                                      RPC_cuStreamGetDevResource,
+                                                                                      handle_cuStreamGetDevResource,
+                                                                                      rpc_backend::
+                                                                                          cuda)
 #endif
 #endif
 #ifdef LUPINE_BUILD_NVML_BACKEND
-                              LUPINE_NVML_RPC_HANDLERS(LUPINE_REGISTER_HANDLER)
+                                                                                      LUPINE_NVML_RPC_HANDLERS(
+                                                                                          LUPINE_REGISTER_HANDLER)
 
 #endif
   };

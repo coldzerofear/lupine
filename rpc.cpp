@@ -13,7 +13,114 @@
 
 #ifndef _WIN32
 #include <netdb.h>
+#include <sys/mman.h>
 #endif
+
+#if defined(__linux__) && !defined(MAP_FIXED_NOREPLACE)
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+
+namespace {
+
+bool lupine_va_candidate_range(uintptr_t base, size_t size) {
+  if (size != LUPINE_VA_ARENA_SIZE || base % LUPINE_VA_ARENA_SIZE != 0 ||
+      base < LUPINE_VA_FIRST_BASE) {
+    return false;
+  }
+  uintptr_t offset = base - LUPINE_VA_FIRST_BASE;
+  return offset / LUPINE_VA_ARENA_SIZE < LUPINE_VA_ARENA_COUNT &&
+         offset % LUPINE_VA_ARENA_SIZE == 0;
+}
+
+#if !defined(_WIN32) && !defined(__APPLE__)
+void *lupine_va_reserve_exact(uintptr_t base, size_t size) {
+  int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+#ifdef MAP_NORESERVE
+  flags |= MAP_NORESERVE;
+#endif
+  flags |= MAP_FIXED_NOREPLACE;
+  void *mapping =
+      mmap(reinterpret_cast<void *>(base), size, PROT_NONE, flags, -1, 0);
+  if (mapping == MAP_FAILED) {
+    return nullptr;
+  }
+  if (mapping != reinterpret_cast<void *>(base)) {
+    munmap(mapping, size);
+    return nullptr;
+  }
+  return mapping;
+}
+#endif
+
+void lupine_va_destroy(conn_t *conn) {
+  if (conn == nullptr || conn->va_size == 0) {
+    return;
+  }
+#if !defined(_WIN32) && !defined(__APPLE__)
+  if (conn->w_offset == LUPINE_VA_WRITE_OFFSET) {
+    munmap(reinterpret_cast<void *>(conn->va_base + LUPINE_VA_WRITE_OFFSET),
+           conn->va_size);
+  }
+  munmap(reinterpret_cast<void *>(conn->va_base), conn->va_size);
+#endif
+  conn->va_base = 0;
+  conn->va_size = 0;
+  conn->va_next = 0;
+}
+
+} // namespace
+
+int lupine_va_reserve_client(conn_t *conn, unsigned int min_slot,
+                             unsigned int *slot) {
+  if (conn == nullptr || slot == nullptr || conn->va_size != 0) {
+    return -1;
+  }
+#if defined(_WIN32) || defined(__APPLE__)
+  (void)min_slot;
+  return 1;
+#else
+  for (unsigned int candidate = min_slot; candidate < LUPINE_VA_ARENA_COUNT;
+       ++candidate) {
+    uintptr_t base = LUPINE_VA_FIRST_BASE +
+                     static_cast<uintptr_t>(candidate) * LUPINE_VA_ARENA_SIZE;
+    uintptr_t write_base = base + LUPINE_VA_WRITE_OFFSET;
+    if (lupine_va_reserve_exact(base, LUPINE_VA_ARENA_SIZE) == nullptr) {
+      continue;
+    }
+    if (lupine_va_reserve_exact(write_base, LUPINE_VA_ARENA_SIZE) == nullptr) {
+      munmap(reinterpret_cast<void *>(base), LUPINE_VA_ARENA_SIZE);
+      continue;
+    }
+    conn->va_base = base;
+    conn->va_size = LUPINE_VA_ARENA_SIZE;
+    conn->va_next = 0;
+    conn->w_offset = LUPINE_VA_WRITE_OFFSET;
+    *slot = candidate;
+    return 0;
+  }
+  return -1;
+#endif
+}
+
+int lupine_va_reserve_server(conn_t *conn, uintptr_t base, size_t size) {
+  if (conn == nullptr || conn->va_size != 0 ||
+      !lupine_va_candidate_range(base, size)) {
+    return -1;
+  }
+#if defined(_WIN32) || defined(__APPLE__)
+  return -1;
+#else
+  if (lupine_va_reserve_exact(base, size) == nullptr) {
+    return -1;
+  }
+  // Keep the placeholder for the connection lifetime. Backends replace only
+  // monotonically claimed portions, so MAP_FIXED never touches foreign VMAs.
+  conn->va_base = base;
+  conn->va_size = size;
+  conn->va_next = base;
+  return 0;
+#endif
+}
 
 // lupine_tcp_connect only resolves and dials; the caller owns TLS setup and
 // the HTTP/2 session. Retried connections use bounded attempts and exponential
@@ -210,8 +317,10 @@ void rpc_conn_destroy(conn_t *conn) {
   }
   rpc_close_transport_socket(conn);
   rpc_http2_destroy(conn);
+  lupine_va_destroy(conn);
   rpc_write_buffer_release(conn);
   std::vector<rpc_write_cursor>().swap(conn->write_queue);
+  std::vector<rpc_mirror_write>().swap(conn->mirror_writes);
   pthread_mutex_destroy(&conn->write_mutex);
   pthread_mutex_destroy(&conn->call_mutex);
 }
@@ -380,10 +489,84 @@ int rpc_read_start(conn_t *conn, int write_id) {
   return 0;
 }
 
-int rpc_read(conn_t *conn, void *data, size_t size) {
+static int rpc_read_into_context(conn_t *conn, void *data, size_t size,
+                                 int (*read)(conn_t *, void *, size_t)) {
+  void *destination = data;
+  bool mirror = false;
+  uintptr_t address = reinterpret_cast<uintptr_t>(data);
+  if (conn->va_size != 0 && conn->w_offset != 0 &&
+      lupine_va_contains(conn, address, size)) {
+    destination = reinterpret_cast<void *>(address + conn->w_offset);
+    mirror = true;
+  } else if (conn->va_size == 0 && conn->w_offset != 0) {
+    uintptr_t read_base = LUPINE_MIRROR_SERVER_BASE + LUPINE_MIRROR_R_OFFSET;
+    if (address >= read_base && size <= LUPINE_MIRROR_WINDOW_SIZE &&
+        address - read_base <= LUPINE_MIRROR_WINDOW_SIZE - size) {
+      uintptr_t server_address = address - LUPINE_MIRROR_R_OFFSET;
+      destination = reinterpret_cast<void *>(server_address + conn->w_offset);
+      mirror = true;
+    }
+  }
+  int result = read(conn, destination, size);
+  if (result < 0 || !mirror) {
+    return result;
+  }
+
+  size_t written = static_cast<size_t>(result);
+  if (pthread_mutex_lock(&conn->write_mutex) != 0) {
+    return -1;
+  }
+  uintptr_t start = reinterpret_cast<uintptr_t>(data);
+  try {
+    if (!conn->mirror_writes.empty() &&
+        conn->mirror_writes.back().start + conn->mirror_writes.back().size ==
+            start) {
+      conn->mirror_writes.back().size += written;
+    } else {
+      conn->mirror_writes.push_back({start, written});
+    }
+  } catch (const std::bad_alloc &) {
+    pthread_mutex_unlock(&conn->write_mutex);
+    return -1;
+  }
+  if (written != 0) {
+    __atomic_store_n(&conn->mirror_writes_pending, 1, __ATOMIC_RELEASE);
+  }
+  if (pthread_mutex_unlock(&conn->write_mutex) != 0) {
+    return -1;
+  }
+  if (written != 0) {
+    long configured_page_size = sysconf(_SC_PAGESIZE);
+    uintptr_t page_size = configured_page_size > 0
+                              ? static_cast<uintptr_t>(configured_page_size)
+                              : static_cast<uintptr_t>(4096);
+    uintptr_t page_start = start & ~(page_size - 1);
+    uintptr_t page_end = (start + written + page_size - 1) & ~(page_size - 1);
+    if (mprotect(reinterpret_cast<void *>(page_start), page_end - page_start,
+                 PROT_READ) < 0) {
+      return -1;
+    }
+  }
+  return result;
+}
+
+static int rpc_read_http2(conn_t *conn, void *data, size_t size) {
   int32_t stream_id = rpc_current_http2_stream(conn);
   return stream_id < 0 ? -1
                        : rpc_http2_read_stream(conn, stream_id, data, size);
+}
+
+static int rpc_read_framed_payload(conn_t *conn, void *data, size_t size) {
+  return rpc_read_payload_part(conn, lupine_payload_framed(conn, size), data,
+                               size);
+}
+
+int rpc_read(conn_t *conn, void *data, size_t size) {
+  return rpc_read_into_context(conn, data, size, rpc_read_http2);
+}
+
+int rpc_read_payload(conn_t *conn, void *data, size_t size) {
+  return rpc_read_into_context(conn, data, size, rpc_read_framed_payload);
 }
 
 int rpc_read_pitched(conn_t *conn, void *data, size_t width, size_t rows,
@@ -589,9 +772,8 @@ int rpc_write(conn_t *conn, const void *data, const size_t size) {
 
 // Rows are queued, not copied, so the caller's buffer must stay valid until
 // the surrounding rpc_write_end.
-int rpc_write_pitched(conn_t *conn, const void *data, size_t width,
-                      size_t rows, size_t row_stride, size_t slices,
-                      size_t slice_stride) {
+int rpc_write_pitched(conn_t *conn, const void *data, size_t width, size_t rows,
+                      size_t row_stride, size_t slices, size_t slice_stride) {
   for (size_t z = 0; z < slices; ++z) {
     const char *slice = (const char *)data + z * slice_stride;
     for (size_t row = 0; row < rows; ++row) {
