@@ -221,6 +221,13 @@ if(LUPINE_BUILD_CUDA)
     target_link_libraries(lupine_cuda_client PRIVATE
         lupine_client_transport lupine_cuda_checkpoint lupine_ipc
         ${CMAKE_DL_LIBS})
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        # shm_open/shm_unlink (memcpy.cpp mirror-fd fallback) live in librt
+        # before glibc 2.34. Without -lrt the shim links fine but fails
+        # RTLD_NOW loading on the glibc 2.28 floor with "undefined symbol:
+        # shm_open"; on newer glibc librt is a stub and this is a no-op.
+        target_link_libraries(lupine_cuda_client PRIVATE rt)
+    endif()
     set_target_properties(lupine_cuda_client PROPERTIES
         POSITION_INDEPENDENT_CODE ON)
     if(WIN32)
