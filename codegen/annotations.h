@@ -13,6 +13,8 @@
 #include <nvml.h>
 #endif
 
+#include <hip/hip_runtime_api.h>
+
 typedef struct {
   unsigned int version;
   nvmlTemperatureSensors_t sensorType;
@@ -2258,6 +2260,18 @@ CUresult cuCtxGetFlags(unsigned int *flags);
  */
 CUresult cuCtxGetId(CUcontext ctx, unsigned long long *ctxId);
 /**
+ * @guard CUDA_VERSION >= 12050
+ * @param hCtx SEND_ONLY
+ * @param hEvent SEND_ONLY
+ */
+CUresult cuCtxRecordEvent(CUcontext hCtx, CUevent hEvent);
+/**
+ * @guard CUDA_VERSION >= 12050
+ * @param hCtx SEND_ONLY
+ * @param hEvent SEND_ONLY
+ */
+CUresult cuCtxWaitEvent(CUcontext hCtx, CUevent hEvent);
+/**
  * @disabled server
  * @synchronize DEFERRED_DTOH STDOUT
  * @routingkey CURRENT_CONTEXT
@@ -2772,12 +2786,12 @@ CUresult cuMemcpyPeer(CUdeviceptr dstDevice, CUcontext dstContext,
                       CUdeviceptr srcDevice, CUcontext srcContext,
                       size_t ByteCount);
 /**
- * @disabled server - manual server pipelines large host-to-device copies
+ * @disabled - manual client/server pipeline large host-to-device copies
  * @synchronize
  * @routingkey DEVICEPTR dstDevice
  * @param dstDevice SEND_ONLY
  * @param ByteCount SEND_ONLY
- * @param srcHost SEND_ONLY LENGTH:ByteCount COMPRESSIBLE
+ * @param srcHost SEND_ONLY LENGTH:ByteCount
  * @server CUDA
  */
 CUresult cuMemcpyHtoD_v2(CUdeviceptr dstDevice, const void *srcHost,
@@ -2787,7 +2801,7 @@ CUresult cuMemcpyHtoD_v2(CUdeviceptr dstDevice, const void *srcHost,
  * @routingkey DEVICEPTR srcDevice
  * @param srcDevice SEND_ONLY
  * @param ByteCount SEND_ONLY
- * @param dstHost RECV_ONLY LENGTH:ByteCount COMPRESSIBLE
+ * @param dstHost RECV_ONLY LENGTH:ByteCount
  * @server CUDA
  */
 CUresult cuMemcpyDtoH_v2(void *dstHost, CUdeviceptr srcDevice,
@@ -2869,6 +2883,7 @@ CUresult cuMemcpy3D_v2(const CUDA_MEMCPY3D *pCopy);
 /**
  * @disabled
  * @param pCopy SEND_ONLY
+ * @server CUDA
  */
 CUresult cuMemcpy3DPeer(const CUDA_MEMCPY3D_PEER *pCopy);
 /**
@@ -2897,7 +2912,7 @@ CUresult cuMemcpyPeerAsync(CUdeviceptr dstDevice, CUcontext dstContext,
  * @routingkey DEVICEPTR dstDevice
  * @param dstDevice SEND_ONLY
  * @param ByteCount SEND_ONLY
- * @param srcHost SEND_ONLY LENGTH:ByteCount COMPRESSIBLE
+ * @param srcHost SEND_ONLY LENGTH:ByteCount
  * @param hStream SEND_ONLY
  * @server CUDA
  */
@@ -2956,12 +2971,14 @@ CUresult cuMemcpy2DAsync_v2(const CUDA_MEMCPY2D *pCopy, CUstream hStream);
  * @disabled
  * @param pCopy SEND_ONLY
  * @param hStream SEND_ONLY
+ * @server CUDA
  */
 CUresult cuMemcpy3DAsync_v2(const CUDA_MEMCPY3D *pCopy, CUstream hStream);
 /**
  * @disabled
  * @param pCopy SEND_ONLY
  * @param hStream SEND_ONLY
+ * @server CUDA
  */
 CUresult cuMemcpy3DPeerAsync(const CUDA_MEMCPY3D_PEER *pCopy, CUstream hStream);
 /**
@@ -3437,8 +3454,9 @@ CUresult cuMemAdvise(CUdeviceptr devPtr, size_t count, CUmem_advise advice,
 CUresult cuMemAdvise_v2(CUdeviceptr devPtr, size_t count, CUmem_advise advice,
                         CUmemLocation location);
 /**
- * @param data SEND_RECV
+ * @routingkey DEVICEPTR devPtr
  * @param dataSize SEND_ONLY
+ * @param data RECV_ONLY LENGTH:dataSize
  * @param attribute SEND_ONLY
  * @param devPtr SEND_ONLY
  * @param count SEND_ONLY
@@ -3447,6 +3465,8 @@ CUresult cuMemRangeGetAttribute(void *data, size_t dataSize,
                                 CUmem_range_attribute attribute,
                                 CUdeviceptr devPtr, size_t count);
 /**
+ * @disabled - manual client and server marshal each variable-sized result
+ * @server CUDA
  * @param data SEND_RECV
  * @param dataSizes SEND_RECV
  * @param attributes SEND_RECV
@@ -3633,6 +3653,27 @@ CUresult cuGreenCtxDestroy(CUgreenCtx hCtx);
  */
 CUresult cuGreenCtxStreamCreate(CUstream *phStream, CUgreenCtx greenCtx,
                                 unsigned int flags, int priority);
+/**
+ * @guard CUDA_VERSION >= 13000
+ * @routingkey CURRENT_CONTEXT
+ * @param greenCtx SEND_ONLY
+ * @param greenCtxId RECV_ONLY
+ */
+CUresult cuGreenCtxGetId(CUgreenCtx greenCtx, unsigned long long *greenCtxId);
+/**
+ * @guard CUDA_VERSION >= 12040
+ * @routingkey CURRENT_CONTEXT
+ * @param hCtx SEND_ONLY
+ * @param hEvent SEND_ONLY
+ */
+CUresult cuGreenCtxRecordEvent(CUgreenCtx hCtx, CUevent hEvent);
+/**
+ * @guard CUDA_VERSION >= 12040
+ * @routingkey CURRENT_CONTEXT
+ * @param hCtx SEND_ONLY
+ * @param hEvent SEND_ONLY
+ */
+CUresult cuGreenCtxWaitEvent(CUgreenCtx hCtx, CUevent hEvent);
 /**
  * @disabled - manual client handles cross-server event waits
  * @routingkey STREAM hStream
@@ -4445,6 +4486,38 @@ CUresult cuGraphNodeFindInClone(CUgraphNode *phNode, CUgraphNode hOriginalNode,
  */
 CUresult cuGraphNodeGetType(CUgraphNode hNode, CUgraphNodeType *type);
 /**
+ * @guard CUDA_VERSION >= 13010
+ * @recordowner GRAPH phGraph
+ * @param hNode SEND_ONLY
+ * @param phGraph RECV_ONLY
+ */
+CUresult cuGraphNodeGetContainingGraph(CUgraphNode hNode, CUgraph *phGraph);
+/**
+ * @guard CUDA_VERSION >= 13010
+ * @param hNode SEND_ONLY
+ * @param nodeId RECV_ONLY
+ */
+CUresult cuGraphNodeGetLocalId(CUgraphNode hNode, unsigned int *nodeId);
+/**
+ * @guard CUDA_VERSION >= 13010
+ * @param hNode SEND_ONLY
+ * @param toolsNodeId RECV_ONLY
+ */
+CUresult cuGraphNodeGetToolsId(CUgraphNode hNode,
+                               unsigned long long *toolsNodeId);
+/**
+ * @guard CUDA_VERSION >= 13010
+ * @param hGraph SEND_ONLY
+ * @param graphId RECV_ONLY
+ */
+CUresult cuGraphGetId(CUgraph hGraph, unsigned int *graphId);
+/**
+ * @guard CUDA_VERSION >= 13010
+ * @param hGraphExec SEND_ONLY
+ * @param graphId RECV_ONLY
+ */
+CUresult cuGraphExecGetId(CUgraphExec hGraphExec, unsigned int *graphId);
+/**
  * @param hGraph SEND_ONLY
  * @param numNodes SEND_RECV
  * @param nodes RECV_ONLY NULLABLE LENGTH:numNodes
@@ -4505,6 +4578,19 @@ CUresult cuGraphRemoveDependencies(CUgraph hGraph, const CUgraphNode *from,
  * @param hNode SEND_ONLY
  */
 CUresult cuGraphDestroyNode(CUgraphNode hNode);
+/**
+ * @disabled server - manual server retains graph staging resources
+ * @recordowner GRAPH_EXEC phGraphExec
+ * @param phGraphExec RECV_ONLY
+ * @param hGraph SEND_ONLY
+ * @param phErrorNode RECV_ONLY NULLABLE
+ * @param bufferSize SEND_ONLY
+ * @param logBuffer RECV_ONLY NULLABLE LENGTH:bufferSize ON_ERROR
+ * @server CUDA
+ */
+CUresult cuGraphInstantiate_v2(CUgraphExec *phGraphExec, CUgraph hGraph,
+                               CUgraphNode *phErrorNode, char *logBuffer,
+                               size_t bufferSize);
 /**
  * @recordowner GRAPH_EXEC phGraphExec
  * @param phGraphExec SEND_RECV
@@ -5153,6 +5239,22 @@ CUresult cuGraphicsUnmapResources(unsigned int count,
 CUresult cuGetProcAddress_v2(const char *symbol, void **pfn, int cudaVersion,
                              cuuint64_t flags,
                              CUdriverProcAddressQueryResult *symbolStatus);
+/**
+ * @guard CUDA_VERSION >= 12010
+ * @param attrib SEND_ONLY
+ * @param size SEND_RECV
+ * @param value RECV_ONLY LENGTH:size
+ */
+CUresult cuCoredumpGetAttributeGlobal(CUcoredumpSettings attrib, void *value,
+                                      size_t *size);
+/**
+ * @guard CUDA_VERSION >= 12010
+ * @param attrib SEND_ONLY
+ * @param size SEND_RECV
+ * @param value SEND_ONLY LENGTH:size
+ */
+CUresult cuCoredumpSetAttributeGlobal(CUcoredumpSettings attrib, void *value,
+                                      size_t *size);
 /**
  * @disabled
  * @param ppExportTable SEND_RECV
@@ -17254,6 +17356,71 @@ cublasStatus_t cublasGemmStridedBatchedEx(
     long long int strideB, const void *beta, void *C, cudaDataType Ctype,
     int ldc, long long int strideC, int batchCount, cudaDataType computeType,
     cublasGemmAlgo_t algo);
+
+// HIP runtime API. The initial generated surface covers device discovery and
+// properties.
+
+/**
+ * @server HIP
+ * @disabled client - manual client initializes every configured route
+ * @param flags SEND_ONLY
+ */
+hipError_t hipInit(unsigned int flags);
+/**
+ * @server HIP
+ * @disabled client - manual client reports the virtual device table size
+ * @param count RECV_ONLY
+ */
+hipError_t hipGetDeviceCount(int *count);
+/**
+ * @server HIP
+ * @disabled client - manual client maps the virtual device ordinal
+ * @param device RECV_ONLY
+ * @param ordinal SEND_ONLY
+ */
+hipError_t hipDeviceGet(int *device, int ordinal);
+/**
+ * @server HIP
+ * @param prop RECV_ONLY
+ * @param deviceId SEND_ONLY
+ * @routingkey HIP_DEVICE deviceId
+ */
+hipError_t hipGetDevicePropertiesR0600(hipDeviceProp_tR0600 *prop,
+                                       int deviceId);
+/**
+ * @server HIP
+ * @param name RECV_ONLY LENGTH:len
+ * @param len SEND_ONLY
+ * @param deviceId SEND_ONLY
+ * @routingkey HIP_DEVICE deviceId
+ */
+hipError_t hipDeviceGetName(char *name, int len, int deviceId);
+/**
+ * @server HIP
+ * @param bytes RECV_ONLY
+ * @param deviceId SEND_ONLY
+ * @routingkey HIP_DEVICE deviceId
+ */
+hipError_t hipDeviceTotalMem(size_t *bytes, int deviceId);
+/**
+ * @server HIP
+ * @param pi RECV_ONLY
+ * @param attr SEND_ONLY
+ * @param deviceId SEND_ONLY
+ * @routingkey HIP_DEVICE deviceId
+ */
+hipError_t hipDeviceGetAttribute(int *pi, hipDeviceAttribute_t attr,
+                                 int deviceId);
+/**
+ * @server HIP
+ * @param driverVersion RECV_ONLY
+ */
+hipError_t hipDriverGetVersion(int *driverVersion);
+/**
+ * @server HIP
+ * @param runtimeVersion RECV_ONLY
+ */
+hipError_t hipRuntimeGetVersion(int *runtimeVersion);
 
 // Registry-only operations without API declarations above. The code generator
 // reads these annotations directly; the C++ parser intentionally ignores them.

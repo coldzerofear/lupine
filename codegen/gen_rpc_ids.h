@@ -45,6 +45,8 @@
 #define RPC_cuCtxGetStreamPriorityRange 1782496290
 #define RPC_cuCtxResetPersistingL2Cache 1127157402
 #define RPC_cuCtxGetExecAffinity 110995246
+#define RPC_cuCtxRecordEvent 64806754
+#define RPC_cuCtxWaitEvent 1390839162
 #define RPC_cuCtxAttach 1257564665
 #define RPC_cuCtxDetach 1203357304
 #define RPC_cuCtxGetSharedMemConfig 1986889819
@@ -172,6 +174,7 @@
 #define RPC_cuMemPoolImportPointer 1026713940
 #define RPC_cuMemPrefetchAsync_v2 199313298
 #define RPC_cuMemAdvise_v2 1952016083
+#define RPC_cuMemRangeGetAttribute 1819983801
 #define RPC_cuMemRangeGetAttributes 694140572
 #define RPC_cuPointerSetAttribute 749063765
 #define RPC_cuPointerGetAttributes 1948058610
@@ -274,6 +277,11 @@
 #define RPC_cuGraphClone 1985984852
 #define RPC_cuGraphNodeFindInClone 1346487083
 #define RPC_cuGraphNodeGetType 1733309030
+#define RPC_cuGraphNodeGetContainingGraph 2073783441
+#define RPC_cuGraphNodeGetLocalId 909459841
+#define RPC_cuGraphNodeGetToolsId 1122255545
+#define RPC_cuGraphGetId 1130798716
+#define RPC_cuGraphExecGetId 1513714907
 #define RPC_cuGraphGetNodes 314616981
 #define RPC_cuGraphGetRootNodes 1731117011
 #define RPC_cuGraphDestroyNode 1083979368
@@ -361,6 +369,8 @@
 #define RPC_cuGraphicsMapResources 156810469
 #define RPC_cuGraphicsUnmapResources 121118754
 #define RPC_cuGetProcAddress_v2 1976428842
+#define RPC_cuCoredumpGetAttributeGlobal 2132238767
+#define RPC_cuCoredumpSetAttributeGlobal 1511844529
 #define RPC_cuGetExportTable 2020229241
 #define RPC_cuGreenCtxCreate 1079242194
 #define RPC_cuGreenCtxDestroy 1043831578
@@ -371,9 +381,13 @@
 #define RPC_cuDevSmResourceSplitByCount 2128109816
 #define RPC_cuDevSmResourceSplit 1230886197
 #define RPC_cuDevResourceGenerateDesc 1242809183
+#define RPC_cuGreenCtxRecordEvent 1473921838
+#define RPC_cuGreenCtxWaitEvent 1136327306
 #define RPC_cuStreamGetGreenCtx 1723357044
 #define RPC_cuGreenCtxStreamCreate 1433266945
+#define RPC_cuGreenCtxGetId 1724676806
 #define RPC_cuStreamGetDevResource 494275841
+#define RPC_cuGraphInstantiate_v2 1599532620
 #define RPC_cuCtxCreate_v2 804269166
 #define RPC_cuCtxCreate_v3 1492589816
 #define RPC_cuDeviceGetGraphMemAttribute 622504442
@@ -390,7 +404,6 @@
 #define RPC_cuMemPoolGetAttribute 830843819
 #define RPC_cuMemPoolSetAttribute 1050377512
 #define RPC_cuMemPrefetchAsync 596440383
-#define RPC_cuMemRangeGetAttribute 1819983801
 #define RPC_cuMemRetainAllocationHandle 1903553150
 #define RPC_cuMemcpyAtoHAsync_v2 1591028942
 #define RPC_cuParamSetv 1622049063
@@ -464,6 +477,15 @@
 #define RPC_nvmlDeviceGetNvLinkRemoteDeviceType 65527014
 #define RPC_nvmlDeviceGetNvLinkRemotePciInfo_v2 1998574024
 #define RPC_nvmlDeviceGetCudaComputeCapability 1264755594
+#define RPC_hipInit 874444791
+#define RPC_hipGetDeviceCount 1401409107
+#define RPC_hipDeviceGet 1529875909
+#define RPC_hipGetDevicePropertiesR0600 768204638
+#define RPC_hipDeviceGetName 2031968752
+#define RPC_hipDeviceTotalMem 53957243
+#define RPC_hipDeviceGetAttribute 1095006000
+#define RPC_hipDriverGetVersion 380424251
+#define RPC_hipRuntimeGetVersion 392869969
 
 #define LUPINE_RPC_cuGetExportTableMetadata 565915314
 #define LUPINE_RPC_cuGraphAddNode_v2 1958016248

@@ -5,6 +5,15 @@
 
 #include "rpc.h"
 
+// Which side of a copy is host memory, and therefore which side the handler
+// has to stage locally.
+enum class lupine_copy_direction {
+  host_to_host,
+  host_to_device,
+  device_to_host,
+  device_to_device,
+};
+
 int handle_cuGetErrorName(conn_t *conn);
 int handle_cuGetErrorString(conn_t *conn);
 int handle_cuGetExportTableMetadata(conn_t *conn);
@@ -22,6 +31,7 @@ int handle_cuMemExportToShareableHandle(conn_t *conn);
 int handle_cuMemImportFromShareableHandle(conn_t *conn);
 int handle_cuMemPoolExportToShareableHandle(conn_t *conn);
 int handle_cuMemPoolImportFromShareableHandle(conn_t *conn);
+int handle_cuMemRangeGetAttributes(conn_t *conn);
 int handle_cuPointerGetAttribute(conn_t *conn);
 int handle_cuPointerSetAttribute(conn_t *conn);
 int handle_cuPointerGetAttributes(conn_t *conn);
@@ -31,6 +41,9 @@ int handle_cuLinkAddFile_v2(conn_t *conn);
 int handle_cuLinkComplete(conn_t *conn);
 int handle_cuLinkDestroy(conn_t *conn);
 int handle_cuMemcpy3D_v2(conn_t *conn);
+int handle_cuMemcpy3DAsync_v2(conn_t *conn);
+int handle_cuMemcpy3DPeer(conn_t *conn);
+int handle_cuMemcpy3DPeerAsync(conn_t *conn);
 int handle_cuMemcpy2D_v2(conn_t *conn);
 int handle_cuMemcpy2DUnaligned_v2(conn_t *conn);
 int handle_cuMemcpy2DAsync_v2(conn_t *conn);
@@ -71,6 +84,7 @@ int handle_cuStreamGetCaptureInfo(conn_t *conn);
 int handle_cuStreamBeginCapture(conn_t *conn);
 int handle_cuStreamEndCapture(conn_t *conn);
 int handle_cuGraphClone(conn_t *conn);
+int handle_cuGraphInstantiate_v2(conn_t *conn);
 int handle_cuGraphInstantiateWithFlags(conn_t *conn);
 int handle_cuGraphInstantiateWithParams(conn_t *conn);
 int handle_cuGraphExecDestroy(conn_t *conn);
@@ -94,5 +108,22 @@ int handle_cuOccupancyMaxPotentialBlockSizeWithFlags(conn_t *conn);
 #if CUDA_VERSION >= 12000
 int handle_cuTensorMapEncodeTiled(conn_t *conn);
 #endif
+
+bool lupine_server_initialize_connection(conn_t *conn);
+void lupine_server_cleanup_connection(conn_t *conn);
+
+int lupine_server_copy_htod_async(conn_t *conn, CUdeviceptr destination,
+                                  size_t bytes, CUstream stream,
+                                  CUresult &result);
+
+int handle_cuDevicePrimaryCtxRetain(conn_t *conn);
+int handle_cuDevicePrimaryCtxRelease_v2(conn_t *conn);
+int handle_cuDevicePrimaryCtxReset_v2(conn_t *conn);
+int handle_cuCtxAttach(conn_t *conn);
+int handle_cuCtxCreate_v2(conn_t *conn);
+int handle_cuCtxDestroy_v2(conn_t *conn);
+int handle_cuCtxDetach(conn_t *conn);
+int handle_cuMemcpyHtoD_v2(conn_t *conn);
+int handle_cuMemcpyDtoH_v2(conn_t *conn);
 
 #endif

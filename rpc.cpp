@@ -22,16 +22,6 @@
 
 namespace {
 
-bool lupine_va_candidate_range(uintptr_t base, size_t size) {
-  if (size != LUPINE_VA_ARENA_SIZE || base % LUPINE_VA_ARENA_SIZE != 0 ||
-      base < LUPINE_VA_FIRST_BASE) {
-    return false;
-  }
-  uintptr_t offset = base - LUPINE_VA_FIRST_BASE;
-  return offset / LUPINE_VA_ARENA_SIZE < LUPINE_VA_ARENA_COUNT &&
-         offset % LUPINE_VA_ARENA_SIZE == 0;
-}
-
 #if !defined(_WIN32) && !defined(__APPLE__)
 void *lupine_va_reserve_exact(uintptr_t base, size_t size) {
   int flags = MAP_PRIVATE | MAP_ANONYMOUS;
@@ -57,10 +47,8 @@ void lupine_va_destroy(conn_t *conn) {
     return;
   }
 #if !defined(_WIN32) && !defined(__APPLE__)
-  if (conn->w_offset == LUPINE_VA_WRITE_OFFSET) {
-    munmap(reinterpret_cast<void *>(conn->va_base + LUPINE_VA_WRITE_OFFSET),
-           conn->va_size);
-  }
+  munmap(reinterpret_cast<void *>(conn->va_base + conn->w_offset),
+         conn->va_size);
   munmap(reinterpret_cast<void *>(conn->va_base), conn->va_size);
 #endif
   conn->va_base = 0;
@@ -70,9 +58,19 @@ void lupine_va_destroy(conn_t *conn) {
 
 } // namespace
 
-int lupine_va_reserve_client(conn_t *conn, unsigned int min_slot,
-                             unsigned int *slot) {
-  if (conn == nullptr || slot == nullptr || conn->va_size != 0) {
+lupine_va_window lupine_va_local_window(void) {
+#if defined(_WIN32) || defined(__APPLE__)
+  // No arena can be hosted here, so state none and let the peer fall back.
+  return {};
+#else
+  return {LUPINE_VA_FIRST_BASE, LUPINE_VA_ARENA_SIZE * LUPINE_VA_ARENA_COUNT};
+#endif
+}
+
+int lupine_va_reserve_client(conn_t *conn, const lupine_va_window &window,
+                             unsigned int min_slot, unsigned int *slot) {
+  const size_t arena = window.size / LUPINE_VA_ARENA_COUNT;
+  if (conn == nullptr || slot == nullptr || conn->va_size != 0 || arena == 0) {
     return -1;
   }
 #if defined(_WIN32) || defined(__APPLE__)
@@ -81,20 +79,21 @@ int lupine_va_reserve_client(conn_t *conn, unsigned int min_slot,
 #else
   for (unsigned int candidate = min_slot; candidate < LUPINE_VA_ARENA_COUNT;
        ++candidate) {
-    uintptr_t base = LUPINE_VA_FIRST_BASE +
-                     static_cast<uintptr_t>(candidate) * LUPINE_VA_ARENA_SIZE;
-    uintptr_t write_base = base + LUPINE_VA_WRITE_OFFSET;
-    if (lupine_va_reserve_exact(base, LUPINE_VA_ARENA_SIZE) == nullptr) {
+    uintptr_t offset = static_cast<uintptr_t>(candidate) * arena;
+    uintptr_t base = window.base + offset;
+    uintptr_t write_base = LUPINE_VA_WRITE_BASE + offset;
+    if (lupine_va_reserve_exact(base, arena) == nullptr) {
       continue;
     }
-    if (lupine_va_reserve_exact(write_base, LUPINE_VA_ARENA_SIZE) == nullptr) {
-      munmap(reinterpret_cast<void *>(base), LUPINE_VA_ARENA_SIZE);
+    if (lupine_va_reserve_exact(write_base, arena) == nullptr) {
+      munmap(reinterpret_cast<void *>(base), arena);
       continue;
     }
     conn->va_base = base;
-    conn->va_size = LUPINE_VA_ARENA_SIZE;
+    conn->va_size = arena;
     conn->va_next = 0;
-    conn->w_offset = LUPINE_VA_WRITE_OFFSET;
+    conn->w_offset =
+        static_cast<intptr_t>(write_base) - static_cast<intptr_t>(base);
     *slot = candidate;
     return 0;
   }
@@ -102,9 +101,30 @@ int lupine_va_reserve_client(conn_t *conn, unsigned int min_slot,
 #endif
 }
 
+bool lupine_va_claim(conn_t *conn, size_t size, size_t alignment,
+                     uintptr_t *claimed) {
+  if (conn == nullptr || claimed == nullptr || conn->va_size == 0 ||
+      size == 0 || alignment == 0 || (alignment & (alignment - 1)) != 0 ||
+      size > conn->va_size) {
+    return false;
+  }
+  uintptr_t current = __atomic_load_n(&conn->va_next, __ATOMIC_RELAXED);
+  for (;;) {
+    uintptr_t next_claim = (current + alignment - 1) & ~(alignment - 1);
+    if (next_claim < current || next_claim < conn->va_base ||
+        next_claim - conn->va_base > conn->va_size - size) {
+      return false;
+    }
+    if (__atomic_compare_exchange_n(&conn->va_next, &current, next_claim + size,
+                                    true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+      *claimed = next_claim;
+      return true;
+    }
+  }
+}
+
 int lupine_va_reserve_server(conn_t *conn, uintptr_t base, size_t size) {
-  if (conn == nullptr || conn->va_size != 0 ||
-      !lupine_va_candidate_range(base, size)) {
+  if (conn == nullptr || conn->va_size != 0) {
     return -1;
   }
 #if defined(_WIN32) || defined(__APPLE__)
@@ -130,6 +150,14 @@ lupine_socket_t lupine_tcp_connect(const char *host, const char *port,
   constexpr int kInitialBackoffMs = 1000;
   constexpr int kMaxBackoffMs = 30000;
   constexpr int kConnectTimeoutMs = 10000;
+
+  // Every client dial funnels through here, and on Windows no socket call --
+  // getaddrinfo included -- works until Winsock has been started. The server
+  // starts it from main; a client shim has no such entry point of its own.
+  if (lupine_socket_init() < 0) {
+    LUPINE_LOG_ERROR("Socket initialization failed");
+    return LUPINE_INVALID_SOCKET;
+  }
 
   for (int attempt = 0;; ++attempt) {
     addrinfo hints;
@@ -320,7 +348,7 @@ void rpc_conn_destroy(conn_t *conn) {
   lupine_va_destroy(conn);
   rpc_write_buffer_release(conn);
   std::vector<rpc_write_cursor>().swap(conn->write_queue);
-  std::vector<rpc_mirror_write>().swap(conn->mirror_writes);
+  std::vector<rpc_host_allocation_write>().swap(conn->host_allocation_writes);
   pthread_mutex_destroy(&conn->write_mutex);
   pthread_mutex_destroy(&conn->call_mutex);
 }
@@ -492,23 +520,24 @@ int rpc_read_start(conn_t *conn, int write_id) {
 static int rpc_read_into_context(conn_t *conn, void *data, size_t size,
                                  int (*read)(conn_t *, void *, size_t)) {
   void *destination = data;
-  bool mirror = false;
+  bool host_allocation = false;
   uintptr_t address = reinterpret_cast<uintptr_t>(data);
   if (conn->va_size != 0 && conn->w_offset != 0 &&
       lupine_va_contains(conn, address, size)) {
     destination = reinterpret_cast<void *>(address + conn->w_offset);
-    mirror = true;
+    host_allocation = true;
   } else if (conn->va_size == 0 && conn->w_offset != 0) {
-    uintptr_t read_base = LUPINE_MIRROR_SERVER_BASE + LUPINE_MIRROR_R_OFFSET;
-    if (address >= read_base && size <= LUPINE_MIRROR_WINDOW_SIZE &&
-        address - read_base <= LUPINE_MIRROR_WINDOW_SIZE - size) {
-      uintptr_t server_address = address - LUPINE_MIRROR_R_OFFSET;
+    uintptr_t read_base =
+        LUPINE_HOST_ALLOCATION_SERVER_BASE + LUPINE_HOST_ALLOCATION_R_OFFSET;
+    if (address >= read_base && size <= LUPINE_HOST_ALLOCATION_WINDOW_SIZE &&
+        address - read_base <= LUPINE_HOST_ALLOCATION_WINDOW_SIZE - size) {
+      uintptr_t server_address = address - LUPINE_HOST_ALLOCATION_R_OFFSET;
       destination = reinterpret_cast<void *>(server_address + conn->w_offset);
-      mirror = true;
+      host_allocation = true;
     }
   }
   int result = read(conn, destination, size);
-  if (result < 0 || !mirror) {
+  if (result < 0 || !host_allocation) {
     return result;
   }
 
@@ -518,19 +547,21 @@ static int rpc_read_into_context(conn_t *conn, void *data, size_t size,
   }
   uintptr_t start = reinterpret_cast<uintptr_t>(data);
   try {
-    if (!conn->mirror_writes.empty() &&
-        conn->mirror_writes.back().start + conn->mirror_writes.back().size ==
+    if (!conn->host_allocation_writes.empty() &&
+        conn->host_allocation_writes.back().start +
+                conn->host_allocation_writes.back().size ==
             start) {
-      conn->mirror_writes.back().size += written;
+      conn->host_allocation_writes.back().size += written;
     } else {
-      conn->mirror_writes.push_back({start, written});
+      conn->host_allocation_writes.push_back({start, written});
     }
   } catch (const std::bad_alloc &) {
     pthread_mutex_unlock(&conn->write_mutex);
     return -1;
   }
   if (written != 0) {
-    __atomic_store_n(&conn->mirror_writes_pending, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&conn->host_allocation_writes_pending, 1,
+                     __ATOMIC_RELEASE);
   }
   if (pthread_mutex_unlock(&conn->write_mutex) != 0) {
     return -1;
@@ -556,17 +587,8 @@ static int rpc_read_http2(conn_t *conn, void *data, size_t size) {
                        : rpc_http2_read_stream(conn, stream_id, data, size);
 }
 
-static int rpc_read_framed_payload(conn_t *conn, void *data, size_t size) {
-  return rpc_read_payload_part(conn, lupine_payload_framed(conn, size), data,
-                               size);
-}
-
 int rpc_read(conn_t *conn, void *data, size_t size) {
   return rpc_read_into_context(conn, data, size, rpc_read_http2);
-}
-
-int rpc_read_payload(conn_t *conn, void *data, size_t size) {
-  return rpc_read_into_context(conn, data, size, rpc_read_framed_payload);
 }
 
 int rpc_read_pitched(conn_t *conn, void *data, size_t width, size_t rows,
@@ -767,7 +789,7 @@ int rpc_write(conn_t *conn, const void *data, const size_t size) {
   if (size == 0) {
     return 0;
   }
-  return rpc_write_queue_push(conn, rpc_write_cursor::plain(data, size));
+  return rpc_write_queue_push(conn, rpc_write_cursor(data, size));
 }
 
 // Rows are queued, not copied, so the caller's buffer must stay valid until
@@ -839,22 +861,12 @@ int rpc_write_cursors(conn_t *conn, const rpc_write_cursor *cursors,
     return -1;
   }
   for (size_t i = 0; i < count; ++i) {
-    if ((cursors[i].data == nullptr && cursors[i].size != 0) ||
-        (cursors[i].source == nullptr && cursors[i].source_size != 0) ||
-        (cursors[i].size != 0 && cursors[i].source_size != 0)) {
+    if (cursors[i].data == nullptr && cursors[i].size != 0) {
       return -1;
     }
     conn->write_queue.push_back(cursors[i]);
   }
   return 0;
-}
-
-// rpc_write_framed queues a payload that the transport LZ4-frames lazily,
-// one block at a time, as the bytes are streamed to the socket. The caller's
-// buffer must stay valid until rpc_write_end() returns, exactly like
-// rpc_write(). See compress.cpp for the framing format.
-int rpc_write_framed(conn_t *conn, const void *data, const size_t size) {
-  return rpc_write_queue_push(conn, rpc_write_cursor::framed(data, size));
 }
 
 // rpc_write_end finalizes the current request builder on the given connection
@@ -877,9 +889,9 @@ int rpc_write_end(conn_t *conn) {
   int result = -1;
   if (conn->write_queue.size() >= 2) {
     conn->write_queue[0] =
-        rpc_write_cursor::plain(&conn->write_id, sizeof(conn->write_id));
+        rpc_write_cursor(&conn->write_id, sizeof(conn->write_id));
     conn->write_queue[1] =
-        rpc_write_cursor::plain(&conn->write_op, sizeof(conn->write_op));
+        rpc_write_cursor(&conn->write_op, sizeof(conn->write_op));
     result = rpc_http2_write_stream(conn, write_stream_id, conn->write_queue);
   }
   rpc_write_buffer_release(conn);

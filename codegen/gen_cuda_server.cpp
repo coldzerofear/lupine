@@ -12,6 +12,15 @@
 
 #include "rpc.h"
 
+#ifdef cuGraphInstantiate_v2
+#undef cuGraphInstantiate_v2
+#endif
+extern "C" CUresult CUDAAPI cuGraphInstantiate_v2(CUgraphExec *phGraphExec,
+                                                  CUgraph hGraph,
+                                                  CUgraphNode *phErrorNode,
+                                                  char *logBuffer,
+                                                  size_t bufferSize);
+
 #ifdef cuMemPrefetchAsync
 #undef cuMemPrefetchAsync
 #endif
@@ -887,6 +896,60 @@ int handle_cuCtxGetExecAffinity(conn_t *conn) {
 ERROR_0:
   return -1;
 }
+
+#if CUDA_VERSION >= 12050
+int handle_cuCtxRecordEvent(conn_t *conn) {
+  CUcontext hCtx;
+  CUevent hEvent;
+  int request_id;
+  CUresult lupine_intercept_result;
+  if (rpc_read(conn, &hCtx, sizeof(CUcontext)) < 0 ||
+      rpc_read(conn, &hEvent, sizeof(CUevent)) < 0 || false)
+    goto ERROR_0;
+
+  request_id = rpc_read_end(conn);
+  if (request_id < 0)
+    goto ERROR_0;
+  lupine_intercept_result = cuCtxRecordEvent(hCtx, hEvent);
+
+  if (rpc_write_start_response(conn, request_id) < 0 ||
+      rpc_write(conn, &lupine_intercept_result, sizeof(CUresult)) < 0 ||
+      rpc_write_end(conn) < 0)
+    goto ERROR_0;
+
+  return 0;
+ERROR_0:
+  return -1;
+}
+
+#endif
+
+#if CUDA_VERSION >= 12050
+int handle_cuCtxWaitEvent(conn_t *conn) {
+  CUcontext hCtx;
+  CUevent hEvent;
+  int request_id;
+  CUresult lupine_intercept_result;
+  if (rpc_read(conn, &hCtx, sizeof(CUcontext)) < 0 ||
+      rpc_read(conn, &hEvent, sizeof(CUevent)) < 0 || false)
+    goto ERROR_0;
+
+  request_id = rpc_read_end(conn);
+  if (request_id < 0)
+    goto ERROR_0;
+  lupine_intercept_result = cuCtxWaitEvent(hCtx, hEvent);
+
+  if (rpc_write_start_response(conn, request_id) < 0 ||
+      rpc_write(conn, &lupine_intercept_result, sizeof(CUresult)) < 0 ||
+      rpc_write_end(conn) < 0)
+    goto ERROR_0;
+
+  return 0;
+ERROR_0:
+  return -1;
+}
+
+#endif
 
 int handle_cuCtxGetSharedMemConfig(conn_t *conn) {
   CUsharedconfig pConfig;
@@ -3392,19 +3455,19 @@ ERROR_0:
 
 #endif
 
-int handle_cuMemRangeGetAttributes(conn_t *conn) {
-  void *data;
-  size_t dataSizes;
-  CUmem_range_attribute attributes;
-  size_t numAttributes;
+int handle_cuMemRangeGetAttribute(conn_t *conn) {
+  size_t dataSize;
+  void *data = nullptr;
+  CUmem_range_attribute attribute;
   CUdeviceptr devPtr;
   size_t count;
   int request_id;
   CUresult lupine_intercept_result;
-  if (rpc_read(conn, &data, sizeof(void *)) < 0 ||
-      rpc_read(conn, &dataSizes, sizeof(size_t)) < 0 ||
-      rpc_read(conn, &attributes, sizeof(CUmem_range_attribute)) < 0 ||
-      rpc_read(conn, &numAttributes, sizeof(size_t)) < 0 ||
+  if (rpc_read(conn, &dataSize, sizeof(size_t)) < 0 || false)
+    goto ERROR_0;
+  data = (void *)malloc(dataSize);
+  if ((dataSize != 0 && data == nullptr) ||
+      rpc_read(conn, &attribute, sizeof(CUmem_range_attribute)) < 0 ||
       rpc_read(conn, &devPtr, sizeof(CUdeviceptr)) < 0 ||
       rpc_read(conn, &count, sizeof(size_t)) < 0 || false)
     goto ERROR_0;
@@ -3412,19 +3475,19 @@ int handle_cuMemRangeGetAttributes(conn_t *conn) {
   request_id = rpc_read_end(conn);
   if (request_id < 0)
     goto ERROR_0;
-  lupine_intercept_result = cuMemRangeGetAttributes(
-      &data, &dataSizes, &attributes, numAttributes, devPtr, count);
+  lupine_intercept_result = cuMemRangeGetAttribute(
+      (dataSize == 0 ? nullptr : data), dataSize, attribute, devPtr, count);
 
   if (rpc_write_start_response(conn, request_id) < 0 ||
-      rpc_write(conn, &data, sizeof(void *)) < 0 ||
-      rpc_write(conn, &dataSizes, sizeof(size_t)) < 0 ||
-      rpc_write(conn, &attributes, sizeof(CUmem_range_attribute)) < 0 ||
+      rpc_write(conn, data, dataSize) < 0 ||
       rpc_write(conn, &lupine_intercept_result, sizeof(CUresult)) < 0 ||
       rpc_write_end(conn) < 0)
     goto ERROR_0;
 
+  free((void *)data);
   return 0;
 ERROR_0:
+  free((void *)data);
   return -1;
 }
 
@@ -5762,6 +5825,141 @@ ERROR_0:
   return -1;
 }
 
+#if CUDA_VERSION >= 13010
+int handle_cuGraphNodeGetContainingGraph(conn_t *conn) {
+  CUgraphNode hNode;
+  CUgraph phGraph;
+  int request_id;
+  CUresult lupine_intercept_result;
+  if (rpc_read(conn, &hNode, sizeof(CUgraphNode)) < 0 || false)
+    goto ERROR_0;
+
+  request_id = rpc_read_end(conn);
+  if (request_id < 0)
+    goto ERROR_0;
+  lupine_intercept_result = cuGraphNodeGetContainingGraph(hNode, &phGraph);
+
+  if (rpc_write_start_response(conn, request_id) < 0 ||
+      rpc_write(conn, &phGraph, sizeof(CUgraph)) < 0 ||
+      rpc_write(conn, &lupine_intercept_result, sizeof(CUresult)) < 0 ||
+      rpc_write_end(conn) < 0)
+    goto ERROR_0;
+
+  return 0;
+ERROR_0:
+  return -1;
+}
+
+#endif
+
+#if CUDA_VERSION >= 13010
+int handle_cuGraphNodeGetLocalId(conn_t *conn) {
+  CUgraphNode hNode;
+  unsigned int nodeId;
+  int request_id;
+  CUresult lupine_intercept_result;
+  if (rpc_read(conn, &hNode, sizeof(CUgraphNode)) < 0 || false)
+    goto ERROR_0;
+
+  request_id = rpc_read_end(conn);
+  if (request_id < 0)
+    goto ERROR_0;
+  lupine_intercept_result = cuGraphNodeGetLocalId(hNode, &nodeId);
+
+  if (rpc_write_start_response(conn, request_id) < 0 ||
+      rpc_write(conn, &nodeId, sizeof(unsigned int)) < 0 ||
+      rpc_write(conn, &lupine_intercept_result, sizeof(CUresult)) < 0 ||
+      rpc_write_end(conn) < 0)
+    goto ERROR_0;
+
+  return 0;
+ERROR_0:
+  return -1;
+}
+
+#endif
+
+#if CUDA_VERSION >= 13010
+int handle_cuGraphNodeGetToolsId(conn_t *conn) {
+  CUgraphNode hNode;
+  unsigned long long toolsNodeId;
+  int request_id;
+  CUresult lupine_intercept_result;
+  if (rpc_read(conn, &hNode, sizeof(CUgraphNode)) < 0 || false)
+    goto ERROR_0;
+
+  request_id = rpc_read_end(conn);
+  if (request_id < 0)
+    goto ERROR_0;
+  lupine_intercept_result = cuGraphNodeGetToolsId(hNode, &toolsNodeId);
+
+  if (rpc_write_start_response(conn, request_id) < 0 ||
+      rpc_write(conn, &toolsNodeId, sizeof(unsigned long long)) < 0 ||
+      rpc_write(conn, &lupine_intercept_result, sizeof(CUresult)) < 0 ||
+      rpc_write_end(conn) < 0)
+    goto ERROR_0;
+
+  return 0;
+ERROR_0:
+  return -1;
+}
+
+#endif
+
+#if CUDA_VERSION >= 13010
+int handle_cuGraphGetId(conn_t *conn) {
+  CUgraph hGraph;
+  unsigned int graphId;
+  int request_id;
+  CUresult lupine_intercept_result;
+  if (rpc_read(conn, &hGraph, sizeof(CUgraph)) < 0 || false)
+    goto ERROR_0;
+
+  request_id = rpc_read_end(conn);
+  if (request_id < 0)
+    goto ERROR_0;
+  lupine_intercept_result = cuGraphGetId(hGraph, &graphId);
+
+  if (rpc_write_start_response(conn, request_id) < 0 ||
+      rpc_write(conn, &graphId, sizeof(unsigned int)) < 0 ||
+      rpc_write(conn, &lupine_intercept_result, sizeof(CUresult)) < 0 ||
+      rpc_write_end(conn) < 0)
+    goto ERROR_0;
+
+  return 0;
+ERROR_0:
+  return -1;
+}
+
+#endif
+
+#if CUDA_VERSION >= 13010
+int handle_cuGraphExecGetId(conn_t *conn) {
+  CUgraphExec hGraphExec;
+  unsigned int graphId;
+  int request_id;
+  CUresult lupine_intercept_result;
+  if (rpc_read(conn, &hGraphExec, sizeof(CUgraphExec)) < 0 || false)
+    goto ERROR_0;
+
+  request_id = rpc_read_end(conn);
+  if (request_id < 0)
+    goto ERROR_0;
+  lupine_intercept_result = cuGraphExecGetId(hGraphExec, &graphId);
+
+  if (rpc_write_start_response(conn, request_id) < 0 ||
+      rpc_write(conn, &graphId, sizeof(unsigned int)) < 0 ||
+      rpc_write(conn, &lupine_intercept_result, sizeof(CUresult)) < 0 ||
+      rpc_write_end(conn) < 0)
+    goto ERROR_0;
+
+  return 0;
+ERROR_0:
+  return -1;
+}
+
+#endif
+
 int handle_cuGraphGetNodes(conn_t *conn) {
   CUgraph hGraph;
   size_t numNodes = 0;
@@ -7884,6 +8082,81 @@ ERROR_0:
   return -1;
 }
 
+#if CUDA_VERSION >= 12010
+int handle_cuCoredumpGetAttributeGlobal(conn_t *conn) {
+  CUcoredumpSettings attrib;
+  size_t size;
+  void *value = nullptr;
+  int request_id;
+  CUresult lupine_intercept_result;
+  if (rpc_read(conn, &attrib, sizeof(CUcoredumpSettings)) < 0 ||
+      rpc_read(conn, &size, sizeof(size_t)) < 0 || false)
+    goto ERROR_0;
+  value = (void *)malloc(size);
+  if ((size != 0 && value == nullptr) || false)
+    goto ERROR_0;
+
+  request_id = rpc_read_end(conn);
+  if (request_id < 0)
+    goto ERROR_0;
+  lupine_intercept_result = cuCoredumpGetAttributeGlobal(
+      attrib, (size == 0 ? nullptr : value), &size);
+
+  if (rpc_write_start_response(conn, request_id) < 0 ||
+      rpc_write(conn, &size, sizeof(size_t)) < 0 ||
+      rpc_write(conn, value, size) < 0 ||
+      rpc_write(conn, &lupine_intercept_result, sizeof(CUresult)) < 0 ||
+      rpc_write_end(conn) < 0)
+    goto ERROR_0;
+
+  free((void *)value);
+  return 0;
+ERROR_0:
+  free((void *)value);
+  return -1;
+}
+
+#endif
+
+#if CUDA_VERSION >= 12010
+int handle_cuCoredumpSetAttributeGlobal(conn_t *conn) {
+  CUcoredumpSettings attrib;
+  size_t size;
+  void *value = nullptr;
+  size_t value_size;
+  int request_id;
+  CUresult lupine_intercept_result;
+  if (rpc_read(conn, &attrib, sizeof(CUcoredumpSettings)) < 0 ||
+      rpc_read(conn, &size, sizeof(size_t)) < 0 || false)
+    goto ERROR_0;
+  value_size = size;
+  value = (void *)malloc(value_size);
+  if (value_size != 0 && value == nullptr)
+    goto ERROR_0;
+  if ((value_size != 0 && rpc_read(conn, value, value_size) < 0) || false)
+    goto ERROR_0;
+
+  request_id = rpc_read_end(conn);
+  if (request_id < 0)
+    goto ERROR_0;
+  lupine_intercept_result = cuCoredumpSetAttributeGlobal(
+      attrib, (size == 0 ? nullptr : value), &size);
+
+  if (rpc_write_start_response(conn, request_id) < 0 ||
+      rpc_write(conn, &size, sizeof(size_t)) < 0 ||
+      rpc_write(conn, &lupine_intercept_result, sizeof(CUresult)) < 0 ||
+      rpc_write_end(conn) < 0)
+    goto ERROR_0;
+
+  free((void *)value);
+  return 0;
+ERROR_0:
+  free((void *)value);
+  return -1;
+}
+
+#endif
+
 #if CUDA_VERSION >= 12040
 int handle_cuGreenCtxCreate(conn_t *conn) {
   CUgreenCtx phCtx;
@@ -8222,6 +8495,60 @@ ERROR_0:
 #endif
 
 #if CUDA_VERSION >= 12040
+int handle_cuGreenCtxRecordEvent(conn_t *conn) {
+  CUgreenCtx hCtx;
+  CUevent hEvent;
+  int request_id;
+  CUresult lupine_intercept_result;
+  if (rpc_read(conn, &hCtx, sizeof(CUgreenCtx)) < 0 ||
+      rpc_read(conn, &hEvent, sizeof(CUevent)) < 0 || false)
+    goto ERROR_0;
+
+  request_id = rpc_read_end(conn);
+  if (request_id < 0)
+    goto ERROR_0;
+  lupine_intercept_result = cuGreenCtxRecordEvent(hCtx, hEvent);
+
+  if (rpc_write_start_response(conn, request_id) < 0 ||
+      rpc_write(conn, &lupine_intercept_result, sizeof(CUresult)) < 0 ||
+      rpc_write_end(conn) < 0)
+    goto ERROR_0;
+
+  return 0;
+ERROR_0:
+  return -1;
+}
+
+#endif
+
+#if CUDA_VERSION >= 12040
+int handle_cuGreenCtxWaitEvent(conn_t *conn) {
+  CUgreenCtx hCtx;
+  CUevent hEvent;
+  int request_id;
+  CUresult lupine_intercept_result;
+  if (rpc_read(conn, &hCtx, sizeof(CUgreenCtx)) < 0 ||
+      rpc_read(conn, &hEvent, sizeof(CUevent)) < 0 || false)
+    goto ERROR_0;
+
+  request_id = rpc_read_end(conn);
+  if (request_id < 0)
+    goto ERROR_0;
+  lupine_intercept_result = cuGreenCtxWaitEvent(hCtx, hEvent);
+
+  if (rpc_write_start_response(conn, request_id) < 0 ||
+      rpc_write(conn, &lupine_intercept_result, sizeof(CUresult)) < 0 ||
+      rpc_write_end(conn) < 0)
+    goto ERROR_0;
+
+  return 0;
+ERROR_0:
+  return -1;
+}
+
+#endif
+
+#if CUDA_VERSION >= 12040
 int handle_cuStreamGetGreenCtx(conn_t *conn) {
   CUstream hStream;
   CUgreenCtx phCtx;
@@ -8269,6 +8596,33 @@ int handle_cuGreenCtxStreamCreate(conn_t *conn) {
 
   if (rpc_write_start_response(conn, request_id) < 0 ||
       rpc_write(conn, &phStream, sizeof(CUstream)) < 0 ||
+      rpc_write(conn, &lupine_intercept_result, sizeof(CUresult)) < 0 ||
+      rpc_write_end(conn) < 0)
+    goto ERROR_0;
+
+  return 0;
+ERROR_0:
+  return -1;
+}
+
+#endif
+
+#if CUDA_VERSION >= 13000
+int handle_cuGreenCtxGetId(conn_t *conn) {
+  CUgreenCtx greenCtx;
+  unsigned long long greenCtxId;
+  int request_id;
+  CUresult lupine_intercept_result;
+  if (rpc_read(conn, &greenCtx, sizeof(CUgreenCtx)) < 0 || false)
+    goto ERROR_0;
+
+  request_id = rpc_read_end(conn);
+  if (request_id < 0)
+    goto ERROR_0;
+  lupine_intercept_result = cuGreenCtxGetId(greenCtx, &greenCtxId);
+
+  if (rpc_write_start_response(conn, request_id) < 0 ||
+      rpc_write(conn, &greenCtxId, sizeof(unsigned long long)) < 0 ||
       rpc_write(conn, &lupine_intercept_result, sizeof(CUresult)) < 0 ||
       rpc_write_end(conn) < 0)
     goto ERROR_0;
