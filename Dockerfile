@@ -397,13 +397,51 @@ RUN printf '%s\n' \
 # Bare image AT THE GLIBC FLOOR (rocky8-minimal = 2.28), deliberately: no
 # libnghttp2, no libssl, no libstdc++ guarantees beyond the base, no CUDA. If
 # the shims load here under RTLD_NOW, they load anywhere with glibc >= 2.28.
+# Same extraction as the upstream nvidia-utils stage, but from a plain Ubuntu
+# base: cuda-sdk is versioned by the build matrix and 11.8.0 has no
+# ubuntu24.04 image, so referencing it here broke those lanes - and pulling a
+# multi-GB devel image for one binary is waste anyway. nvidia-utils comes from
+# Ubuntu's own "restricted" component, which the official image enables.
+FROM ubuntu:${UBUNTU_VERSION} AS client-static-nvidia-utils
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG NVIDIA_UTILS_PACKAGE=nvidia-utils-535
+ARG NVIDIA_UTILS_VERSION=
+
+RUN set -eux; \
+    apt-get update; \
+    mkdir -p /tmp/nvidia-utils; \
+    cd /tmp/nvidia-utils; \
+    try_nvidia_utils() { \
+      rm -f ./*.deb; \
+      rm -rf /tmp/nvidia-utils/root; \
+      apt-get download "$1" >/dev/null 2>&1 || return 1; \
+      dpkg-deb -x ./*.deb /tmp/nvidia-utils/root || return 1; \
+      test -x /tmp/nvidia-utils/root/usr/bin/nvidia-smi; \
+    }; \
+    found=""; \
+    if [ -n "$NVIDIA_UTILS_VERSION" ]; then \
+      try_nvidia_utils "${NVIDIA_UTILS_PACKAGE}=${NVIDIA_UTILS_VERSION}" && found=1; \
+    else \
+      try_nvidia_utils "${NVIDIA_UTILS_PACKAGE}" && found=1; \
+    fi; \
+    if [ -z "$found" ]; then \
+      for pkg in $(apt-cache search --names-only '^nvidia-utils-[0-9]+$' | awk '{print $1}' | sort -t- -k3 -rn); do \
+        if try_nvidia_utils "$pkg"; then found=1; break; fi; \
+      done; \
+    fi; \
+    test -n "$found"; \
+    cp /tmp/nvidia-utils/root/usr/bin/nvidia-smi /nvidia-smi; \
+    chmod +x /nvidia-smi; \
+    rm -rf /var/lib/apt/lists/* /tmp/nvidia-utils
+
 # nvidia-smi rides along with the shims: inside a remote pod its
 # libnvidia-ml.so.1 resolves to the lupine shim, so queries go over RPC to the
 # server. Taken from the same nvidia-utils stage the upstream client image
 # uses. Checked here (the build stage has binutils): dependencies must stay
 # glibc + libnvidia-ml, and its glibc floor must not exceed the shims' floor.
 FROM client-static-build AS client-static-smi
-COPY --from=nvidia-utils /nvidia-smi /opt/nvidia-smi
+COPY --from=client-static-nvidia-utils /nvidia-smi /opt/nvidia-smi
 RUN set -eux; \
     if readelf -d /opt/nvidia-smi | grep NEEDED | \
          grep -vE 'lib(c|m|dl|rt|pthread)\.so|ld-linux|libnvidia-ml\.so\.1'; then \
