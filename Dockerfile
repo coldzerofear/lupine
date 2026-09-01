@@ -537,6 +537,11 @@ FROM rockylinux:8-minimal AS server-static
 
 ARG CUDA_VERSION
 ARG MAX_GLIBC=2.28
+# Mirrors the upstream server image (#689): 1 makes the build fail unless every
+# platform bundle is present, which the publish workflow guarantees by
+# downloading the python.yml artifact first. Dev builds leave it 0 and the
+# server answers the client endpoint with 503.
+ARG LUPINE_REQUIRE_CLIENT_BUNDLES=0
 
 LABEL org.opencontainers.image.title="lupine-server-static"
 LABEL org.opencontainers.image.description="Self-contained LUPINE server (glibc-only runtime deps)"
@@ -549,10 +554,27 @@ LABEL io.lupine.min-glibc="${MAX_GLIBC}"
 # build dependency so the probe cannot be skipped by stage pruning.
 COPY --from=server-static-runprobe /probe/runprobe-passed /opt/lupine/.runprobe-passed
 COPY --from=server-static-build /opt/lupine/build-static-server/lupine_driver_server /opt/lupine/bin/lupine_driver_server
+# Server-selected native client bundles (#689), served over HTTP/1.x on the RPC
+# port at /.well-known/lupine/client/v1/<platform>. Same layout and gate as the
+# upstream server stage so the static image is a drop-in for that endpoint.
+COPY client-bundles/ /opt/lupine/client-bundles/
+
+RUN set -eux; \
+    if [ "${LUPINE_REQUIRE_CLIENT_BUNDLES}" = 1 ]; then \
+      for platform in \
+        linux/amd64 linux/arm64 \
+        macos/amd64 macos/arm64 \
+        windows/amd64 windows/arm64; do \
+        test -s "/opt/lupine/client-bundles/${platform}/client.zip"; \
+        test -s "/opt/lupine/client-bundles/${platform}/client.zip.etag"; \
+        test -s "/opt/lupine/client-bundles/${platform}/client.zip.digest"; \
+      done; \
+    fi
 
 RUN chmod +x /opt/lupine/bin/lupine_driver_server
 
 ENV LUPINE_PORT=14833
+ENV LUPINE_CLIENT_BUNDLE_DIR=/opt/lupine/client-bundles
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
