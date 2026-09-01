@@ -9,16 +9,52 @@ FROM nvidia/cuda:${CUDA_VERSION}-${CUDA_IMAGE_FLAVOR}-ubuntu${UBUNTU_VERSION} AS
 
 FROM --platform=${ROCM_SDK_PLATFORM} ${ROCM_SDK_IMAGE} AS rocm-sdk
 
+FROM cuda-sdk AS cuda-ops
+
+WORKDIR /opt/lupine
+
+COPY ops/smemcpy.cu ops/smemcpy.h ops/smemcpy_dispatch.h /opt/lupine/ops/
+
+# Precompile CUDA operations before entering the SDK-neutral builder. Include
+# native code for every architecture accepted by this toolkit and PTX for the
+# oldest one as a forward-compatible fallback.
+RUN set -eux; \
+    set --; \
+    oldest=""; \
+    for code in $(nvcc --list-gpu-code); do \
+      arch="${code#sm_}"; \
+      if [ -z "$oldest" ] || [ "$arch" -lt "$oldest" ]; then \
+        oldest="$arch"; \
+      fi; \
+      set -- "$@" \
+        "--generate-code=arch=compute_${arch},code=sm_${arch}"; \
+    done; \
+    test -n "$oldest"; \
+    set -- "$@" \
+      "--generate-code=arch=compute_${oldest},code=compute_${oldest}"; \
+    mkdir -p /opt/lupine-precompiled-ops/cuda; \
+    nvcc -std=c++17 --fatbin "$@" \
+      -I/opt/lupine /opt/lupine/ops/smemcpy.cu \
+      -o /tmp/lupine_smemcpy.fatbin; \
+    bin2c --const --name lupine_smemcpy_fatbin \
+      /tmp/lupine_smemcpy.fatbin \
+      > /opt/lupine-precompiled-ops/cuda/smemcpy.cpp; \
+    printf '\nextern "C" const void *lupine_cuda_smemcpy_image() {\n  return lupine_smemcpy_fatbin;\n}\n' \
+      >> /opt/lupine-precompiled-ops/cuda/smemcpy.cpp; \
+    rm /tmp/lupine_smemcpy.fatbin
+
 FROM ubuntu:${UBUNTU_VERSION} AS builder
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG CMAKE_BUILD_TYPE=Release
 ARG CUDA_VERSION
 
-# The generated shims and server only need API headers and the link-time CUDA
-# driver stub; neither compiler SDK is installed in this Ubuntu build stage.
+# Device operations are precompiled in their own SDK stages. The main builder
+# needs only API headers, link-time stubs, and the combined operation directory,
+# so CUDA and ROCm compiler SDKs never have to coexist here.
 COPY --from=cuda-sdk /usr/local/cuda/include/ /usr/local/cuda/include/
 COPY --from=cuda-sdk /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so
+COPY --from=cuda-ops /opt/lupine-precompiled-ops/ /opt/lupine-precompiled-ops/
 COPY --from=rocm-sdk /opt/rocm/include/ /opt/rocm/include/
 
 ENV CUDA_HOME=/usr/local/cuda
@@ -41,7 +77,8 @@ RUN cmake -S /opt/lupine -B /opt/lupine/build \
       -G Ninja \
       -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" \
       -DLUPINE_CUDA_DRIVER_LIBRARY="${CUDA_HOME}/lib64/stubs/libcuda.so" \
-      -DLUPINE_CUDA_VERSION_OVERRIDE="${CUDA_VERSION}"
+      -DLUPINE_CUDA_VERSION_OVERRIDE="${CUDA_VERSION}" \
+      -DLUPINE_PRECOMPILED_OPS=/opt/lupine-precompiled-ops
 
 FROM builder AS client-build
 
@@ -157,6 +194,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 ARG AMDGPU_INSTALL_VERSION=7.2.4.70204-1
 ARG CUDA_KEYRING_VERSION=1.1-1
 ARG CUDA_VERSION
+ARG LUPINE_REQUIRE_CLIENT_BUNDLES=0
 ARG ROCM_VERSION
 ARG UBUNTU_VERSION
 
@@ -208,11 +246,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* /tmp/*.deb
 
 COPY --from=server-build /opt/lupine/build/lupine_driver_server /opt/lupine/bin/lupine_driver_server
+COPY client-bundles/ /opt/lupine/client-bundles/
+
+RUN set -eux; \
+    if [ "${LUPINE_REQUIRE_CLIENT_BUNDLES}" = 1 ]; then \
+      for platform in \
+        linux/amd64 linux/arm64 \
+        macos/amd64 macos/arm64 \
+        windows/amd64 windows/arm64; do \
+        test -s "/opt/lupine/client-bundles/${platform}/client.zip"; \
+        test -s "/opt/lupine/client-bundles/${platform}/client.zip.etag"; \
+        test -s "/opt/lupine/client-bundles/${platform}/client.zip.digest"; \
+      done; \
+    fi
 
 RUN chmod +x /opt/lupine/bin/lupine_driver_server
 
 ENV LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/compat:/opt/rocm/lib
 ENV LUPINE_PORT=14833
+ENV LUPINE_CLIENT_BUNDLE_DIR=/opt/lupine/client-bundles
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
