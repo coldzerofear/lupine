@@ -397,6 +397,23 @@ RUN printf '%s\n' \
 # Bare image AT THE GLIBC FLOOR (rocky8-minimal = 2.28), deliberately: no
 # libnghttp2, no libssl, no libstdc++ guarantees beyond the base, no CUDA. If
 # the shims load here under RTLD_NOW, they load anywhere with glibc >= 2.28.
+# nvidia-smi rides along with the shims: inside a remote pod its
+# libnvidia-ml.so.1 resolves to the lupine shim, so queries go over RPC to the
+# server. Taken from the same nvidia-utils stage the upstream client image
+# uses. Checked here (the build stage has binutils): dependencies must stay
+# glibc + libnvidia-ml, and its glibc floor must not exceed the shims' floor.
+FROM client-static-build AS client-static-smi
+COPY --from=nvidia-utils /nvidia-smi /opt/nvidia-smi
+RUN set -eux; \
+    if readelf -d /opt/nvidia-smi | grep NEEDED | \
+         grep -vE 'lib(c|m|dl|rt|pthread)\.so|ld-linux|libnvidia-ml\.so\.1'; then \
+      echo "nvidia-smi has an unexpected dependency"; exit 1; \
+    fi; \
+    ceiling="$(readelf -V /opt/nvidia-smi | grep -oE 'GLIBC_[0-9.]+' | sed 's/GLIBC_//' | sort -V | tail -1)"; \
+    if ! printf '%s\n%s\n' "$ceiling" "$MAX_GLIBC" | sort -C -V; then \
+      echo "nvidia-smi needs glibc $ceiling > $MAX_GLIBC"; exit 1; \
+    fi
+
 FROM rockylinux:8-minimal AS client-static-loadtest
 
 COPY --from=client-static-build /opt/lupine/build-static/libcuda.so.1 /probe/libcuda.so.1
@@ -425,6 +442,7 @@ LABEL io.lupine.min-glibc="${MAX_GLIBC}"
 COPY --from=client-static-loadtest /probe/loadtest-passed /artifacts/.loadtest-passed
 COPY --from=client-static-build /opt/lupine/build-static/libcuda.so.1 /artifacts/libcuda.so.1
 COPY --from=client-static-build /opt/lupine/build-static/libnvidia-ml.so.1 /artifacts/libnvidia-ml.so.1
+COPY --from=client-static-smi /opt/nvidia-smi /artifacts/nvidia-smi
 
 RUN printf 'cuda_version=%s\nmin_glibc=%s\n' \
       "${CUDA_VERSION}" "${MAX_GLIBC}" > /artifacts/metadata \
