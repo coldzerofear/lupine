@@ -502,9 +502,17 @@ ARG MAX_GLIBC=2.28
 # Set to a gcc-toolset package name (e.g. gcc-toolset-13) when this CUDA
 # version's nvcc rejects the system gcc 8.5. Empty = system gcc.
 ARG GCC_TOOLSET=
+# Directory (in the build context) with the per-platform native clients to
+# embed in the server, laid out as <input>/lupine-client-<tag>/... exactly like
+# the upstream server image. Empty => no bundles embedded (endpoint 503).
+ARG LUPINE_CLIENT_BUNDLE_INPUT=
 
 ENV CUDA_HOME=/usr/local/cuda
 ENV PATH="${CUDA_HOME}/bin:${PATH}"
+
+# uv drives cmake/bundle_codegen.py, which turns each native client into the
+# embedded-bundle source compiled into the server (upstream #691).
+COPY --from=uv /usr/local/bin/uv /usr/local/bin/uv
 
 RUN dnf install -y --enablerepo=powertools \
         gcc gcc-c++ libstdc++-static make cmake binutils file tar gzip \
@@ -541,6 +549,7 @@ RUN set -eux; \
       -DLUPINE_STATIC_DEPS=ON \
       -DNGHTTP2_INCLUDE_DIR=/opt/static-deps/include \
       -DNGHTTP2_LIBRARY=/opt/static-deps/lib/libnghttp2.a \
+      -DLUPINE_CLIENT_BUNDLE_INPUT="${LUPINE_CLIENT_BUNDLE_INPUT}" \
       -DCMAKE_LIBRARY_PATH="${CUDA_HOME}/lib64/stubs"; \
     echo "==== build ===="; \
     cmake --build /opt/lupine/build-static-server --parallel "$(nproc)" \
@@ -551,11 +560,12 @@ RUN chmod +x /opt/lupine/deploy/check_static_server.sh \
          /opt/lupine/build-static-server/lupine_driver_server \
          "${MAX_GLIBC}"
 
-# Run-probe AT THE GLIBC FLOOR, on the same bare base the final image uses: no
-# libnghttp2, no libstdc++, no CUDA. main() validates LUPINE_PORT and exits
-# before it touches the driver, so an invalid port is a complete load-and-run
-# test -- a missing dependency exits 127 from the loader, a working binary exits
-# 1 from the validation. The driver stub stands in for the injected libcuda.
+# Run-probe AT THE GLIBC FLOOR on a bare rockylinux8-minimal (glibc 2.28), which
+# is stricter than the final image's nvidia/cuda base: no libnghttp2, no
+# libstdc++, no CUDA env. main() validates LUPINE_PORT and exits before touching
+# the driver, so an invalid port is a complete load-and-run test -- a missing
+# dependency exits 127 from the loader, a working binary exits 1 from the
+# validation. The driver stub stands in for the injected libcuda.
 FROM rockylinux:8-minimal AS server-static-runprobe
 
 COPY --from=server-static-build /opt/lupine/build-static-server/lupine_driver_server /probe/lupine_driver_server
@@ -569,18 +579,22 @@ RUN LD_LIBRARY_PATH=/probe/stubs LUPINE_PORT=not-a-port /probe/lupine_driver_ser
     fi; \
     touch /probe/runprobe-passed
 
-FROM rockylinux:8-minimal AS server-static
+# Runtime base = NVIDIA's CUDA rockylinux8 (same glibc 2.28 floor as
+# rockylinux8-minimal, so the binary's ceiling still holds), NOT the minimal
+# base. The minimal image lacks the CUDA driver environment the server needs at
+# runtime -- the container runtime injects libcuda.so.1 into
+# /usr/local/nvidia/lib64 and this base's LD_LIBRARY_PATH + cuda-compat make it
+# resolvable, which the minimal base did not (server failed to find the driver).
+# Bigger image, but required to run. Client bundles are embedded in the binary
+# (LUPINE_CLIENT_BUNDLE_INPUT at build time, upstream #691); served over
+# HTTP/1.x on the RPC port at /.well-known/lupine/client/v1/<platform>.
+FROM nvidia/cuda:${CUDA_VERSION}-base-rockylinux8 AS server-static
 
 ARG CUDA_VERSION
 ARG MAX_GLIBC=2.28
-# NOTE: client bundles are no longer served from a directory. Upstream #691
-# embeds them into the server binary at build time via LUPINE_CLIENT_BUNDLE_INPUT
-# (the runtime LUPINE_CLIENT_BUNDLE_DIR path was removed). Until the static
-# server build is rewired to that embed model, this image serves no client
-# bundles and answers the client endpoint with 503.
 
 LABEL org.opencontainers.image.title="lupine-server-static"
-LABEL org.opencontainers.image.description="Self-contained LUPINE server (glibc-only runtime deps)"
+LABEL org.opencontainers.image.description="LUPINE server (glibc-only binary) on the CUDA rockylinux8 driver base"
 LABEL org.opencontainers.image.source="https://github.com/lupinemachines/lupine"
 LABEL org.opencontainers.image.version="${CUDA_VERSION}-static"
 LABEL io.lupine.cuda-version="${CUDA_VERSION}"
@@ -593,6 +607,9 @@ COPY --from=server-static-build /opt/lupine/build-static-server/lupine_driver_se
 
 RUN chmod +x /opt/lupine/bin/lupine_driver_server
 
+# Find the runtime-injected driver (and cuda-compat) ahead of anything else, the
+# same order the upstream server image uses.
+ENV LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/compat
 ENV LUPINE_PORT=14833
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
