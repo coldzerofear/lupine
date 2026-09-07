@@ -11,11 +11,12 @@
 #define LUPINE_RPC_TRANSFER_CHUNK_BYTES (4 * 1024 * 1024)
 
 // Server-originated operations run on the client's dispatch thread. CUDA host
-// functions use these requests for side effects that occur when stream work
-// executes rather than when an API call is captured.
+// functions, stream callbacks, and driver log callbacks use these requests for
+// side effects that occur outside the original API call.
 static constexpr int LUPINE_SIDE_EFFECT_HOST_FUNCTION = 1;
 static constexpr int LUPINE_SIDE_EFFECT_STREAM_CALLBACK = 2;
 static constexpr int LUPINE_SIDE_EFFECT_READ_HOST_MEMORY = 3;
+static constexpr int LUPINE_SIDE_EFFECT_LOG_CALLBACK = 4;
 
 static constexpr uint8_t LUPINE_COPY_DIRECTION_HTOH = 0;
 static constexpr uint8_t LUPINE_COPY_DIRECTION_HTOD = 1;
@@ -115,7 +116,11 @@ struct conn_t {
   int32_t write_stream_id;
 
   pthread_t read_thread;
-  pthread_mutex_t write_mutex, call_mutex;
+  pthread_mutex_t write_mutex, call_mutex, async_mutex;
+  pthread_cond_t async_cond;
+  uint64_t issued_async_sequence;
+  uint64_t serving_async_sequence;
+  int async_sync_initialized;
   std::vector<rpc_write_cursor> write_queue;
   std::vector<rpc_host_allocation_write> host_allocation_writes;
   int host_allocation_writes_pending;
@@ -147,6 +152,8 @@ extern int lupine_va_reserve_client(conn_t *conn,
                                     const lupine_va_window &window,
                                     unsigned int min_slot, unsigned int *slot);
 extern int lupine_va_reserve_server(conn_t *conn, uintptr_t base, size_t size);
+// Releases a rejected candidate without disturbing the connection transport.
+extern void lupine_va_release(conn_t *conn);
 // Bump-claims an aligned span inside the connection's arena. Concurrent callers
 // each get a disjoint span; false means the arena cannot fit the request.
 extern bool lupine_va_claim(conn_t *conn, size_t size, size_t alignment,
@@ -158,6 +165,8 @@ extern bool lupine_va_claim(conn_t *conn, size_t size, size_t alignment,
 struct rpc_lifecycle_hooks {
   void (*connection_closed)(conn_t *conn);
   void (*thread_lane_destroyed)(uint64_t lane_id);
+  // Runs on the RPC caller after a complete response has been consumed.
+  void (*response_completed)(conn_t *conn, int32_t stream_id);
 };
 extern int rpc_set_lifecycle_hooks(const rpc_lifecycle_hooks *hooks);
 
@@ -183,6 +192,11 @@ extern int rpc_wait_for_response(conn_t *conn);
 // remote server) or a closed conn fails here, so callers surface their
 // unavailable-server result without per-call-site null checks.
 extern int rpc_write_start_request(conn_t *conn, const int op);
+// Starts a request and allocates its async-submission ticket while the normal
+// request lock is held. The caller writes the ticket into the request payload;
+// this adds no server acknowledgement or round trip.
+extern int rpc_write_start_async_request(conn_t *conn, const int op,
+                                         uint64_t *sequence);
 extern int rpc_write_start_response(conn_t *conn, const int read_id);
 // A zero-size write is a successful no-op, including when data is null.
 extern int rpc_write(conn_t *conn, const void *data, const size_t size);
@@ -207,6 +221,10 @@ extern void *rpc_write_buffer(conn_t *conn, size_t size, size_t alignment);
 extern int rpc_write_cursors(conn_t *conn, const rpc_write_cursor *cursors,
                              size_t count);
 extern int rpc_write_end(conn_t *conn);
+// Server handlers wait only after receiving the complete async request, then
+// hold the turn through the native API submission.
+extern int rpc_async_sequence_begin(conn_t *conn, uint64_t sequence);
+extern void rpc_async_sequence_end(conn_t *conn);
 extern int rpc_write_lane_termination(conn_t *conn, uint64_t lane_id);
 // Signals transport readers to stop without releasing connection resources.
 // Owners use this before joining workers that may be blocked on the transport.
@@ -245,6 +263,9 @@ extern int32_t rpc_http2_lane_stream(conn_t *conn, uint64_t lane_id);
 extern int rpc_http2_end_stream(conn_t *conn, int32_t stream_id);
 extern int32_t rpc_http2_accept_stream(conn_t *conn);
 extern int rpc_http2_client_init(conn_t *conn);
+// Sends another arena preflight on the existing HTTP/2 connection and waits
+// for its result.
+extern int rpc_http2_client_retry_handshake(conn_t *conn);
 // Waits for the peer's response headers on the session's own connection and
 // settles the client-bundle check and, when one was requested, the arena
 // verdict. rpc_http2_client_init already does this when an arena was requested;
@@ -254,15 +275,20 @@ extern int rpc_http2_client_init(conn_t *conn);
 extern int rpc_http2_client_await_ready(conn_t *conn);
 extern void rpc_http2_client_start_heartbeat(conn_t *conn);
 extern void rpc_http2_destroy(conn_t *conn);
+struct lupine_client_bundle_registry;
 struct rpc_http2_server_metadata {
-  const char *backend_version;
-  const char *client_bundle_dir;
+  const char *backend_version = nullptr;
+  const lupine_client_bundle_registry *client_bundles = nullptr;
+  uint64_t capabilities = 0;
 };
+constexpr uint64_t LUPINE_SERVER_CAPABILITY_CLIENT_METADATA = UINT64_C(1);
 // Sends HEAD / and returns the backend-version response header, or nullptr
 // when the request fails or the server does not advertise a version.
 // The returned pointer remains valid until rpc_http2_destroy() or
 // rpc_conn_destroy(); the probe connection must not be reused for RPC.
 extern const char *rpc_http2_client_probe(conn_t *conn);
+// Returns true when the server advertised every requested capability bit.
+extern bool rpc_http2_peer_supports(conn_t *conn, uint64_t capabilities);
 // The arena window the peer stated it can host. False when it stated none.
 extern bool rpc_http2_peer_va_window(conn_t *conn, lupine_va_window *window);
 // Returns -1 on failure, 0 for an RPC connection, and a positive value when
@@ -271,6 +297,10 @@ extern int rpc_http2_server_init(conn_t *conn);
 extern int
 rpc_http2_server_init_with_metadata(conn_t *conn,
                                     const rpc_http2_server_metadata *metadata);
+// Finishes an HTTP-handled connection with GOAWAY and waits for a PING
+// acknowledgement, ensuring the response reached the peer before the server's
+// abortive transport cleanup can reset the socket.
+extern int rpc_http2_server_graceful_shutdown(conn_t *conn);
 // Returns the x-lupine-session request header after the server has consumed
 // the HTTP/2 request headers, or nullptr when no session was supplied.
 extern const char *rpc_http2_session_id(conn_t *conn);

@@ -855,8 +855,11 @@ CUresult cuLibraryUnload(CUlibrary library) {
     return return_value;
   }
   conn_t *conn = lupine_route_remote_conn(route);
+  uint64_t async_sequence = 0;
   if (lupine_prepare_rpc(conn) < 0 ||
-      rpc_write_start_request(conn, RPC_cuLibraryUnload) < 0 ||
+      rpc_write_start_async_request(conn, RPC_cuLibraryUnload,
+                                    &async_sequence) < 0 ||
+      rpc_write(conn, &async_sequence, sizeof(async_sequence)) < 0 ||
       rpc_write(conn, &library, sizeof(CUlibrary)) < 0 ||
       rpc_write_end(conn) < 0) {
     return CUDA_ERROR_DEVICE_UNAVAILABLE;
@@ -1016,8 +1019,11 @@ CUresult cuKernelSetAttribute(CUfunction_attribute attrib, int val,
     return return_value;
   }
   conn_t *conn = lupine_route_remote_conn(route);
+  uint64_t async_sequence = 0;
   if (lupine_prepare_rpc(conn) < 0 ||
-      rpc_write_start_request(conn, RPC_cuKernelSetAttribute) < 0 ||
+      rpc_write_start_async_request(conn, RPC_cuKernelSetAttribute,
+                                    &async_sequence) < 0 ||
+      rpc_write(conn, &async_sequence, sizeof(async_sequence)) < 0 ||
       rpc_write(conn, &attrib, sizeof(CUfunction_attribute)) < 0 ||
       rpc_write(conn, &val, sizeof(int)) < 0 ||
       rpc_write(conn, &kernel, sizeof(CUkernel)) < 0 ||
@@ -1510,8 +1516,11 @@ CUresult cuMemcpyDtoDAsync_v2(CUdeviceptr dstDevice, CUdeviceptr srcDevice,
     return lupine_call_real_cuda_fn("cuMemcpyDtoDAsync_v2", dstDevice,
                                     srcDevice, ByteCount, hStream);
   conn_t *conn = lupine_route_remote_conn(route);
+  uint64_t async_sequence = 0;
   if (lupine_prepare_rpc(conn) < 0 ||
-      rpc_write_start_request(conn, RPC_cuMemcpyDtoDAsync_v2) < 0 ||
+      rpc_write_start_async_request(conn, RPC_cuMemcpyDtoDAsync_v2,
+                                    &async_sequence) < 0 ||
+      rpc_write(conn, &async_sequence, sizeof(async_sequence)) < 0 ||
       rpc_write(conn, &dstDevice, sizeof(CUdeviceptr)) < 0 ||
       rpc_write(conn, &srcDevice, sizeof(CUdeviceptr)) < 0 ||
       rpc_write(conn, &ByteCount, sizeof(size_t)) < 0 ||
@@ -1686,8 +1695,11 @@ CUresult cuMemsetD8Async(CUdeviceptr dstDevice, unsigned char uc, size_t N,
     return lupine_call_real_cuda_fn("cuMemsetD8Async", dstDevice, uc, N,
                                     hStream);
   conn_t *conn = lupine_route_remote_conn(route);
+  uint64_t async_sequence = 0;
   if (lupine_prepare_rpc(conn) < 0 ||
-      rpc_write_start_request(conn, RPC_cuMemsetD8Async) < 0 ||
+      rpc_write_start_async_request(conn, RPC_cuMemsetD8Async,
+                                    &async_sequence) < 0 ||
+      rpc_write(conn, &async_sequence, sizeof(async_sequence)) < 0 ||
       rpc_write(conn, &dstDevice, sizeof(CUdeviceptr)) < 0 ||
       rpc_write(conn, &uc, sizeof(unsigned char)) < 0 ||
       rpc_write(conn, &N, sizeof(size_t)) < 0 ||
@@ -1706,8 +1718,11 @@ CUresult cuMemsetD16Async(CUdeviceptr dstDevice, unsigned short us, size_t N,
     return lupine_call_real_cuda_fn("cuMemsetD16Async", dstDevice, us, N,
                                     hStream);
   conn_t *conn = lupine_route_remote_conn(route);
+  uint64_t async_sequence = 0;
   if (lupine_prepare_rpc(conn) < 0 ||
-      rpc_write_start_request(conn, RPC_cuMemsetD16Async) < 0 ||
+      rpc_write_start_async_request(conn, RPC_cuMemsetD16Async,
+                                    &async_sequence) < 0 ||
+      rpc_write(conn, &async_sequence, sizeof(async_sequence)) < 0 ||
       rpc_write(conn, &dstDevice, sizeof(CUdeviceptr)) < 0 ||
       rpc_write(conn, &us, sizeof(unsigned short)) < 0 ||
       rpc_write(conn, &N, sizeof(size_t)) < 0 ||
@@ -1726,8 +1741,11 @@ CUresult cuMemsetD32Async(CUdeviceptr dstDevice, unsigned int ui, size_t N,
     return lupine_call_real_cuda_fn("cuMemsetD32Async", dstDevice, ui, N,
                                     hStream);
   conn_t *conn = lupine_route_remote_conn(route);
+  uint64_t async_sequence = 0;
   if (lupine_prepare_rpc(conn) < 0 ||
-      rpc_write_start_request(conn, RPC_cuMemsetD32Async) < 0 ||
+      rpc_write_start_async_request(conn, RPC_cuMemsetD32Async,
+                                    &async_sequence) < 0 ||
+      rpc_write(conn, &async_sequence, sizeof(async_sequence)) < 0 ||
       rpc_write(conn, &dstDevice, sizeof(CUdeviceptr)) < 0 ||
       rpc_write(conn, &ui, sizeof(unsigned int)) < 0 ||
       rpc_write(conn, &N, sizeof(size_t)) < 0 ||
@@ -1747,8 +1765,11 @@ CUresult cuMemsetD2D8Async(CUdeviceptr dstDevice, size_t dstPitch,
     return lupine_call_real_cuda_fn("cuMemsetD2D8Async", dstDevice, dstPitch,
                                     uc, Width, Height, hStream);
   conn_t *conn = lupine_route_remote_conn(route);
+  uint64_t async_sequence = 0;
   if (lupine_prepare_rpc(conn) < 0 ||
-      rpc_write_start_request(conn, RPC_cuMemsetD2D8Async) < 0 ||
+      rpc_write_start_async_request(conn, RPC_cuMemsetD2D8Async,
+                                    &async_sequence) < 0 ||
+      rpc_write(conn, &async_sequence, sizeof(async_sequence)) < 0 ||
       rpc_write(conn, &dstDevice, sizeof(CUdeviceptr)) < 0 ||
       rpc_write(conn, &dstPitch, sizeof(size_t)) < 0 ||
       rpc_write(conn, &uc, sizeof(unsigned char)) < 0 ||
@@ -1770,8 +1791,11 @@ CUresult cuMemsetD2D16Async(CUdeviceptr dstDevice, size_t dstPitch,
     return lupine_call_real_cuda_fn("cuMemsetD2D16Async", dstDevice, dstPitch,
                                     us, Width, Height, hStream);
   conn_t *conn = lupine_route_remote_conn(route);
+  uint64_t async_sequence = 0;
   if (lupine_prepare_rpc(conn) < 0 ||
-      rpc_write_start_request(conn, RPC_cuMemsetD2D16Async) < 0 ||
+      rpc_write_start_async_request(conn, RPC_cuMemsetD2D16Async,
+                                    &async_sequence) < 0 ||
+      rpc_write(conn, &async_sequence, sizeof(async_sequence)) < 0 ||
       rpc_write(conn, &dstDevice, sizeof(CUdeviceptr)) < 0 ||
       rpc_write(conn, &dstPitch, sizeof(size_t)) < 0 ||
       rpc_write(conn, &us, sizeof(unsigned short)) < 0 ||
@@ -1793,8 +1817,11 @@ CUresult cuMemsetD2D32Async(CUdeviceptr dstDevice, size_t dstPitch,
     return lupine_call_real_cuda_fn("cuMemsetD2D32Async", dstDevice, dstPitch,
                                     ui, Width, Height, hStream);
   conn_t *conn = lupine_route_remote_conn(route);
+  uint64_t async_sequence = 0;
   if (lupine_prepare_rpc(conn) < 0 ||
-      rpc_write_start_request(conn, RPC_cuMemsetD2D32Async) < 0 ||
+      rpc_write_start_async_request(conn, RPC_cuMemsetD2D32Async,
+                                    &async_sequence) < 0 ||
+      rpc_write(conn, &async_sequence, sizeof(async_sequence)) < 0 ||
       rpc_write(conn, &dstDevice, sizeof(CUdeviceptr)) < 0 ||
       rpc_write(conn, &dstPitch, sizeof(size_t)) < 0 ||
       rpc_write(conn, &ui, sizeof(unsigned int)) < 0 ||
@@ -6792,6 +6819,111 @@ CUresult cuStreamGetDevResource(CUstream hStream, CUdevResource *resource,
 
 #endif
 
+#if CUDA_VERSION >= 12090
+CUresult cuLogsCurrent(CUlogIterator *iterator_out, unsigned int flags) {
+  lupine_route route = lupine_route_for_default();
+  CUresult return_value;
+  if (lupine_route_is_local(route))
+    return lupine_call_real_cuda_fn("cuLogsCurrent", iterator_out, flags);
+  conn_t *conn = lupine_route_remote_conn(route);
+  CUlogIterator *iterator_out_null_check;
+  if (lupine_prepare_rpc(conn) < 0 ||
+      rpc_write_start_request(conn, RPC_cuLogsCurrent) < 0 ||
+      rpc_write(conn, &iterator_out, sizeof(CUlogIterator *)) < 0 ||
+      rpc_write(conn, &flags, sizeof(unsigned int)) < 0 ||
+      rpc_wait_for_response(conn) < 0 ||
+      rpc_read(conn, &iterator_out_null_check, sizeof(CUlogIterator *)) < 0 ||
+      (iterator_out_null_check &&
+       rpc_read(conn, iterator_out, sizeof(CUlogIterator)) < 0) ||
+      rpc_read(conn, &return_value, sizeof(CUresult)) < 0 ||
+      rpc_read_end(conn) < 0)
+    return CUDA_ERROR_DEVICE_UNAVAILABLE;
+  return return_value;
+}
+
+#endif
+
+#if CUDA_VERSION >= 12090
+CUresult cuLogsDumpToFile(CUlogIterator *iterator, const char *pathToFile,
+                          unsigned int flags) {
+  lupine_route route = lupine_route_for_default();
+  if (pathToFile == nullptr)
+    return CUDA_ERROR_INVALID_VALUE;
+  CUresult return_value;
+  if (lupine_route_is_local(route))
+    return lupine_call_real_cuda_fn("cuLogsDumpToFile", iterator, pathToFile,
+                                    flags);
+  conn_t *conn = lupine_route_remote_conn(route);
+  CUlogIterator *iterator_null_check;
+  std::size_t pathToFile_len = std::strlen(pathToFile) + 1;
+  if (lupine_prepare_rpc(conn) < 0 ||
+      rpc_write_start_request(conn, RPC_cuLogsDumpToFile) < 0 ||
+      rpc_write(conn, &iterator, sizeof(CUlogIterator *)) < 0 ||
+      (iterator != nullptr &&
+       rpc_write(conn, iterator, sizeof(CUlogIterator)) < 0) ||
+      rpc_write(conn, &pathToFile_len, sizeof(std::size_t)) < 0 ||
+      rpc_write(conn, pathToFile, pathToFile_len) < 0 ||
+      rpc_write(conn, &flags, sizeof(unsigned int)) < 0 ||
+      rpc_wait_for_response(conn) < 0 ||
+      rpc_read(conn, &iterator_null_check, sizeof(CUlogIterator *)) < 0 ||
+      (iterator_null_check &&
+       rpc_read(conn, iterator, sizeof(CUlogIterator)) < 0) ||
+      rpc_read(conn, &return_value, sizeof(CUresult)) < 0 ||
+      rpc_read_end(conn) < 0)
+    return CUDA_ERROR_DEVICE_UNAVAILABLE;
+  return return_value;
+}
+
+#endif
+
+#if CUDA_VERSION >= 12090
+CUresult cuLogsDumpToMemory(CUlogIterator *iterator, char *buffer, size_t *size,
+                            unsigned int flags) {
+  lupine_route route = lupine_route_for_default();
+  if (size == nullptr)
+    return CUDA_ERROR_INVALID_VALUE;
+  size_t buffer_capacity = *size;
+  CUresult return_value;
+  if (lupine_route_is_local(route)) {
+    return_value = lupine_call_real_cuda_fn("cuLogsDumpToMemory", iterator,
+                                            buffer, size, flags);
+    if (return_value == CUDA_SUCCESS && buffer != nullptr &&
+        buffer_capacity > *size)
+      buffer[*size] = '\0';
+    return return_value;
+  }
+  conn_t *conn = lupine_route_remote_conn(route);
+  size_t size_requested = (buffer != nullptr) ? *size : 0;
+  uint8_t buffer_null = buffer == nullptr ? 1 : 0;
+  CUlogIterator *iterator_null_check;
+  if (lupine_prepare_rpc(conn) < 0 ||
+      rpc_write_start_request(conn, RPC_cuLogsDumpToMemory) < 0 ||
+      rpc_write(conn, &iterator, sizeof(CUlogIterator *)) < 0 ||
+      (iterator != nullptr &&
+       rpc_write(conn, iterator, sizeof(CUlogIterator)) < 0) ||
+      rpc_write(conn, &size_requested, sizeof(size_t)) < 0 ||
+      rpc_write(conn, &buffer_null, sizeof(uint8_t)) < 0 ||
+      rpc_write(conn, &flags, sizeof(unsigned int)) < 0 ||
+      rpc_wait_for_response(conn) < 0 ||
+      rpc_read(conn, &iterator_null_check, sizeof(CUlogIterator *)) < 0 ||
+      (iterator_null_check &&
+       rpc_read(conn, iterator, sizeof(CUlogIterator)) < 0) ||
+      rpc_read(conn, size, sizeof(size_t)) < 0 ||
+      (buffer != nullptr && size_requested != 0 && *size != 0 &&
+       rpc_read(conn, buffer,
+                (*size < size_requested ? *size : size_requested) *
+                    sizeof(char)) < 0) ||
+      rpc_read(conn, &return_value, sizeof(CUresult)) < 0 ||
+      rpc_read_end(conn) < 0)
+    return CUDA_ERROR_DEVICE_UNAVAILABLE;
+  if (return_value == CUDA_SUCCESS && buffer != nullptr &&
+      buffer_capacity > *size)
+    buffer[*size] = '\0';
+  return return_value;
+}
+
+#endif
+
 CUresult cuGraphInstantiate_v2(CUgraphExec *phGraphExec, CUgraph hGraph,
                                CUgraphNode *phErrorNode, char *logBuffer,
                                size_t bufferSize) {
@@ -7216,6 +7348,8 @@ extern "C" CUresult cuMemAllocFromPoolAsync_ptsz(CUdeviceptr *dptr,
 }
 
 std::unordered_map<std::string, void *> functionMap = {
+    {"cuGetErrorString", (void *)cuGetErrorString},
+    {"cuGetErrorName", (void *)cuGetErrorName},
     {"cuInit", (void *)cuInit},
     {"cuDriverGetVersion", (void *)cuDriverGetVersion},
     {"cuDeviceGet", (void *)cuDeviceGet},
@@ -7234,8 +7368,11 @@ std::unordered_map<std::string, void *> functionMap = {
     {"cuFlushGPUDirectRDMAWrites", (void *)cuFlushGPUDirectRDMAWrites},
     {"cuDeviceGetProperties", (void *)cuDeviceGetProperties},
     {"cuDeviceComputeCapability", (void *)cuDeviceComputeCapability},
+    {"cuDevicePrimaryCtxRetain", (void *)cuDevicePrimaryCtxRetain},
+    {"cuDevicePrimaryCtxRelease_v2", (void *)cuDevicePrimaryCtxRelease_v2},
     {"cuDevicePrimaryCtxSetFlags_v2", (void *)cuDevicePrimaryCtxSetFlags_v2},
     {"cuDevicePrimaryCtxGetState", (void *)cuDevicePrimaryCtxGetState},
+    {"cuDevicePrimaryCtxReset_v2", (void *)cuDevicePrimaryCtxReset_v2},
     {"cuCtxDestroy_v2", (void *)cuCtxDestroy_v2},
     {"cuCtxPushCurrent_v2", (void *)cuCtxPushCurrent_v2},
     {"cuCtxPopCurrent_v2", (void *)cuCtxPopCurrent_v2},
@@ -7269,6 +7406,9 @@ std::unordered_map<std::string, void *> functionMap = {
     {"cuCtxDetach", (void *)cuCtxDetach},
     {"cuCtxGetSharedMemConfig", (void *)cuCtxGetSharedMemConfig},
     {"cuCtxSetSharedMemConfig", (void *)cuCtxSetSharedMemConfig},
+    {"cuModuleLoad", (void *)cuModuleLoad},
+    {"cuModuleLoadData", (void *)cuModuleLoadData},
+    {"cuModuleLoadDataEx", (void *)cuModuleLoadDataEx},
     {"cuModuleUnload", (void *)cuModuleUnload},
     {"cuModuleGetLoadingMode", (void *)cuModuleGetLoadingMode},
     {"cuModuleGetFunction", (void *)cuModuleGetFunction},
@@ -7280,6 +7420,7 @@ std::unordered_map<std::string, void *> functionMap = {
     {"cuLinkDestroy", (void *)cuLinkDestroy},
     {"cuModuleGetTexRef", (void *)cuModuleGetTexRef},
     {"cuModuleGetSurfRef", (void *)cuModuleGetSurfRef},
+    {"cuLibraryLoadData", (void *)cuLibraryLoadData},
     {"cuLibraryLoadFromFile", (void *)cuLibraryLoadFromFile},
     {"cuLibraryUnload", (void *)cuLibraryUnload},
     {"cuLibraryGetKernel", (void *)cuLibraryGetKernel},
@@ -7299,9 +7440,14 @@ std::unordered_map<std::string, void *> functionMap = {
     {"cuMemGetInfo_v2", (void *)cuMemGetInfo_v2},
     {"cuMemAlloc_v2", (void *)cuMemAlloc_v2},
     {"cuMemAllocPitch_v2", (void *)cuMemAllocPitch_v2},
+    {"cuMemFree_v2", (void *)cuMemFree_v2},
     {"cuMemGetAddressRange_v2", (void *)cuMemGetAddressRange_v2},
     {"cuMemAllocHost_v2", (void *)cuMemAllocHost_v2},
+    {"cuMemFreeHost", (void *)cuMemFreeHost},
+    {"cuMemHostAlloc", (void *)cuMemHostAlloc},
     {"cuMemHostGetDevicePointer_v2", (void *)cuMemHostGetDevicePointer_v2},
+    {"cuMemHostGetFlags", (void *)cuMemHostGetFlags},
+    {"cuMemAllocManaged", (void *)cuMemAllocManaged},
     {"cuDeviceGetByPCIBusId", (void *)cuDeviceGetByPCIBusId},
     {"cuDeviceGetPCIBusId", (void *)cuDeviceGetPCIBusId},
     {"cuIpcGetEventHandle", (void *)cuIpcGetEventHandle},
@@ -7311,12 +7457,24 @@ std::unordered_map<std::string, void *> functionMap = {
     {"cuIpcCloseMemHandle", (void *)cuIpcCloseMemHandle},
     {"cuMemcpy", (void *)cuMemcpy},
     {"cuMemcpyPeer", (void *)cuMemcpyPeer},
+    {"cuMemcpyHtoD_v2", (void *)cuMemcpyHtoD_v2},
+    {"cuMemcpyDtoH_v2", (void *)cuMemcpyDtoH_v2},
     {"cuMemcpyDtoD_v2", (void *)cuMemcpyDtoD_v2},
     {"cuMemcpyDtoA_v2", (void *)cuMemcpyDtoA_v2},
     {"cuMemcpyAtoD_v2", (void *)cuMemcpyAtoD_v2},
+    {"cuMemcpyAtoH_v2", (void *)cuMemcpyAtoH_v2},
     {"cuMemcpyAtoA_v2", (void *)cuMemcpyAtoA_v2},
+    {"cuMemcpy2D_v2", (void *)cuMemcpy2D_v2},
+    {"cuMemcpy2DUnaligned_v2", (void *)cuMemcpy2DUnaligned_v2},
+    {"cuMemcpy3D_v2", (void *)cuMemcpy3D_v2},
+    {"cuMemcpy3DPeer", (void *)cuMemcpy3DPeer},
     {"cuMemcpyPeerAsync", (void *)cuMemcpyPeerAsync},
+    {"cuMemcpyHtoDAsync_v2", (void *)cuMemcpyHtoDAsync_v2},
+    {"cuMemcpyDtoHAsync_v2", (void *)cuMemcpyDtoHAsync_v2},
     {"cuMemcpyDtoDAsync_v2", (void *)cuMemcpyDtoDAsync_v2},
+    {"cuMemcpy2DAsync_v2", (void *)cuMemcpy2DAsync_v2},
+    {"cuMemcpy3DAsync_v2", (void *)cuMemcpy3DAsync_v2},
+    {"cuMemcpy3DPeerAsync", (void *)cuMemcpy3DPeerAsync},
     {"cuMemsetD8_v2", (void *)cuMemsetD8_v2},
     {"cuMemsetD16_v2", (void *)cuMemsetD16_v2},
     {"cuMemsetD32_v2", (void *)cuMemsetD32_v2},
@@ -7353,6 +7511,8 @@ std::unordered_map<std::string, void *> functionMap = {
     {"cuMemUnmap", (void *)cuMemUnmap},
     {"cuMemSetAccess", (void *)cuMemSetAccess},
     {"cuMemGetAccess", (void *)cuMemGetAccess},
+    {"cuMemExportToShareableHandle", (void *)cuMemExportToShareableHandle},
+    {"cuMemImportFromShareableHandle", (void *)cuMemImportFromShareableHandle},
     {"cuMemGetAllocationGranularity", (void *)cuMemGetAllocationGranularity},
     {"cuMemGetAllocationPropertiesFromHandle",
      (void *)cuMemGetAllocationPropertiesFromHandle},
@@ -7364,6 +7524,10 @@ std::unordered_map<std::string, void *> functionMap = {
     {"cuMemPoolCreate", (void *)cuMemPoolCreate},
     {"cuMemPoolDestroy", (void *)cuMemPoolDestroy},
     {"cuMemAllocFromPoolAsync", (void *)cuMemAllocFromPoolAsync},
+    {"cuMemPoolExportToShareableHandle",
+     (void *)cuMemPoolExportToShareableHandle},
+    {"cuMemPoolImportFromShareableHandle",
+     (void *)cuMemPoolImportFromShareableHandle},
     {"cuMemPoolExportPointer", (void *)cuMemPoolExportPointer},
     {"cuMemPoolImportPointer", (void *)cuMemPoolImportPointer},
 #if CUDA_VERSION >= 12020
@@ -7373,6 +7537,8 @@ std::unordered_map<std::string, void *> functionMap = {
     {"cuMemAdvise_v2", (void *)cuMemAdvise_v2},
 #endif
     {"cuMemRangeGetAttribute", (void *)cuMemRangeGetAttribute},
+    {"cuMemRangeGetAttributes", (void *)cuMemRangeGetAttributes},
+    {"cuPointerSetAttribute", (void *)cuPointerSetAttribute},
     {"cuPointerGetAttributes", (void *)cuPointerGetAttributes},
     {"cuStreamCreate", (void *)cuStreamCreate},
     {"cuStreamCreateWithPriority", (void *)cuStreamCreateWithPriority},
@@ -7380,6 +7546,7 @@ std::unordered_map<std::string, void *> functionMap = {
     {"cuStreamGetFlags", (void *)cuStreamGetFlags},
     {"cuStreamGetId", (void *)cuStreamGetId},
     {"cuStreamGetCtx", (void *)cuStreamGetCtx},
+    {"cuStreamWaitEvent", (void *)cuStreamWaitEvent},
     {"cuStreamBeginCapture_v2", (void *)cuStreamBeginCapture_v2},
     {"cuThreadExchangeStreamCaptureMode",
      (void *)cuThreadExchangeStreamCaptureMode},
@@ -7395,7 +7562,9 @@ std::unordered_map<std::string, void *> functionMap = {
     {"cuEventCreate", (void *)cuEventCreate},
     {"cuEventRecord", (void *)cuEventRecord},
     {"cuEventRecordWithFlags", (void *)cuEventRecordWithFlags},
+    {"cuEventQuery", (void *)cuEventQuery},
     {"cuEventSynchronize", (void *)cuEventSynchronize},
+    {"cuEventDestroy_v2", (void *)cuEventDestroy_v2},
     {"cuEventElapsedTime_v2", (void *)cuEventElapsedTime_v2},
     {"cuImportExternalMemory", (void *)cuImportExternalMemory},
     {"cuExternalMemoryGetMappedBuffer",
@@ -7421,6 +7590,8 @@ std::unordered_map<std::string, void *> functionMap = {
     {"cuFuncGetName", (void *)cuFuncGetName},
 #endif
     {"cuFuncGetParamInfo", (void *)cuFuncGetParamInfo},
+    {"cuLaunchKernel", (void *)cuLaunchKernel},
+    {"cuLaunchKernelEx", (void *)cuLaunchKernelEx},
     {"cuLaunchCooperativeKernel", (void *)cuLaunchCooperativeKernel},
     {"cuFuncSetBlockShape", (void *)cuFuncSetBlockShape},
     {"cuFuncSetSharedSize", (void *)cuFuncSetSharedSize},
@@ -7435,10 +7606,18 @@ std::unordered_map<std::string, void *> functionMap = {
     {"cuParamSetTexRef", (void *)cuParamSetTexRef},
     {"cuFuncSetSharedMemConfig", (void *)cuFuncSetSharedMemConfig},
     {"cuGraphCreate", (void *)cuGraphCreate},
+    {"cuGraphAddKernelNode_v2", (void *)cuGraphAddKernelNode_v2},
+    {"cuGraphKernelNodeGetParams_v2", (void *)cuGraphKernelNodeGetParams_v2},
+    {"cuGraphKernelNodeSetParams_v2", (void *)cuGraphKernelNodeSetParams_v2},
+    {"cuGraphAddMemcpyNode", (void *)cuGraphAddMemcpyNode},
     {"cuGraphMemcpyNodeGetParams", (void *)cuGraphMemcpyNodeGetParams},
     {"cuGraphMemcpyNodeSetParams", (void *)cuGraphMemcpyNodeSetParams},
+    {"cuGraphAddMemsetNode", (void *)cuGraphAddMemsetNode},
     {"cuGraphMemsetNodeGetParams", (void *)cuGraphMemsetNodeGetParams},
     {"cuGraphMemsetNodeSetParams", (void *)cuGraphMemsetNodeSetParams},
+    {"cuGraphAddHostNode", (void *)cuGraphAddHostNode},
+    {"cuGraphHostNodeGetParams", (void *)cuGraphHostNodeGetParams},
+    {"cuGraphHostNodeSetParams", (void *)cuGraphHostNodeSetParams},
     {"cuGraphAddChildGraphNode", (void *)cuGraphAddChildGraphNode},
     {"cuGraphChildGraphNodeGetGraph", (void *)cuGraphChildGraphNodeGetGraph},
     {"cuGraphAddEmptyNode", (void *)cuGraphAddEmptyNode},
@@ -7498,8 +7677,11 @@ std::unordered_map<std::string, void *> functionMap = {
     {"cuGraphInstantiateWithFlags", (void *)cuGraphInstantiateWithFlags},
     {"cuGraphInstantiateWithParams", (void *)cuGraphInstantiateWithParams},
     {"cuGraphExecGetFlags", (void *)cuGraphExecGetFlags},
+    {"cuGraphExecKernelNodeSetParams_v2",
+     (void *)cuGraphExecKernelNodeSetParams_v2},
     {"cuGraphExecMemcpyNodeSetParams", (void *)cuGraphExecMemcpyNodeSetParams},
     {"cuGraphExecMemsetNodeSetParams", (void *)cuGraphExecMemsetNodeSetParams},
+    {"cuGraphExecHostNodeSetParams", (void *)cuGraphExecHostNodeSetParams},
     {"cuGraphExecChildGraphNodeSetParams",
      (void *)cuGraphExecChildGraphNodeSetParams},
     {"cuGraphExecEventRecordNodeSetEvent",
@@ -7536,6 +7718,10 @@ std::unordered_map<std::string, void *> functionMap = {
      (void *)cuOccupancyMaxActiveBlocksPerMultiprocessor},
     {"cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags",
      (void *)cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags},
+    {"cuOccupancyMaxPotentialBlockSize",
+     (void *)cuOccupancyMaxPotentialBlockSize},
+    {"cuOccupancyMaxPotentialBlockSizeWithFlags",
+     (void *)cuOccupancyMaxPotentialBlockSizeWithFlags},
     {"cuOccupancyAvailableDynamicSMemPerBlock",
      (void *)cuOccupancyAvailableDynamicSMemPerBlock},
     {"cuOccupancyMaxPotentialClusterSize",
@@ -7578,6 +7764,9 @@ std::unordered_map<std::string, void *> functionMap = {
     {"cuSurfObjectCreate", (void *)cuSurfObjectCreate},
     {"cuSurfObjectDestroy", (void *)cuSurfObjectDestroy},
     {"cuSurfObjectGetResourceDesc", (void *)cuSurfObjectGetResourceDesc},
+#if CUDA_VERSION >= 12000
+    {"cuTensorMapEncodeTiled", (void *)cuTensorMapEncodeTiled},
+#endif
     {"cuDeviceCanAccessPeer", (void *)cuDeviceCanAccessPeer},
     {"cuCtxEnablePeerAccess", (void *)cuCtxEnablePeerAccess},
     {"cuCtxDisablePeerAccess", (void *)cuCtxDisablePeerAccess},
@@ -7643,6 +7832,21 @@ std::unordered_map<std::string, void *> functionMap = {
 #endif
 #if CUDA_VERSION >= 13010
     {"cuStreamGetDevResource", (void *)cuStreamGetDevResource},
+#endif
+#if CUDA_VERSION >= 12090
+    {"cuLogsRegisterCallback", (void *)cuLogsRegisterCallback},
+#endif
+#if CUDA_VERSION >= 12090
+    {"cuLogsUnregisterCallback", (void *)cuLogsUnregisterCallback},
+#endif
+#if CUDA_VERSION >= 12090
+    {"cuLogsCurrent", (void *)cuLogsCurrent},
+#endif
+#if CUDA_VERSION >= 12090
+    {"cuLogsDumpToFile", (void *)cuLogsDumpToFile},
+#endif
+#if CUDA_VERSION >= 12090
+    {"cuLogsDumpToMemory", (void *)cuLogsDumpToMemory},
 #endif
     {"cuGraphInstantiate_v2", (void *)cuGraphInstantiate_v2},
     {"cuGraphExecUpdate", (void *)cuGraphExecUpdate},

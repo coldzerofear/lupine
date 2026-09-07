@@ -22,9 +22,11 @@
 #include <vector>
 #endif
 
+#include "client_bundle.h"
 #include "dispatch.h"
 #include "ipc.h"
 #include "lupine_log.h"
+#include "monitoring.h"
 #include "rpc.h"
 #include "rpc_server.h"
 #ifdef LUPINE_BUILD_CUDA_BACKEND
@@ -36,6 +38,33 @@
 #define DEFAULT_PORT 14833
 #define MAX_CLIENTS 10
 #define MAX_LANES 256
+
+#ifdef LUPINE_EMBED_CLIENT_BUNDLES
+extern const lupine_client_bundle_payload
+    lupine_embedded_client_bundle_linux_x86_64;
+extern const lupine_client_bundle_payload
+    lupine_embedded_client_bundle_linux_aarch64;
+extern const lupine_client_bundle_payload
+    lupine_embedded_client_bundle_macosx_universal2;
+extern const lupine_client_bundle_payload
+    lupine_embedded_client_bundle_win_amd64;
+extern const lupine_client_bundle_payload
+    lupine_embedded_client_bundle_win_arm64;
+
+namespace {
+const lupine_client_bundle_entry kClientBundles[] = {
+    {"linux/amd64", &lupine_embedded_client_bundle_linux_x86_64},
+    {"linux/arm64", &lupine_embedded_client_bundle_linux_aarch64},
+    {"macos/amd64", &lupine_embedded_client_bundle_macosx_universal2},
+    {"macos/arm64", &lupine_embedded_client_bundle_macosx_universal2},
+    {"windows/amd64", &lupine_embedded_client_bundle_win_amd64},
+    {"windows/arm64", &lupine_embedded_client_bundle_win_arm64},
+};
+} // namespace
+
+const lupine_client_bundle_registry lupine_embedded_client_bundles = {
+    kClientBundles, sizeof(kClientBundles) / sizeof(kClientBundles[0])};
+#endif
 
 #ifndef _WIN32
 static volatile sig_atomic_t lupine_parent_termination_requested = 0;
@@ -101,6 +130,7 @@ lupine_reap_connection_children(std::unordered_set<pid_t> &children) {
       LUPINE_LOG_ERROR("Connection child "
                        << child << " exited abnormally with status " << status);
     }
+    lupine_monitoring_unregister_pid(child);
     children.erase(child);
   }
   lupine_parent_child_exited = 0;
@@ -119,6 +149,11 @@ struct lupine_lane {
 int rpc_server_dispatch(const rpc_handler_registry &handlers, conn_t *conn,
                         int op) {
   LUPINE_TRACE_LOG("LUPINE server handling op " << op);
+#ifdef LUPINE_MONITORING_ENABLED
+  if (op == LUPINE_RPC_CLIENT_METADATA) {
+    return handle_lupine_client_metadata(conn);
+  }
+#endif
   auto it = handlers.find(op);
   if (it == handlers.end()) {
     LUPINE_LOG_ERROR("No RPC handler for op " << op << "; closing client.");
@@ -174,13 +209,26 @@ int client_handler(lupine_socket_t connfd) {
 #else
       nullptr,
 #endif
-      getenv("LUPINE_CLIENT_BUNDLE_DIR"),
+#ifdef LUPINE_EMBED_CLIENT_BUNDLES
+      &lupine_embedded_client_bundles,
+#else
+      nullptr,
+#endif
+#ifdef LUPINE_MONITORING_ENABLED
+      LUPINE_SERVER_CAPABILITY_CLIENT_METADATA,
+#else
+      0,
+#endif
   };
 
   // Identify the protocol before any RPC state exists: HTTP/2 preface means
   // an RPC client, anything else is answered as plain HTTP/1.x and the
   // connection is done.
-  if (lupine_connection_dispatch(connfd, &metadata) != 0) {
+  lupine_metrics_handler metrics = nullptr;
+#ifdef LUPINE_MONITORING_ENABLED
+  metrics = lupine_monitoring_render_metrics;
+#endif
+  if (lupine_connection_dispatch(connfd, &metadata, metrics) != 0) {
     lupine_socket_close(connfd);
 #ifdef LUPINE_BUILD_CUDA_BACKEND
     return lupine_server_checkpoint_child_finish();
@@ -198,7 +246,6 @@ int client_handler(lupine_socket_t connfd) {
     return 0;
 #endif
   }
-
   int http2_init_result = rpc_http2_server_init_with_metadata(&conn, &metadata);
   if (http2_init_result < 0) {
     LUPINE_LOG_ERROR("Error initializing HTTP/2 connection.");
@@ -210,6 +257,9 @@ int client_handler(lupine_socket_t connfd) {
 #endif
   }
   if (http2_init_result != 0) {
+    if (rpc_http2_server_graceful_shutdown(&conn) < 0) {
+      LUPINE_LOG_DEBUG("HTTP/2 peer closed before acknowledging shutdown");
+    }
     rpc_conn_destroy(&conn);
 #ifdef LUPINE_BUILD_CUDA_BACKEND
     return lupine_server_checkpoint_child_finish();
@@ -217,6 +267,7 @@ int client_handler(lupine_socket_t connfd) {
     return 0;
 #endif
   }
+  lupine_monitoring_register_child();
 #ifdef LUPINE_BUILD_CUDA_BACKEND
   if (!lupine_server_initialize_connection(&conn)) {
     LUPINE_LOG_ERROR("Error initializing per-connection CUDA state.");
@@ -356,12 +407,18 @@ int main() {
     exit(EXIT_FAILURE);
   }
 
+  if (!lupine_monitoring_initialize()) {
+    lupine_socket_close(sockfd);
+    exit(EXIT_FAILURE);
+  }
+
   LUPINE_LOG_DEBUG("Server listening on port " << port << "...");
 
 #ifndef _WIN32
   if (!lupine_install_parent_signal_handlers()) {
     LUPINE_LOG_ERROR("Failed to install server signal handlers.");
     lupine_socket_close(sockfd);
+    lupine_monitoring_shutdown();
     exit(EXIT_FAILURE);
   }
   std::unordered_set<pid_t> connection_children;
@@ -549,8 +606,10 @@ int main() {
     shutdown_result = EXIT_FAILURE;
     break;
   }
+  lupine_monitoring_shutdown();
   return shutdown_result;
 #else
+  lupine_monitoring_shutdown();
   return 0;
 #endif
 }

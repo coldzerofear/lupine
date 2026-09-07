@@ -8,7 +8,9 @@ from cxxheaderparser.types import Type, Pointer, Parameter, Function, Array
 from typing import Optional, Union
 from dataclasses import dataclass
 from string import Template
+from types import SimpleNamespace
 import argparse
+from collections import namedtuple
 import io
 import os
 import glob
@@ -17,6 +19,15 @@ import subprocess
 import textwrap
 import zlib
 from client_templates import collect_client_call_templates
+from emit import (
+    Backend,
+    format_call_args,
+    format_function_params,
+    write_client_rpc,
+    write_client_wrapper,
+    write_server_buffer_cleanup,
+    write_server_handler,
+)
 from ops import (
     NullableOperation,
     ArrayOperation,
@@ -201,19 +212,6 @@ NVML_RPC_FUNCTIONS = [
     "nvmlDeviceGetCudaComputeCapability",
 ]
 
-HIP_RPC_FUNCTIONS = [
-    "hipInit",
-    "hipGetDeviceCount",
-    "hipDeviceGet",
-    # HIP's public macro resolves to this versioned ABI symbol.
-    "hipGetDevicePropertiesR0600",
-    "hipDeviceGetName",
-    "hipDeviceTotalMem",
-    "hipDeviceGetAttribute",
-    "hipDriverGetVersion",
-    "hipRuntimeGetVersion",
-]
-
 HIP_MANUAL_REMAPPINGS = [
     ("hipGetDeviceProperties", "hipGetDevicePropertiesR0600"),
 ]
@@ -326,36 +324,30 @@ def annotation_directives(annotation: str) -> list[str]:
     return directives
 
 
-def parse_server_binding(name: str, annotation: str) -> Optional[ServerBinding]:
-    backend = None
+def parse_server_binding(
+    name: str, annotation: str, backend: str
+) -> Optional[ServerBinding]:
+    """A hand-written server handler: `handle_<call>`, or the name given."""
     handler = None
     guard = None
     for directive in annotation_directives(annotation):
-        parts = directive.split(maxsplit=2)
-        if parts[0] == "@server":
-            if backend is not None or len(parts) < 2:
-                raise RuntimeError(
-                    f"Invalid @server annotation for {name}"
-                )
-            backend = parts[1].upper()
-            if backend not in SERVER_BACKENDS:
-                raise RuntimeError(f"Unknown RPC server backend {backend}")
-            if len(parts) == 3:
-                handler = parts[2]
+        parts = directive.split()
+        if parts[0] == "@disabled" and parts[1:2] != ["client"]:
+            if handler is not None:
+                raise RuntimeError(f"Duplicate @disabled for {name}")
+            rest = parts[2:] if parts[1:2] == ["server"] else parts[1:]
+            handler = rest[0] if rest and rest[0] != "-" else "handle_" + name
         elif parts[0] == "@guard":
             if guard is not None or len(parts) < 2:
                 raise RuntimeError(f"Invalid @guard annotation for {name}")
             guard = directive.removeprefix("@guard").strip()
 
-    if backend is None:
-        return None
-
     if handler is None:
-        handler = "handle_" + name
+        return None
     return ServerBinding(name, backend, handler, guard)
 
 
-def collect_server_bindings(path: str) -> dict[str, ServerBinding]:
+def collect_server_bindings(path: str, backend: str) -> dict[str, ServerBinding]:
     bindings = {}
     with open(path) as annotations_file:
         source = annotations_file.read()
@@ -364,27 +356,48 @@ def collect_server_bindings(path: str) -> dict[str, ServerBinding]:
         name_match = re.search(r"([A-Za-z_]\w*)\s*\($", declaration)
         if name_match is None:
             continue
-        binding = parse_server_binding(name_match.group(1), annotation)
+        binding = parse_server_binding(name_match.group(1), annotation, backend)
         if binding is None:
             continue
         previous = bindings.get(binding.name)
         if previous is not None and previous != binding:
-            raise RuntimeError(f"Conflicting @server annotations for {binding.name}")
+            raise RuntimeError(f"Conflicting @disabled for {binding.name}")
         bindings[binding.name] = binding
     return bindings
 
 
-def rpc_id(name: str) -> int:
-    return zlib.crc32(name.encode("utf-8")) & 0x7FFFFFFF
+# One annotation file per shim target. A declaration belongs to the target
+# whose file it lives in, so no API-name prefix is needed to tell them apart.
+CUDA = Backend(
+    result="CUresult",
+    invalid_argument="CUDA_ERROR_INVALID_VALUE",
+    device_routing_kind="DEVICE",
+    # The driver shim links against libcuda, so its handlers call the entry
+    # point directly instead of resolving it by name.
+    symbol_lookup="",
+)
 
+NVML = Backend(
+    result="nvmlReturn_t",
+    invalid_argument="NVML_ERROR_INVALID_ARGUMENT",
+    device_routing_kind="NVML_DEVICE",
+    symbol_lookup="nvml_symbol",
+    lookup_on_all_connections=True,
+)
 
-def annotated_rpc_names(annotations: ParsedData) -> list[str]:
-    names: set[str] = set()
-    for function in annotations.namespace.functions:
-        name = function.name.format()
-        if len(name) > 2 and name.startswith("cu") and name[2].isupper():
-            names.add(name)
-    return sorted(names)
+HIP = Backend(
+    result="hipError_t",
+    invalid_argument="hipErrorInvalidValue",
+    device_routing_kind="HIP_DEVICE",
+    symbol_lookup="hip_symbol",
+    guard_null_conn=True,
+)
+
+ANNOTATION_FILES = {
+    "cuda": "annotations_cuda.h",
+    "nvml": "annotations_nvml.h",
+    "hip": "annotations_hip.h",
+}
 
 
 SKIP_FUNCTIONS = {
@@ -439,6 +452,17 @@ def infer_routing_key(
 
 
 # Parses a function annotation into marshalling operations and metadata.
+# Directives that name their annotation's fields in order. A field called
+# "kind" is taken as written; the rest name parameters.
+UNIFORM_ANNOTATIONS = {
+    "routingfallback": (RoutingFallbackAnnotation, None),
+    "recordowner": (OwnerAnnotation, "record_owners"),
+    "recordparent": (ParentAnnotation, "parents"),
+    "retain": (RetainAnnotation, "retains"),
+    "release": (ReleaseAnnotation, "releases"),
+}
+
+
 def parse_annotation(
     annotation: str, params: list[Parameter]
 ) -> FunctionAnnotationMetadata:
@@ -452,22 +476,22 @@ def parse_annotation(
         metadata.routing_kind, metadata.routing_parameter = infer_routing_key(params)
         return metadata
     for line in annotation.split("\n"):
-        # Disabled annotations can apply to client generation, server
-        # generation, or both. Bare @disabled keeps the historical behavior
-        # by setting both scoped flags.
-        if "@disabled" in line or "@DISABLED" in line:
-            disabled_parts = line.lower().lstrip(" *").split()
-            scope = disabled_parts[1] if len(disabled_parts) > 1 else "both"
-            if scope == "client":
+        # @disabled client / @disabled server skip one generated side; bare
+        # @disabled (optionally naming the server handler) skips both.
+        if "@disabled" in line:
+            if metadata.disabled_client or metadata.disabled_server:
+                raise RuntimeError("Duplicate @disabled")
+            scope = line.lstrip(" *").split()[1:2]
+            if scope == ["client"]:
                 metadata.disabled_client = True
                 continue
-            elif scope == "server":
+            elif scope == ["server"]:
                 metadata.disabled_server = True
                 continue
             else:
                 metadata.disabled_client = True
                 metadata.disabled_server = True
-                return metadata
+                continue
         if line.startswith("/**"):
             continue
         if line.startswith("*/"):
@@ -496,8 +520,6 @@ def parse_annotation(
                 raise RuntimeError("Invalid @guard annotation")
             metadata.guard = guard
             continue
-        if line.startswith("@server"):
-            continue
         if line.startswith("@routingkey"):
             parts = line.split()
             if len(parts) < 2:
@@ -506,57 +528,24 @@ def parse_annotation(
             if len(parts) >= 3:
                 metadata.routing_parameter = annotation_param(params, parts[2])
             continue
-        if line.startswith("@routingfallback"):
+        directive = next(
+            (name for name in UNIFORM_ANNOTATIONS if line.startswith("@" + name)),
+            None,
+        )
+        if directive is not None:
+            annotation, target = UNIFORM_ANNOTATIONS[directive]
+            fields = list(annotation.__annotations__)
             parts = line.split()
-            if len(parts) < 3:
-                continue
-            metadata.routing_fallback = RoutingFallbackAnnotation(
-                kind=parts[1].upper(),
-                parameter=annotation_param(params, parts[2]),
-            )
-            continue
-        if line.startswith("@recordowner"):
-            parts = line.split()
-            if len(parts) < 3:
-                continue
-            param = annotation_param(params, parts[2])
-            metadata.record_owners.append(OwnerAnnotation(parts[1].upper(), param))
-            continue
-        if line.startswith("@retain"):
-            parts = line.split()
-            if len(parts) != 3:
-                raise RuntimeError("@retain requires an output parameter and a handle")
-            metadata.retains.append(
-                RetainAnnotation(
-                    parameter=annotation_param(params, parts[1]),
-                    handle=annotation_param(params, parts[2]),
-                )
-            )
-            continue
-        if line.startswith("@release"):
-            parts = line.split()
-            if len(parts) != 3:
-                raise RuntimeError("@release requires a handle kind and parameter")
-            metadata.releases.append(
-                ReleaseAnnotation(
-                    kind=parts[1].upper(),
-                    parameter=annotation_param(params, parts[2]),
-                )
-            )
-            continue
-        if line.startswith("@recordparent"):
-            parts = line.split()
-            if len(parts) != 4:
-                raise RuntimeError(
-                    "@recordparent requires a parent kind, child, and parent"
-                )
-            metadata.parents.append(
-                ParentAnnotation(
-                    kind=parts[1].upper(),
-                    child=annotation_param(params, parts[2]),
-                    parent=annotation_param(params, parts[3]),
-                )
-            )
+            if len(parts) != len(fields) + 1:
+                raise RuntimeError(f"@{directive} requires {' '.join(fields)}")
+            values = {
+                field: part.upper() if field == "kind" else annotation_param(params, part)
+                for field, part in zip(fields, parts[1:])
+            }
+            if target is None:
+                metadata.routing_fallback = annotation(**values)
+            else:
+                getattr(metadata, target).append(annotation(**values))
             continue
         if line.startswith("@crossservercopy"):
             parts = line.split()
@@ -576,6 +565,13 @@ def parse_annotation(
                 ),
                 async_="ASYNC" in parts[4:],
             )
+            continue
+        if line.startswith("@clearfields"):
+            # @clearfields <param> <member>...
+            parts = line.split()
+            if len(parts) < 3:
+                raise RuntimeError("@clearfields requires a parameter and members")
+            metadata.clear_fields.append((parts[1], tuple(parts[2:])))
             continue
         if line.startswith("@graphexecnode"):
             parts = line.split()
@@ -767,87 +763,8 @@ def parse_annotation(
                         length=length_param,
                     )
                 )
-            elif size_arg:
-                # if it has a size, it's an array operation with constant length
-                operations.append(
-                    ArrayOperation(
-                        send=send,
-                        recv=recv,
-                        parameter=param,
-                        ptr=param.type,
-                        length=int(size_arg.split(":")[1]),
-                    )
-                )
-            elif null_terminated:
-                # if it's null terminated, it's a null terminated operation
-                operations.append(
-                    NullTerminatedOperation(
-                        send=send,
-                        recv=recv,
-                        parameter=param,
-                        ptr=param.type,
-                    )
-                )
-            elif nullable:
-                # if it's nullable, it's a nullable operation
-                operations.append(
-                    NullableOperation(
-                        send=send,
-                        recv=recv,
-                        parameter=param,
-                        ptr=param.type,
-                    )
-                )
             else:
-                # otherwise, it's a pointer to a single value or another pointer
-                if recv:
-                    if param.type.ptr_to.format() == "void":
-                        raise NotImplementedError("Cannot dereference a void pointer")
-                    # this is an out parameter so use the base type as the server declaration
-                    operations.append(
-                        DereferenceOperation(
-                            send=send,
-                            recv=recv,
-                            parameter=param,
-                            type_=param.type,
-                        )
-                    )
-                else:
-                    # otherwise, treat it as an opaque type
-                    operations.append(
-                        OpaqueTypeOperation(
-                            send=send,
-                            recv=recv,
-                            parameter=param,
-                            type_=param.type,
-                        )
-                    )
-        elif isinstance(param.type, Type):
-            if param.type.const:
-                recv = False
-            operations.append(
-                OpaqueTypeOperation(
-                    send=send,
-                    recv=recv,
-                    parameter=param,
-                    type_=param.type,
-                )
-            )
-        elif isinstance(param.type, Array):
-            length_param = next(p for p in params if p.name == length_arg.split(":")[1])
-            if param.type.array_of.const:
-                recv = False
-            operations.append(
-                ArrayOperation(
-                    send=send,
-                    recv=recv,
-                    parameter=param,
-                    ptr=param.type,
-                    length=length_param,
-                )
-            )
-        else:
-            raise NotImplementedError("Unknown type")
+                raise NotImplementedError("Unknown type")
     # Promote the count param of any optional out-array to an
     # InOutCountOperation. Several arrays may share one count (cuGraphGetEdges);
     # the first one is the anchor whose presence the client uses to decide
@@ -923,102 +840,45 @@ def parse_annotation(
 def client_routing_key_expr(
     kind: Optional[str], param: Optional[Parameter], metadata: FunctionAnnotationMetadata
 ) -> str:
+    # The kind names the selector, so a new kind needs one but no change here.
     if kind is None:
         return "lupine_route_for_default()"
+    route = f"lupine_route_for_{kind.lower()}"
     if kind == "CURRENT_CONTEXT":
-        return "lupine_route_for_current_context()"
+        return f"{route}()"
     if param is None:
         raise NotImplementedError(f"Routing key {kind} requires a parameter")
     name = param.name
     if kind == "DEVICE":
-        return f"lupine_route_for_device(&{name})"
-    if kind == "CONTEXT":
-        return f"lupine_route_for_context({name})"
-    if kind == "MODULE":
-        return f"lupine_route_for_module({name})"
-    if kind == "LIBRARY":
-        return f"lupine_route_for_library({name})"
-    if kind == "FUNCTION":
-        if param.type.format() == "CUkernel":
-            name = f"reinterpret_cast<CUfunction>({name})"
-        return f"lupine_route_for_function({name})"
-    if kind == "STREAM":
-        if metadata.routing_fallback is not None:
-            fallback = client_routing_key_expr(
+        # By address: the selector rewrites the ordinal to the server's.
+        name = f"&{name}"
+    elif kind == "FUNCTION" and param.type.format() == "CUkernel":
+        name = f"reinterpret_cast<CUfunction>({name})"
+    elif kind == "STREAM":
+        # The default stream belongs to no route, so a null handle falls back.
+        fallback = (
+            client_routing_key_expr(
                 metadata.routing_fallback.kind,
                 metadata.routing_fallback.parameter,
                 metadata,
             )
-            return f"({name} != nullptr ? lupine_route_for_stream({name}) : {fallback})"
-        return f"({name} != nullptr ? lupine_route_for_stream({name}) : lupine_route_for_default())"
-    if kind == "EVENT":
-        return f"lupine_route_for_event({name})"
-    if kind == "MEMORY_POOL":
-        return f"lupine_route_for_memory_pool({name})"
-    if kind == "GRAPH":
-        return f"lupine_route_for_graph({name})"
-    if kind == "GRAPH_NODE":
-        return f"lupine_route_for_graph_node({name})"
-    if kind == "GRAPH_EXEC":
-        return f"lupine_route_for_graph_exec({name})"
-    if kind == "DEVICEPTR":
-        return f"lupine_route_for_deviceptr({name})"
-    raise NotImplementedError(f"Unknown routing key kind: {kind}")
-
-
-def client_routing_route_expr(metadata: FunctionAnnotationMetadata) -> str:
-    return client_routing_key_expr(
-        metadata.routing_kind, metadata.routing_parameter, metadata
-    )
-
-
-def client_call_args(function: Function, metadata: FunctionAnnotationMetadata) -> list[str]:
-    return [param.name for param in function.parameters if param.name]
-
-
-def write_client_rpc_write(f, operation: Operation, metadata: FunctionAnnotationMetadata):
-    operation.client_rpc_write(f)
+            if metadata.routing_fallback is not None
+            else "lupine_route_for_default()"
+        )
+        return f"({name} != nullptr ? {route}({name}) : {fallback})"
+    return f"{route}({name})"
 
 
 def client_record_owner_stmt(owner: OwnerAnnotation) -> str:
-    kind = owner.kind
     name = owner.parameter.name
-    value = f"*{name}" if isinstance(owner.parameter.type, Pointer) else name
-    null_guard = f" && {name} != nullptr" if isinstance(owner.parameter.type, Pointer) else ""
-    if kind == "CONTEXT":
-        fn = "lupine_note_context_owner"
-    elif kind == "MODULE":
-        fn = "lupine_note_module_owner"
-    elif kind == "LIBRARY":
-        fn = "lupine_note_library_owner"
-    elif kind == "FUNCTION":
-        fn = "lupine_note_function_owner"
-    elif kind == "STREAM":
-        fn = "lupine_note_stream_owner"
-    elif kind == "EVENT":
-        fn = "lupine_note_event_owner"
-    elif kind == "MEMORY_POOL":
-        fn = "lupine_note_memory_pool_owner"
-    elif kind == "GRAPH":
-        fn = "lupine_note_graph_owner"
-    elif kind == "GRAPH_NODE":
-        fn = "lupine_note_graph_node_owner"
-    elif kind == "GRAPH_EXEC":
-        fn = "lupine_note_graph_exec_owner"
-    elif kind == "DEVICEPTR":
-        fn = "lupine_note_deviceptr_owner"
-    else:
-        raise NotImplementedError(f"Unknown owner kind: {kind}")
+    output = isinstance(owner.parameter.type, Pointer)
+    value = f"*{name}" if output else name
+    null_guard = f" && {name} != nullptr" if output else ""
     return (
         f"    if (return_value == CUDA_SUCCESS{null_guard}) {{\n"
-        f"        {fn}_route({value}, route);\n"
+        f"        lupine_note_{owner.kind.lower()}_owner_route({value}, route);\n"
         "    }\n"
     )
-
-
-def write_client_template_section(f, section: str):
-    if section:
-        f.write(textwrap.indent(section, "    "))
 
 
 def write_client_post_call(f, metadata: FunctionAnnotationMetadata):
@@ -1050,446 +910,78 @@ def write_client_post_call(f, metadata: FunctionAnnotationMetadata):
         )
 
     if metadata.client_call_template is not None:
-        write_client_template_section(f, metadata.client_call_template.after_call)
+        f.write(textwrap.indent(metadata.client_call_template.after_call, "    "))
 
     if metadata.synchronize:
         f.write("    if (return_value == CUDA_SUCCESS) return_value = lupine_sync_mapped_device_to_host();\n")
 
 
-def error_const(return_type: str) -> str:
-    if return_type == "nvmlReturn_t":
-        return "NVML_ERROR_GPU_IS_LOST"
-    if return_type == "hipError_t":
-        return "hipErrorUnknown"
-    if return_type == "CUresult":
-        return "CUDA_ERROR_DEVICE_UNAVAILABLE"
-    if return_type == "cudaError_t":
-        return "cudaErrorDevicesUnavailable"
-    if return_type == "cublasStatus_t":
-        return "CUBLAS_STATUS_NOT_INITIALIZED"
-    if return_type == "cudnnStatus_t":
-        return "CUDNN_STATUS_NOT_INITIALIZED"
-    if return_type == "size_t":
-        return "size_t"
-    if return_type == "const char*":
-        return "const char*"
-    if return_type == "void":
-        return "void"
-    if return_type == "struct cudaChannelFormatDesc":
-        return "struct cudaChannelFormatDesc"
-    raise NotImplementedError("Unknown return type: %s" % return_type)
+# The results generated code produces on its own. An entry naming a type rather
+# than a code marks a result that carries no error value.
+ResultCodes = namedtuple(
+    "ResultCodes", "unavailable invalid_device invalid_argument"
+)
+
+RESULT_CODES = {
+    "CUresult": ResultCodes(
+        "CUDA_ERROR_DEVICE_UNAVAILABLE",
+        "CUDA_ERROR_INVALID_DEVICE",
+        "CUDA_ERROR_INVALID_VALUE",
+    ),
+    "cudaError_t": ResultCodes(
+        "cudaErrorDevicesUnavailable",
+        "cudaErrorInvalidDevice",
+        "cudaErrorInvalidValue",
+    ),
+    "hipError_t": ResultCodes(
+        "hipErrorUnknown", "hipErrorInvalidDevice", "hipErrorInvalidValue"
+    ),
+    "nvmlReturn_t": ResultCodes("NVML_ERROR_GPU_IS_LOST", None, "NVML_ERROR_INVALID_ARGUMENT"),
+    "cublasStatus_t": ResultCodes(
+        "CUBLAS_STATUS_NOT_INITIALIZED",
+        None,
+        "CUBLAS_STATUS_INVALID_VALUE",
+    ),
+    "cudnnStatus_t": ResultCodes("CUDNN_STATUS_NOT_INITIALIZED", None, "CUDNN_STATUS_BAD_PARAM"),
+    "size_t": ResultCodes("size_t", None, None),
+    "const char*": ResultCodes("const char*", None, None),
+    "void": ResultCodes("void", None, None),
+    "struct cudaChannelFormatDesc": ResultCodes("struct cudaChannelFormatDesc", None, None),
+}
 
 
-def invalid_device_const(return_type: str) -> str:
-    if return_type == "CUresult":
-        return "CUDA_ERROR_INVALID_DEVICE"
-    if return_type == "cudaError_t":
-        return "cudaErrorInvalidDevice"
-    if return_type == "hipError_t":
-        return "hipErrorInvalidDevice"
-    raise NotImplementedError(
-        "No invalid-device error for return type: %s" % return_type
-    )
+def result_code(return_type: str, result: str = "unavailable") -> str:
+    codes = RESULT_CODES.get(return_type)
+    if codes is None:
+        raise NotImplementedError(f"Unknown return type: {return_type}")
+    return getattr(codes, result) or codes.unavailable
 
 
-def invalid_argument_const(return_type: str) -> str:
-    if return_type == "nvmlReturn_t":
-        return "NVML_ERROR_INVALID_ARGUMENT"
-    if return_type == "hipError_t":
-        return "hipErrorInvalidValue"
-    if return_type == "CUresult":
-        return "CUDA_ERROR_INVALID_VALUE"
-    if return_type == "cudaError_t":
-        return "cudaErrorInvalidValue"
-    if return_type == "cublasStatus_t":
-        return "CUBLAS_STATUS_INVALID_VALUE"
-    if return_type == "cudnnStatus_t":
-        return "CUDNN_STATUS_BAD_PARAM"
-    return error_const(return_type)
-
-
-def prefix_std(type: str) -> str:
-    # if type in ["size_t", "std::size_t"]:
-    #     return "std::size_t"
-    return type
-
-
-def format_function_params(function: Function) -> list[str]:
-    params = []
-    for param in function.parameters:
-        if param.name and "[]" in param.type.format():
-            params.append(
-                "{type} {name}".format(
-                    type=param.type.format().replace("[]", ""),
-                    name=param.name + "[]",
-                )
-            )
-        elif param.name:
-            params.append(
-                "{type} {name}".format(
-                    type=param.type.format(),
-                    name=param.name,
-                )
-            )
-        else:
-            params.append(param.type.format())
-    return params
-
-
-def format_call_args(function: Function) -> list[str]:
-    return [param.name for param in function.parameters if param.name]
-
-
-def server_call_name(function_name: str) -> str:
-    if function_name == "cuEventElapsedTime_v2":
-        return "cuEventElapsedTime"
-    return function_name
-
-
-def collect_nvml_functions(
-    annotations: ParsedData, server_bindings: dict[str, ServerBinding]
+def collect_backend_functions(
+    annotations: ParsedData,
+    names=None,
+    server_bindings: dict[str, ServerBinding] = {},
+    string_length_type: str = None,
 ):
+    """Calls in the order named, or every call the annotation file declares."""
     by_name = {
         function.name.format(): function
         for function in annotations.namespace.functions
     }
     result = []
-    for name in NVML_RPC_FUNCTIONS:
+    for name in names if names is not None else by_name:
         if name in server_bindings:
             continue
         function = by_name.get(name)
         if function is None:
-            raise RuntimeError(f"NVML annotation for {name} not found")
+            raise RuntimeError(f"Annotation for {name} not found")
         metadata = parse_annotation(function.doxygen, function.parameters)
-        for operation in metadata.operations:
-            if isinstance(operation, NullTerminatedOperation):
-                # Preserve the existing NVML wire format. CUDA RPC strings use
-                # size_t lengths, while the NVML protocol historically used
-                # unsigned int lengths.
-                operation.length_type = "unsigned int"
+        if string_length_type is not None:
+            for operation in metadata.operations:
+                if isinstance(operation, NullTerminatedOperation):
+                    operation.length_type = string_length_type
         result.append((function, function, metadata.operations, metadata))
     return result
-
-
-def write_nvml_client_validation(f, operations):
-    checks = []
-    for operation in operations:
-        name = operation.parameter.name
-        if isinstance(operation, NullTerminatedOperation) and operation.send:
-            checks.append(f"{name} == nullptr")
-        elif isinstance(operation, DereferenceOperation):
-            checks.append(f"{name} == nullptr")
-        elif isinstance(operation, ArrayOperation):
-            checks.append(
-                f"({operation.transfer_size_expr()} != 0 && {name} == nullptr)"
-            )
-    if checks:
-        f.write("  if (" + " ||\n      ".join(checks) + ") {\n")
-        f.write("    return NVML_ERROR_INVALID_ARGUMENT;\n")
-        f.write("  }\n")
-
-
-def write_nvml_client_rpc(f, function, operations):
-    name = function.name.format()
-    params = ", ".join(format_function_params(function))
-    f.write(f"static nvmlReturn_t lupine_rpc_{name}(conn_t *conn")
-    if params:
-        f.write(f", {params}")
-    f.write(") {\n")
-    f.write("  nvmlReturn_t return_value = rpc_error();\n")
-    for operation in operations:
-        if isinstance(operation, NullTerminatedOperation):
-            f.write(
-                "  {length_type} {name}_len = static_cast<{length_type}>("
-                "std::strlen({name}) + 1);\n".format(
-                    length_type=operation.length_type,
-                    name=operation.parameter.name,
-                )
-            )
-        elif isinstance(operation, NullableOperation) and operation.recv:
-            f.write(
-                "  {type_} {name}_null_check = nullptr;\n".format(
-                    type_=operation.ptr.format(), name=operation.parameter.name
-                )
-            )
-
-    f.write(f"  if (rpc_write_start_request(conn, RPC_{name}) < 0 ||\n")
-    for operation in operations:
-        operation.client_rpc_write(f)
-    f.write("      rpc_wait_for_response(conn) < 0 ||\n")
-    for operation in operations:
-        operation.client_rpc_read(f)
-    f.write("      rpc_read(conn, &return_value, sizeof(return_value)) < 0 ||\n")
-    f.write("      rpc_read_end(conn) < 0) {\n")
-    f.write("    return rpc_error();\n")
-    f.write("  }\n")
-    f.write("  return return_value;\n")
-    f.write("}\n\n")
-
-
-def write_nvml_client_wrapper(f, function, operations, metadata):
-    if metadata.disabled_client:
-        return
-
-    name = function.name.format()
-    params = ", ".join(format_function_params(function))
-    f.write(f'extern "C" nvmlReturn_t {name}({params}) {{\n')
-    write_nvml_client_validation(f, operations)
-
-    call_args = format_call_args(function)
-    if metadata.routing_kind == "ALL":
-        owners = [
-            owner
-            for owner in metadata.record_owners
-            if owner.kind == "NVML_DEVICE"
-        ]
-        if len(owners) != 1 or not isinstance(owners[0].parameter.type, Pointer):
-            raise RuntimeError(
-                f"{name}: ALL-routed NVML lookup requires one NVML_DEVICE output"
-            )
-        output_name = owners[0].parameter.name
-        lambda_args = [
-            "remote_device" if arg == output_name else arg for arg in call_args
-        ]
-        f.write(
-            f"  return lookup_device_on_all_connections({output_name},\n"
-            "      [&](conn_t *conn, nvmlDevice_t *remote_device) {\n"
-            f"        return lupine_rpc_{name}(conn, {', '.join(lambda_args)});\n"
-            "      });\n"
-        )
-    else:
-        if metadata.routing_kind == "NVML_DEVICE":
-            if metadata.routing_parameter is None:
-                raise RuntimeError(f"{name}: NVML_DEVICE routing requires a parameter")
-            route_name = metadata.routing_parameter.name
-            f.write(f"  conn_t *conn = connection_for_device(&{route_name});\n")
-        elif metadata.routing_kind is None:
-            f.write("  conn_t *conn = connection();\n")
-        else:
-            raise RuntimeError(
-                f"{name}: unsupported NVML routing key {metadata.routing_kind}"
-            )
-        suffix = f", {', '.join(call_args)}" if call_args else ""
-        f.write(f"  return lupine_rpc_{name}(conn{suffix});\n")
-    f.write("}\n\n")
-
-
-def write_server_buffer_cleanup(f, owned_buffers, indent):
-    for buffer_name in reversed(owned_buffers):
-        f.write(f"{indent}free((void *){buffer_name});\n")
-
-
-def write_nvml_server_handler(f, function, operations):
-    name = function.name.format()
-    fn_params = ", ".join(
-        parameter.type.format() for parameter in function.parameters
-    )
-    f.write(f"int handle_{name}(conn_t *conn) {{\n")
-    owned_buffers = []
-    for operation in operations:
-        f.write(operation.server_declaration)
-        if (
-            isinstance(operation, DereferenceOperation)
-            and operation.recv
-            and not operation.send
-        ):
-            f.write(f"  {operation.parameter.name} = {{}};\n")
-    f.write("  int request_id;\n")
-    f.write("  nvmlReturn_t return_value;\n")
-    f.write(f"  using fn_t = nvmlReturn_t (*)({fn_params});\n")
-    f.write("  fn_t fn = nullptr;\n")
-    f.write("  if (\n")
-    for operation in operations:
-        if owned_buffer := operation.server_rpc_read(f):
-            owned_buffers.append(owned_buffer)
-    f.write("      false)\n")
-    f.write("    goto ERROR_0;\n\n")
-    f.write("  request_id = rpc_read_end(conn);\n")
-    f.write("  if (request_id < 0)\n")
-    f.write("    goto ERROR_0;\n\n")
-
-    call_args = []
-    for parameter in function.parameters:
-        operation = next(
-            op for op in operations if op.parameter.name == parameter.name
-        )
-        call_args.append(operation.server_reference)
-    f.write(f'  fn = nvml_symbol<fn_t>("{name}");\n')
-    f.write(
-        "  return_value = fn == nullptr ? function_not_found()\n"
-        f"                               : fn({', '.join(call_args)});\n\n"
-    )
-    f.write("  if (rpc_write_start_response(conn, request_id) < 0 ||\n")
-    for operation in operations:
-        operation.server_rpc_write(f)
-    f.write("      rpc_write(conn, &return_value, sizeof(return_value)) < 0 ||\n")
-    f.write("      rpc_write_end(conn) < 0)\n")
-    f.write("    goto ERROR_0;\n")
-    write_server_buffer_cleanup(f, owned_buffers, "  ")
-    f.write("  return 0;\n")
-    f.write("ERROR_0:\n")
-    write_server_buffer_cleanup(f, owned_buffers, "  ")
-    f.write("  return -1;\n")
-    f.write("}\n\n")
-
-
-def collect_hip_functions(annotations: ParsedData):
-    by_name = {
-        function.name.format(): function
-        for function in annotations.namespace.functions
-    }
-    result = []
-    for name in HIP_RPC_FUNCTIONS:
-        function = by_name.get(name)
-        if function is None:
-            raise RuntimeError(f"HIP annotation for {name} not found")
-        metadata = parse_annotation(function.doxygen, function.parameters)
-        result.append((function, function, metadata.operations, metadata))
-    return result
-
-
-def write_hip_client_validation(f, function, operations):
-    checks = []
-    if function.name.format() == "hipDeviceGetName":
-        checks.append("len < 0")
-    for operation in operations:
-        name = operation.parameter.name
-        if isinstance(operation, NullTerminatedOperation) and operation.send:
-            checks.append(f"{name} == nullptr")
-        elif isinstance(operation, DereferenceOperation):
-            checks.append(f"{name} == nullptr")
-        elif isinstance(operation, ArrayOperation):
-            checks.append(
-                f"({operation.transfer_size_expr()} != 0 && {name} == nullptr)"
-            )
-    if checks:
-        f.write("  if (" + " ||\n      ".join(checks) + ") {\n")
-        f.write("    return hipErrorInvalidValue;\n")
-        f.write("  }\n")
-
-
-def write_hip_client_rpc(f, function, operations):
-    name = function.name.format()
-    params = ", ".join(format_function_params(function))
-    f.write(f"static hipError_t lupine_rpc_{name}(conn_t *conn")
-    if params:
-        f.write(f", {params}")
-    f.write(") {\n")
-    f.write("  hipError_t return_value = rpc_error();\n")
-    f.write("  if (conn == nullptr ||\n")
-    f.write(f"      rpc_write_start_request(conn, RPC_{name}) < 0 ||\n")
-    for operation in operations:
-        operation.client_rpc_write(f)
-    f.write("      rpc_wait_for_response(conn) < 0 ||\n")
-    for operation in operations:
-        operation.client_rpc_read(f)
-    f.write("      rpc_read(conn, &return_value, sizeof(return_value)) < 0 ||\n")
-    f.write("      rpc_read_end(conn) < 0) {\n")
-    if name == "hipGetDevicePropertiesR0600":
-        f.write("    prop->hdpMemFlushCntl = nullptr;\n")
-        f.write("    prop->hdpRegFlushCntl = nullptr;\n")
-    f.write("    return rpc_error();\n")
-    f.write("  }\n")
-    if name == "hipGetDevicePropertiesR0600":
-        f.write("  prop->hdpMemFlushCntl = nullptr;\n")
-        f.write("  prop->hdpRegFlushCntl = nullptr;\n")
-    f.write("  return return_value;\n")
-    f.write("}\n\n")
-
-
-def write_hip_client_wrapper(f, function, operations, metadata):
-    if metadata.disabled_client:
-        return
-
-    name = function.name.format()
-    params = ", ".join(format_function_params(function))
-    f.write(f'extern "C" hipError_t {name}({params}) {{\n')
-    write_hip_client_validation(f, function, operations)
-
-    call_args = format_call_args(function)
-    if metadata.routing_kind == "HIP_DEVICE":
-        if metadata.routing_parameter is None:
-            raise RuntimeError(f"{name}: HIP_DEVICE routing requires a parameter")
-        route_name = metadata.routing_parameter.name
-        f.write(f"  conn_t *conn = connection_for_device(&{route_name});\n")
-    elif metadata.routing_kind is None:
-        f.write("  conn_t *conn = connection();\n")
-    else:
-        raise RuntimeError(
-            f"{name}: unsupported HIP routing key {metadata.routing_kind}"
-        )
-    suffix = f", {', '.join(call_args)}" if call_args else ""
-    f.write(f"  return lupine_rpc_{name}(conn{suffix});\n")
-    f.write("}\n\n")
-
-
-def write_hip_server_handler(f, function, operations):
-    name = function.name.format()
-    fn_params = ", ".join(
-        parameter.type.format() for parameter in function.parameters
-    )
-    f.write(f"int handle_{name}(conn_t *conn) {{\n")
-    owned_buffers = []
-    for operation in operations:
-        f.write(operation.server_declaration)
-        if (
-            isinstance(operation, DereferenceOperation)
-            and operation.recv
-            and not operation.send
-        ):
-            if name == "hipGetDevicePropertiesR0600":
-                f.write("  std::memset(&prop, 0, sizeof(prop));\n")
-            else:
-                f.write(f"  {operation.parameter.name} = {{}};\n")
-    f.write("  int request_id;\n")
-    f.write("  hipError_t return_value;\n")
-    f.write(f"  using fn_t = hipError_t (*)({fn_params});\n")
-    f.write("  fn_t fn = nullptr;\n")
-    f.write("  if (\n")
-    for operation in operations:
-        if (
-            name == "hipDeviceGetName"
-            and isinstance(operation, ArrayOperation)
-            and operation.parameter.name == "name"
-        ):
-            # The length is read before the output buffer is allocated. Reject
-            # negative values before signed multiplication can become a huge
-            # allocation or wire size.
-            f.write("      len < 0 ||\n")
-        if owned_buffer := operation.server_rpc_read(f):
-            owned_buffers.append(owned_buffer)
-    f.write("      false)\n")
-    f.write("    goto ERROR_0;\n\n")
-    f.write("  request_id = rpc_read_end(conn);\n")
-    f.write("  if (request_id < 0)\n")
-    f.write("    goto ERROR_0;\n\n")
-
-    call_args = []
-    for parameter in function.parameters:
-        operation = next(
-            op for op in operations if op.parameter.name == parameter.name
-        )
-        call_args.append(operation.server_reference)
-    f.write(f'  fn = hip_symbol<fn_t>("{name}");\n')
-    f.write(
-        "  return_value = fn == nullptr ? function_not_found()\n"
-        f"                               : fn({', '.join(call_args)});\n\n"
-    )
-    if name == "hipGetDevicePropertiesR0600":
-        f.write("  prop.hdpMemFlushCntl = nullptr;\n")
-        f.write("  prop.hdpRegFlushCntl = nullptr;\n\n")
-    f.write("  if (rpc_write_start_response(conn, request_id) < 0 ||\n")
-    for operation in operations:
-        operation.server_rpc_write(f)
-    f.write("      rpc_write(conn, &return_value, sizeof(return_value)) < 0 ||\n")
-    f.write("      rpc_write_end(conn) < 0)\n")
-    f.write("    goto ERROR_0;\n")
-    write_server_buffer_cleanup(f, owned_buffers, "  ")
-    f.write("  return 0;\n")
-    f.write("ERROR_0:\n")
-    write_server_buffer_cleanup(f, owned_buffers, "  ")
-    f.write("  return -1;\n")
-    f.write("}\n\n")
 
 
 HIP_ROOT = (
@@ -1498,7 +990,6 @@ HIP_ROOT = (
 
 # List of possible directories to search for header files
 COMMON_INCLUDE_DIRS = [
-    "./",
     os.path.join(HIP_ROOT, "include"),
     "/usr/local/cuda/include/",
     "/opt/cuda/include/",
@@ -1562,164 +1053,9 @@ def attach_client_call_template(
     metadata.client_call_template = template
 
 
-def main():
-    cuda_header = find_header_file("cuda.h")
-    hip_header = find_header_file("hip_runtime_api.h")
-    annotations_header = find_header_file("annotations.h")
-
-    cuda_include_dir = os.path.dirname(cuda_header)
-    hip_include_dir = os.path.dirname(os.path.dirname(hip_header))
-    options = ParserOptions(
-        preprocessor=make_gcc_preprocessor(
-            defines=["__HIP_PLATFORM_AMD__"],
-            include_paths=[cuda_include_dir, hip_include_dir],
-        ),
-    )
-
-    # Parse the files
-    cuda_ast: ParsedData = parse_file(cuda_header, options=options)
-    annotations: ParsedData = parse_file(annotations_header, options=options)
-    definition_return_types = {
-        function.name.format(): function.return_type.format()
-        for function in annotations.namespace.functions
-        if function.has_body
-    }
-    client_call_templates = collect_client_call_templates(
-        annotations_header, definition_return_types
-    )
-    server_bindings = collect_server_bindings(annotations_header)
-    functions = [
-        function
-        for function in cuda_ast.namespace.functions
-        if function.name.format().startswith("cu")
-        and function.name.format() not in SKIP_FUNCTIONS
-    ]
-
-    functions_with_annotations: list[
-        tuple[Function, Function, list[Operation], FunctionAnnotationMetadata]
-    ] = []
-
-    dupes = {}
-
-    for function in functions:
-        # ensure duplicate functions can't be written
-        if dupes.get(function.name.format()):
-            continue
-
-        dupes[function.name.format()] = True
-
-        try:
-            annotation = next(
-                f for f in annotations.namespace.functions if f.name == function.name
-            )
-        except StopIteration:
-            print(f"Annotation for {function.name} not found")
-            continue
-        try:
-            metadata = parse_annotation(annotation.doxygen, function.parameters)
-        except Exception as e:
-            print(f"Error parsing annotation for {function.name}: {e}")
-            continue
-        attach_client_call_template(function, metadata, client_call_templates)
-        validate_async_annotation(function, metadata)
-        functions_with_annotations.append(
-            (function, annotation, metadata.operations, metadata)
-        )
-
-    # Generate explicitly listed legacy ABI entry points that cuda.h hides
-    # behind macros. A legacy entry point may still use @disabled server when
-    # its server handler needs lifecycle management beyond ordinary marshalling.
-    server_functions_with_annotations = list(functions_with_annotations)
-    server_function_names = {
-        function.name.format()
-        for function, _, _, _ in server_functions_with_annotations
-    }
-    legacy_abi_functions = []
-    annotation_only_server_functions = []
-    for annotation in annotations.namespace.functions:
-        name = annotation.name.format()
-        if (
-            len(name) <= 2
-            or not name.startswith("cu")
-            or not name[2].isupper()
-            or name in server_function_names
-        ):
-            continue
-        directives = annotation_directives(annotation.doxygen)
-        legacy_abi = name in LEGACY_ABI_FUNCTIONS
-        client_disabled = any(
-            directive.startswith("@disabled client")
-            for directive in directives
-        )
-        if not legacy_abi and not client_disabled:
-            continue
-        if not legacy_abi and any(
-            directive == "@disabled"
-            or directive.startswith("@disabled server")
-            for directive in directives
-        ):
-            continue
-        metadata = parse_annotation(annotation.doxygen, annotation.parameters)
-        attach_client_call_template(annotation, metadata, client_call_templates)
-        validate_async_annotation(annotation, metadata)
-        annotated_function = (
-            annotation,
-            annotation,
-            metadata.operations,
-            metadata,
-        )
-        if legacy_abi:
-            if metadata.disabled_client:
-                raise RuntimeError(
-                    f"{name}: legacy ABI function cannot disable the client"
-                )
-            functions_with_annotations.append(annotated_function)
-            legacy_abi_functions.append(annotated_function)
-        server_functions_with_annotations.append(annotated_function)
-        if not legacy_abi:
-            annotation_only_server_functions.append(annotated_function)
-        server_function_names.add(name)
-
-    attached_client_call_templates = {
-        function.name.format()
-        for function, _, _, metadata in functions_with_annotations
-        if metadata.client_call_template is not None
-    }
-    unused_client_call_templates = (
-        set(client_call_templates) - attached_client_call_templates
-    )
-    if unused_client_call_templates:
-        raise RuntimeError(
-            "client call templates do not match generated CUDA functions: "
-            + ", ".join(sorted(unused_client_call_templates))
-        )
-
-    found_legacy_abi_functions = {
-        function.name.format() for function, _, _, _ in legacy_abi_functions
-    }
-    missing_legacy_abi_functions = (
-        LEGACY_ABI_FUNCTIONS - found_legacy_abi_functions
-    )
-    if missing_legacy_abi_functions:
-        raise RuntimeError(
-            "Legacy ABI annotations not found: "
-            + ", ".join(sorted(missing_legacy_abi_functions))
-        )
-
-    nvml_functions_with_annotations = collect_nvml_functions(
-        annotations, server_bindings
-    )
-    hip_functions_with_annotations = collect_hip_functions(annotations)
-
-    annotated_names = sorted(
-        set(annotated_rpc_names(annotations))
-        | {
-            name
-            for name, binding in server_bindings.items()
-            if binding.backend == "CUDA"
-        }
-    )
-
+def write_rpc_ids(
+    functions_with_annotations, annotated_names, hip_functions_with_annotations
+):
     with open("gen_rpc_ids.h", "w") as f:
         f.write("// Generated by codegen.py. Do not edit by hand.\n")
         f.write("// RPC ids are stable 31-bit CRC32 hashes of their operation names.\n\n")
@@ -1730,7 +1066,7 @@ def main():
         def write_rpc_define(macro_name: str, operation_name: str) -> None:
             if macro_name in emitted_macros:
                 return
-            value = rpc_id(operation_name)
+            value = zlib.crc32(operation_name.encode("utf-8")) & 0x7FFFFFFF
             if value in seen_rpc_ids:
                 raise RuntimeError(
                     f"RPC id collision: {operation_name} and {seen_rpc_ids[value]} "
@@ -1751,78 +1087,15 @@ def main():
             write_rpc_define(f"RPC_{name}", name)
         for name in NVML_RPC_FUNCTIONS:
             write_rpc_define(f"RPC_{name}", name)
-        for name in HIP_RPC_FUNCTIONS:
+        for function, _, _, _ in hip_functions_with_annotations:
+            name = function.name.format()
             write_rpc_define(f"RPC_{name}", name)
         f.write("\n")
         for name in PRIVATE_RPC_FUNCTIONS:
             write_rpc_define(f"LUPINE_RPC_{name}", name)
 
-    with open("gen_nvml_client.inc", "w") as f:
-        f.write("// Generated by codegen.py. Do not edit by hand.\n\n")
-        for function, _, operations, metadata in nvml_functions_with_annotations:
-            if metadata.disabled_client:
-                continue
-            write_nvml_client_rpc(f, function, operations)
-            write_nvml_client_wrapper(f, function, operations, metadata)
 
-    with open("gen_nvml_server.inc", "w") as f:
-        f.write("// Generated by codegen.py. Do not edit by hand.\n\n")
-        for function, _, operations, metadata in nvml_functions_with_annotations:
-            if metadata.disabled_server:
-                continue
-            write_nvml_server_handler(f, function, operations)
-
-    with open("gen_nvml_server.h", "w") as f:
-        f.write("// Generated by codegen.py. Do not edit by hand.\n\n")
-        for function, _, _, metadata in nvml_functions_with_annotations:
-            if metadata.disabled_server:
-                continue
-            f.write(f"int handle_{function.name.format()}(conn_t *conn);\n")
-
-    with open("gen_hip_client.inc", "w") as f:
-        f.write("// Generated by codegen.py. Do not edit by hand.\n\n")
-        hip_client_functions = {}
-        for function, _, operations, metadata in hip_functions_with_annotations:
-            if metadata.disabled_client:
-                continue
-            hip_client_functions[function.name.format()] = function
-            write_hip_client_rpc(f, function, operations)
-            write_hip_client_wrapper(f, function, operations, metadata)
-        for alias, target in HIP_MANUAL_REMAPPINGS:
-            if alias in hip_client_functions:
-                continue
-            target_function = hip_client_functions.get(target)
-            if target_function is None:
-                continue
-            f.write(f"#ifdef {alias}\n#undef {alias}\n#endif\n")
-            f.write(
-                'extern "C" {return_type} {alias}({params}) {{\n'.format(
-                    return_type=target_function.return_type.format(),
-                    alias=alias,
-                    params=", ".join(format_function_params(target_function)),
-                )
-            )
-            f.write(
-                "  return {target}({args});\n}}\n\n".format(
-                    target=target,
-                    args=", ".join(format_call_args(target_function)),
-                )
-            )
-
-    with open("gen_hip_server.inc", "w") as f:
-        f.write("// Generated by codegen.py. Do not edit by hand.\n\n")
-        for function, _, operations, metadata in hip_functions_with_annotations:
-            if metadata.disabled_server:
-                continue
-            write_hip_server_handler(f, function, operations)
-
-    with open("gen_hip_server.h", "w") as f:
-        f.write("// Generated by codegen.py. Do not edit by hand.\n\n")
-        for function, _, _, metadata in hip_functions_with_annotations:
-            if metadata.disabled_server:
-                continue
-            f.write(f"int handle_{function.name.format()}(conn_t *conn);\n")
-
+def write_cuda_client(functions_with_annotations, legacy_abi_functions):
     with open("gen_cuda_client.cpp", "w") as f:
         f.write(
             "#include <cuda.h>\n"
@@ -1896,12 +1169,10 @@ def main():
         for function, _, _, _ in legacy_abi_functions:
             name = function.name.format()
             f.write(f"#ifdef {name}\n#undef {name}\n#endif\n")
+            params = ", ".join(format_function_params(function))
             f.write(
-                'extern "C" {return_type} CUDAAPI {name}({params});\n\n'.format(
-                    return_type=function.return_type.format(),
-                    name=name,
-                    params=", ".join(format_function_params(function)),
-                )
+                f'extern "C" {function.return_type.format()} CUDAAPI '
+                f"{name}({params});\n\n"
             )
         for function, annotation, operations, metadata in functions_with_annotations:
             # We don't generate client function definitions for client-disabled
@@ -1914,13 +1185,7 @@ def main():
 
             joined_params = ", ".join(format_function_params(function))
 
-            f.write(
-                "{return_type} {name}({params})\n".format(
-                    return_type=function.return_type.format(),
-                    name=function.name.format(),
-                    params=joined_params,
-                )
-            )
+            f.write(f"{function.return_type.format()} {function.name.format()}({joined_params})\n")
             f.write("{\n")
 
             all_output = metadata.routing_parameter
@@ -1963,20 +1228,16 @@ def main():
                     f"            {all_output.type.format()} {output_name} = route_output;\n"
                 )
             else:
-                f.write(
-                    "    lupine_route route = {route_expr};\n".format(
-                        route_expr=client_routing_route_expr(metadata)
-                    )
+                route_expr = client_routing_key_expr(
+                    metadata.routing_kind, metadata.routing_parameter, metadata
                 )
+                f.write(f"    lupine_route route = {route_expr};\n")
                 if metadata.routing_kind == "DEVICE":
                     f.write("    if (route.kind == LUPINE_ROUTE_UNKNOWN_DEVICE)\n")
-                    f.write(
-                        "        return {error_return};\n".format(
-                            error_return=invalid_device_const(
-                                function.return_type.format()
-                            )
-                        )
+                    invalid = result_code(
+                        function.return_type.format(), "invalid_device"
                     )
+                    f.write(f"        return {invalid};\n")
             if metadata.cross_server_copy is not None:
                 copy = metadata.cross_server_copy
                 stream_arg = (
@@ -1992,29 +1253,21 @@ def main():
                     )
                 )
                 f.write(
-                    "        return lupine_cuMemcpyDtoD_via_client({dst}, {src}, {bytes}, {stream}, {async_});\n".format(
-                        dst=copy.dst.name,
-                        src=copy.src.name,
-                        bytes=copy.bytes.name,
-                        stream=stream_arg,
-                        async_=async_arg,
-                    )
+                    "        return lupine_cuMemcpyDtoD_via_client("
+                    f"{copy.dst.name}, {copy.src.name}, {copy.bytes.name}, "
+                    f"{stream_arg}, {async_arg});\n"
                 )
                 f.write("    }\n")
             if metadata.client_call_template is not None:
-                write_client_template_section(
-                    f, metadata.client_call_template.before_call
+                f.write(
+                    textwrap.indent(metadata.client_call_template.before_call, "    ")
                 )
-            f.write(
-                "    {return_type} return_value;\n".format(
-                    return_type=function.return_type.format()
-                )
+            f.write(f"    {function.return_type.format()} return_value;\n")
+            call_args = ", ".join(
+                param.name for param in function.parameters if param.name
             )
-            call_args = ", ".join(client_call_args(function, metadata))
             helper_args = f", {call_args}" if call_args else ""
-            local_call = 'lupine_call_real_cuda_fn("{name}"{args})'.format(
-                name=function.name.format(), args=helper_args
-            )
+            local_call = f'lupine_call_real_cuda_fn("{function.name.format()}"{helper_args})'
             local_post_call = io.StringIO()
             write_client_post_call(local_post_call, metadata)
             if local_post_call.getvalue():
@@ -2044,18 +1297,9 @@ def main():
 
             for operation in operations:
                 if isinstance(operation, NullTerminatedOperation) and operation.send:
-                    f.write(
-                        "    std::size_t {param_name}_len = std::strlen({param_name}) + 1;\n".format(
-                            param_name=operation.parameter.name
-                        )
-                    )
+                    f.write(f"    std::size_t {operation.parameter.name}_len = std::strlen({operation.parameter.name}) + 1;\n")
                 if isinstance(operation, NullableOperation) and operation.recv:
-                    f.write(
-                        "    {server_type} {param_name}_null_check;\n".format(
-                            server_type=operation.ptr.format(),
-                            param_name=operation.parameter.name,
-                        )
-                    )
+                    f.write(f"    {operation.ptr.format()} {operation.parameter.name}_null_check;\n")
 
             # Reject invalid send buffers before lupine_prepare_rpc() flushes
             # pending writes and rpc_write_start_request() acquires the
@@ -2065,28 +1309,29 @@ def main():
             for operation in operations:
                 if isinstance(operation, ArrayOperation):
                     operation.client_preflight(
-                        f, invalid_argument_const(function.return_type.format())
+                        f, result_code(function.return_type.format(), "invalid_argument")
                     )
                 elif (
                     isinstance(operation, NullTerminatedOperation)
                     and operation.recv
                 ):
                     operation.client_preflight(
-                        f, invalid_argument_const(function.return_type.format())
+                        f, result_code(function.return_type.format(), "invalid_argument")
                     )
 
             if metadata.async_fire_forget:
-                error_return = error_const(function.return_type.format())
+                error_return = result_code(function.return_type.format())
                 f.write(
-                    "    if (lupine_prepare_rpc(conn) < 0 ||\n"
-                    "        rpc_write_start_request(conn, RPC_{name}) < 0 ||\n".format(
-                        name=function.name.format()
-                    )
+                    f"    uint64_t async_sequence = 0;\n"
+                    f"    if (lupine_prepare_rpc(conn) < 0 ||\n"
+                    f"        rpc_write_start_async_request(\n"
+                    f"            conn, RPC_{function.name.format()}, &async_sequence) < 0 ||\n"
+                    f"        rpc_write(conn, &async_sequence, sizeof(async_sequence)) < 0 ||\n"
                 )
                 for operation in operations:
-                    write_client_rpc_write(f, operation, metadata)
+                    operation.client_rpc_write(f)
                 f.write("        rpc_write_end(conn) < 0) {\n")
-                f.write("        return {r};\n".format(r=error_return))
+                f.write(f"        return {error_return};\n")
                 f.write("    }\n")
                 post_call = io.StringIO()
                 write_client_post_call(post_call, metadata)
@@ -2102,14 +1347,12 @@ def main():
                 continue
 
             f.write(
-                "    if (lupine_prepare_rpc(conn) < 0 ||\n"
-                "        rpc_write_start_request(conn, RPC_{name}) < 0 ||\n".format(
-                    name=function.name.format()
-                )
+                f"    if (lupine_prepare_rpc(conn) < 0 ||\n"
+                f"        rpc_write_start_request(conn, RPC_{function.name.format()}) < 0 ||\n"
             )
 
             for operation in operations:
-                write_client_rpc_write(f, operation, metadata)
+                operation.client_rpc_write(f)
 
             f.write("        rpc_wait_for_response(conn) < 0 ||\n")
 
@@ -2121,17 +1364,9 @@ def main():
             for operation in operations:
                 operation.client_rpc_read(f)
 
-            f.write(
-                "        rpc_read(conn, &return_value, sizeof({return_type})) < 0 ||\n".format(
-                    return_type=function.return_type.format()
-                )
-            )
+            f.write(f"        rpc_read(conn, &return_value, sizeof({function.return_type.format()})) < 0 ||\n")
             f.write("        rpc_read_end(conn) < 0)\n")
-            f.write(
-                "        return {error_return};\n".format(
-                    error_return=error_const(function.return_type.format())
-                )
-            )
+            f.write(f"        return {result_code(function.return_type.format())};\n")
 
             for operation in operations:
                 if isinstance(operation, NullTerminatedOperation) and operation.recv:
@@ -2171,7 +1406,7 @@ def main():
             if alias in function_by_name or target not in function_by_name:
                 continue
             target_function = function_by_name[target]
-            f.write("#ifdef {name}\n#undef {name}\n#endif\n".format(name=alias))
+            f.write(f"#ifdef {alias}\n#undef {alias}\n#endif\n")
             f.write(
                 'extern "C" {return_type} {name}({params})\n'.format(
                     return_type=target_function.return_type.format(),
@@ -2185,16 +1420,13 @@ def main():
                 args=", ".join(format_call_args(target_function)),
             )
             if target_function.return_type.format() == "void":
-                f.write("    {call};\n".format(call=call))
+                f.write(f"    {call};\n")
                 f.write("}\n\n")
             else:
-                f.write("    return {call};\n".format(call=call))
+                f.write(f"    return {call};\n")
                 f.write("}\n\n")
         f.write("std::unordered_map<std::string, void *> functionMap = {\n")
         for function, _, _, metadata in functions_with_annotations:
-            if metadata.disabled_client and metadata.disabled_server:
-                continue
-
             if metadata.guard is not None:
                 f.write(f"#if {metadata.guard}\n")
             f.write(
@@ -2242,6 +1474,13 @@ def main():
         f.write("    return it->second;\n")
         f.write("}\n")
 
+
+def write_cuda_server(
+    server_functions_with_annotations,
+    legacy_abi_functions,
+    server_bindings,
+    annotation_only_server_functions,
+):
     with open("gen_cuda_server.cpp", "w") as f:
         f.write(
             "#include <iostream>\n"
@@ -2262,130 +1501,295 @@ def main():
         for function, _, _, _ in annotation_only_functions:
             name = function.name.format()
             f.write(f"#ifdef {name}\n#undef {name}\n#endif\n")
+            params = ", ".join(format_function_params(function))
             f.write(
-                'extern "C" {return_type} CUDAAPI {name}({params});\n\n'.format(
-                    return_type=function.return_type.format(),
-                    name=name,
-                    params=", ".join(format_function_params(function)),
-                )
+                f'extern "C" {function.return_type.format()} CUDAAPI '
+                f"{name}({params});\n\n"
             )
-        for (
-            function,
+        for function, _, operations, metadata in server_functions_with_annotations:
+            if metadata.disabled_server or function.name.format() in server_bindings:
+                continue
+            write_server_handler(f, CUDA, function, operations, metadata)
+
+
+def write_registry(registry_entries, guarded_declarations, guarded_handlers):
+    with open("registry.cpp", "w") as f:
+        f.write(
+            REGISTRY_CPP_TEMPLATE.substitute(
+                cuda_registry_entries=" \\\n".join(registry_entries["CUDA"]),
+                nvml_registry_entries=" \\\n".join(registry_entries["NVML"]),
+                hip_registry_entries=" \\\n".join(registry_entries["HIP"]),
+                cuda_guarded_declarations="\n".join(
+                    guarded_declarations["CUDA"]
+                ),
+                nvml_guarded_declarations="\n".join(
+                    guarded_declarations["NVML"]
+                ),
+                hip_guarded_declarations="\n".join(
+                    guarded_declarations["HIP"]
+                ),
+                cuda_guarded_handlers="\n".join(guarded_handlers["CUDA"]),
+                nvml_guarded_handlers="\n".join(guarded_handlers["NVML"]),
+                hip_guarded_handlers="\n".join(guarded_handlers["HIP"]),
+            )
+        )
+
+
+def main():
+    cuda_header = find_header_file("cuda.h")
+    hip_header = find_header_file("hip_runtime_api.h")
+
+    cuda_include_dir = os.path.dirname(cuda_header)
+    hip_include_dir = os.path.dirname(os.path.dirname(hip_header))
+    options = ParserOptions(
+        preprocessor=make_gcc_preprocessor(
+            defines=["__HIP_PLATFORM_AMD__"],
+            include_paths=[cuda_include_dir, hip_include_dir],
+        ),
+    )
+
+    # Parse the files
+    cuda_ast: ParsedData = parse_file(cuda_header, options=options)
+    annotations_by_target = {
+        target: parse_file(path, options=options)
+        for target, path in ANNOTATION_FILES.items()
+    }
+    cuda_annotations = annotations_by_target["cuda"]
+    annotations = SimpleNamespace(
+        namespace=SimpleNamespace(
+            functions=[
+                function
+                for parsed in annotations_by_target.values()
+                for function in parsed.namespace.functions
+            ]
+        )
+    )
+    definition_return_types = {
+        function.name.format(): function.return_type.format()
+        for function in cuda_annotations.namespace.functions
+        if function.has_body
+    }
+    client_call_templates = collect_client_call_templates(
+        ANNOTATION_FILES["cuda"], definition_return_types
+    )
+    server_bindings = {}
+    # A handler belongs to the backend whose annotation file declares it.
+    for target, path in ANNOTATION_FILES.items():
+        for name, binding in collect_server_bindings(path, target.upper()).items():
+            if name in server_bindings and server_bindings[name] != binding:
+                raise RuntimeError(f"Conflicting @disabled for {name}")
+            server_bindings[name] = binding
+    functions = [
+        function
+        for function in cuda_ast.namespace.functions
+        if function.name.format().startswith("cu")
+        and function.name.format() not in SKIP_FUNCTIONS
+    ]
+
+    functions_with_annotations: list[
+        tuple[Function, Function, list[Operation], FunctionAnnotationMetadata]
+    ] = []
+
+    dupes = {}
+
+    for function in functions:
+        # ensure duplicate functions can't be written
+        if dupes.get(function.name.format()):
+            continue
+
+        dupes[function.name.format()] = True
+
+        try:
+            annotation = next(
+                f for f in annotations.namespace.functions if f.name == function.name
+            )
+        except StopIteration:
+            print(f"Annotation for {function.name} not found")
+            continue
+        try:
+            metadata = parse_annotation(annotation.doxygen, function.parameters)
+        except Exception as e:
+            print(f"Error parsing annotation for {function.name}: {e}")
+            continue
+        attach_client_call_template(function, metadata, client_call_templates)
+        validate_async_annotation(function, metadata)
+        functions_with_annotations.append(
+            (function, annotation, metadata.operations, metadata)
+        )
+
+    # Generate explicitly listed legacy ABI entry points that cuda.h hides
+    # behind macros. A legacy entry point may still use @disabled server when
+    # its server handler needs lifecycle management beyond ordinary marshalling.
+    server_functions_with_annotations = list(functions_with_annotations)
+    server_function_names = {
+        function.name.format()
+        for function, _, _, _ in server_functions_with_annotations
+    }
+    legacy_abi_functions = []
+    annotation_only_server_functions = []
+    for annotation in cuda_annotations.namespace.functions:
+        name = annotation.name.format()
+        if name in server_function_names:
+            continue
+        directives = annotation_directives(annotation.doxygen)
+        legacy_abi = name in LEGACY_ABI_FUNCTIONS
+        client_disabled = any(
+            directive.startswith("@disabled client")
+            for directive in directives
+        )
+        if not legacy_abi and not client_disabled:
+            continue
+        if not legacy_abi and any(
+            directive.startswith("@disabled")
+            and not directive.startswith("@disabled client")
+            for directive in directives
+        ):
+            continue
+        metadata = parse_annotation(annotation.doxygen, annotation.parameters)
+        attach_client_call_template(annotation, metadata, client_call_templates)
+        validate_async_annotation(annotation, metadata)
+        annotated_function = (
             annotation,
-            operations,
+            annotation,
+            metadata.operations,
             metadata,
-        ) in server_functions_with_annotations:
-            if (
-                metadata.disabled_server
-                or function.name.format() in server_bindings
-            ):
+        )
+        if legacy_abi:
+            if metadata.disabled_client:
+                raise RuntimeError(
+                    f"{name}: legacy ABI function cannot disable the client"
+                )
+            functions_with_annotations.append(annotated_function)
+            legacy_abi_functions.append(annotated_function)
+        server_functions_with_annotations.append(annotated_function)
+        if not legacy_abi:
+            annotation_only_server_functions.append(annotated_function)
+        server_function_names.add(name)
+
+    attached_client_call_templates = {
+        function.name.format()
+        for function, _, _, metadata in functions_with_annotations
+        if metadata.client_call_template is not None
+    }
+    unused_client_call_templates = (
+        set(client_call_templates) - attached_client_call_templates
+    )
+    if unused_client_call_templates:
+        raise RuntimeError(
+            "client call templates do not match generated CUDA functions: "
+            + ", ".join(sorted(unused_client_call_templates))
+        )
+
+    found_legacy_abi_functions = {
+        function.name.format() for function, _, _, _ in legacy_abi_functions
+    }
+    missing_legacy_abi_functions = (
+        LEGACY_ABI_FUNCTIONS - found_legacy_abi_functions
+    )
+    if missing_legacy_abi_functions:
+        raise RuntimeError(
+            "Legacy ABI annotations not found: "
+            + ", ".join(sorted(missing_legacy_abi_functions))
+        )
+
+    nvml_functions_with_annotations = collect_backend_functions(
+        annotations_by_target["nvml"],
+        NVML_RPC_FUNCTIONS,
+        server_bindings,
+        # NVML's protocol predates the size_t string lengths CUDA RPC uses.
+        string_length_type="unsigned int",
+    )
+    hip_functions_with_annotations = collect_backend_functions(
+        annotations_by_target["hip"]
+    )
+
+    annotated_names = sorted(
+        {function.name.format() for function in cuda_annotations.namespace.functions}
+        | {
+            name
+            for name, binding in server_bindings.items()
+            if binding.backend == "CUDA"
+        }
+    )
+
+    write_rpc_ids(
+        functions_with_annotations, annotated_names, hip_functions_with_annotations
+    )
+
+    with open("gen_nvml_client.inc", "w") as f:
+        f.write("// Generated by codegen.py. Do not edit by hand.\n\n")
+        for function, _, operations, metadata in nvml_functions_with_annotations:
+            if metadata.disabled_client:
                 continue
+            write_client_rpc(f, NVML, function, operations, metadata)
+            write_client_wrapper(f, NVML, function, operations, metadata)
 
-            if metadata.guard is not None:
-                f.write(f"#if {metadata.guard}\n")
+    with open("gen_nvml_server.inc", "w") as f:
+        f.write("// Generated by codegen.py. Do not edit by hand.\n\n")
+        for function, _, operations, metadata in nvml_functions_with_annotations:
+            if metadata.disabled_server:
+                continue
+            write_server_handler(f, NVML, function, operations, metadata)
 
-            # parse the annotation doxygen
+    with open("gen_nvml_server.h", "w") as f:
+        f.write("// Generated by codegen.py. Do not edit by hand.\n\n")
+        for function, _, _, metadata in nvml_functions_with_annotations:
+            if metadata.disabled_server:
+                continue
+            f.write(f"int handle_{function.name.format()}(conn_t *conn);\n")
+
+    with open("gen_hip_client.inc", "w") as f:
+        f.write("// Generated by codegen.py. Do not edit by hand.\n\n")
+        hip_client_functions = {}
+        for function, _, operations, metadata in hip_functions_with_annotations:
+            if metadata.disabled_client:
+                continue
+            hip_client_functions[function.name.format()] = function
+            write_client_rpc(f, HIP, function, operations, metadata)
+            write_client_wrapper(f, HIP, function, operations, metadata)
+        for alias, target in HIP_MANUAL_REMAPPINGS:
+            if alias in hip_client_functions:
+                continue
+            target_function = hip_client_functions.get(target)
+            if target_function is None:
+                continue
+            f.write(f"#ifdef {alias}\n#undef {alias}\n#endif\n")
             f.write(
-                "int handle_{name}(conn_t *conn)\n".format(
-                    name=function.name.format(),
+                'extern "C" {return_type} {alias}({params}) {{\n'.format(
+                    return_type=target_function.return_type.format(),
+                    alias=alias,
+                    params=", ".join(format_function_params(target_function)),
                 )
             )
-            f.write("{\n")
-
-            owned_buffers = []
-
-            for operation in operations:
-                f.write(operation.server_declaration)
-
-            f.write("    int request_id;\n")
-
-            # we only generate return from non-void types
-            if metadata.async_fire_forget:
-                pass
-            elif function.return_type.format() != "void":
-                f.write(
-                    "    {return_type} lupine_intercept_result;\n".format(
-                        return_type=function.return_type.format()
-                    )
-                )
-            else:
-                f.write("    void* lupine_intercept_result;\n")
-
-            f.write("    if (\n")
-            for operation in operations:
-                if owned_buffer := operation.server_rpc_read(f):
-                    owned_buffers.append(owned_buffer)
-            f.write("        false)\n")
-            f.write("        goto ERROR_0;\n")
-
-            f.write("\n")
-
-            f.write("    request_id = rpc_read_end(conn);\n")
-            f.write("    if (request_id < 0)\n")
-            f.write("        goto ERROR_0;\n")
-
-            if metadata.graph_exec_node is not None:
-                graph_exec = metadata.graph_exec_node.graph_exec.name
-                node = metadata.graph_exec_node.node.name
-                f.write(
-                    f"    {node} = lupine_htod_graph_exec_node({graph_exec}, {node});\n"
-                )
-
-            params: list[str] = []
-            # these need to be in function param order, not operation order.
-            for param in function.parameters:
-                for op in operations:
-                    if op.parameter.name == param.name:
-                        params.append(op.server_reference)
-
-            if metadata.async_fire_forget or function.return_type.format() == "void":
-                f.write(
-                    "    {name}({params});\n\n".format(
-                        name=server_call_name(function.name.format()),
-                        params=", ".join(params),
-                    )
-                )
-            else:
-                f.write(
-                    "    lupine_intercept_result = {name}({params});\n\n".format(
-                        name=server_call_name(function.name.format()),
-                        params=", ".join(params),
-                    )
-                )
-
-            if metadata.async_fire_forget:
-                write_server_buffer_cleanup(f, owned_buffers, "    ")
-                f.write("    return 0;\n")
-                f.write("ERROR_0:\n")
-                write_server_buffer_cleanup(f, owned_buffers, "    ")
-                f.write("    return -1;\n")
-                f.write("}\n\n")
-                if metadata.guard is not None:
-                    f.write("#endif\n\n")
-                continue
-
-            f.write("    if (rpc_write_start_response(conn, request_id) < 0 ||\n")
-
-            for operation in operations:
-                operation.server_rpc_write(f)
-
             f.write(
-                "        rpc_write(conn, &lupine_intercept_result, sizeof({return_type})) < 0 ||\n".format(
-                    return_type=function.return_type.format()
+                "  return {target}({args});\n}}\n\n".format(
+                    target=target,
+                    args=", ".join(format_call_args(target_function)),
                 )
             )
-            f.write("        rpc_write_end(conn) < 0)\n")
-            f.write("        goto ERROR_0;\n")
-            f.write("\n")
-            write_server_buffer_cleanup(f, owned_buffers, "    ")
-            f.write("    return 0;\n")
 
-            f.write("ERROR_0:\n")
-            write_server_buffer_cleanup(f, owned_buffers, "    ")
-            f.write("    return -1;\n")
-            f.write("}\n\n")
-            if metadata.guard is not None:
-                f.write("#endif\n\n")
+    with open("gen_hip_server.inc", "w") as f:
+        f.write("// Generated by codegen.py. Do not edit by hand.\n\n")
+        for function, _, operations, metadata in hip_functions_with_annotations:
+            if metadata.disabled_server:
+                continue
+            write_server_handler(f, HIP, function, operations, metadata)
+
+    with open("gen_hip_server.h", "w") as f:
+        f.write("// Generated by codegen.py. Do not edit by hand.\n\n")
+        for function, _, _, metadata in hip_functions_with_annotations:
+            if metadata.disabled_server:
+                continue
+            f.write(f"int handle_{function.name.format()}(conn_t *conn);\n")
+
+    write_cuda_client(functions_with_annotations, legacy_abi_functions)
+
+    write_cuda_server(
+        server_functions_with_annotations,
+        legacy_abi_functions,
+        server_bindings,
+        annotation_only_server_functions,
+    )
 
     generated_bindings = [
         ServerBinding(
@@ -2403,11 +1807,17 @@ def main():
         for name in NVML_RPC_FUNCTIONS
         if name not in server_bindings
     )
+    generated_bindings.extend(
+        ServerBinding(function.name.format(), "HIP", f"handle_{function.name.format()}")
+        for function, _, _, metadata in hip_functions_with_annotations
+        if not metadata.disabled_server
+        and function.name.format() not in server_bindings
+    )
     bindings = list(server_bindings.values()) + generated_bindings
 
     operations_by_id = {}
     for binding in bindings:
-        operation = rpc_id(binding.name)
+        operation = zlib.crc32(binding.name.encode("utf-8")) & 0x7FFFFFFF
         if operation in operations_by_id:
             raise RuntimeError(
                 f"Duplicate RPC operation for {operations_by_id[operation]} "
@@ -2444,26 +1854,7 @@ def main():
                 f'#endif'
             )
 
-    with open("registry.cpp", "w") as f:
-        f.write(
-            REGISTRY_CPP_TEMPLATE.substitute(
-                cuda_registry_entries=" \\\n".join(registry_entries["CUDA"]),
-                nvml_registry_entries=" \\\n".join(registry_entries["NVML"]),
-                hip_registry_entries=" \\\n".join(registry_entries["HIP"]),
-                cuda_guarded_declarations="\n".join(
-                    guarded_declarations["CUDA"]
-                ),
-                nvml_guarded_declarations="\n".join(
-                    guarded_declarations["NVML"]
-                ),
-                hip_guarded_declarations="\n".join(
-                    guarded_declarations["HIP"]
-                ),
-                cuda_guarded_handlers="\n".join(guarded_handlers["CUDA"]),
-                nvml_guarded_handlers="\n".join(guarded_handlers["NVML"]),
-                hip_guarded_handlers="\n".join(guarded_handlers["HIP"]),
-            )
-        )
+    write_registry(registry_entries, guarded_declarations, guarded_handlers)
 
     subprocess.run(
         [
@@ -2523,7 +1914,7 @@ if __name__ == "__main__":
         help="verify existing generated files without loading backend SDK headers",
     )
     args = parser.parse_args()
-    # Inputs (annotations.h) and gen_* outputs are CWD-relative.
+    # Annotation inputs and gen_* outputs are CWD-relative.
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     if args.verify_backend:
         verify_backend_boundaries(args.verify_backend)

@@ -7,17 +7,15 @@
 // RPC/non-RPC split is decided by the request route, not the HTTP version:
 // this file only detects the framing.
 //
-// Reads block without an application deadline. Dispatch runs inside the
-// per-connection child, so a stalled peer only occupies its own child until
-// the keepalive options from lupine_socket_apply_transport_options declare
-// the peer dead and recv fails.
+// Protocol detection blocks until enough bytes arrive to classify the
+// connection. Once classified as HTTP/1.x, reads and writes use a short
+// application deadline so a stalled scrape only occupies its own child briefly.
 
 #include "dispatch.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cstring>
-#include <fstream>
 #include <string>
 #include <thread>
 #include <utility>
@@ -41,11 +39,10 @@ ssize_t peek_bytes(lupine_socket_t fd, unsigned char *data, size_t size) {
 #endif
 }
 
-bool send_all(lupine_socket_t fd, const std::string &data) {
+bool send_all(lupine_socket_t fd, const char *data, size_t size) {
   size_t offset = 0;
-  while (offset < data.size()) {
-    struct iovec buffer = {const_cast<char *>(data.data()) + offset,
-                           data.size() - offset};
+  while (offset < size) {
+    struct iovec buffer = {const_cast<char *>(data) + offset, size - offset};
     ssize_t sent = lupine_socket_sendv(fd, &buffer, 1);
     if (sent <= 0) {
       return false;
@@ -53,6 +50,10 @@ bool send_all(lupine_socket_t fd, const std::string &data) {
     offset += static_cast<size_t>(sent);
   }
   return true;
+}
+
+bool send_all(lupine_socket_t fd, const std::string &data) {
+  return send_all(fd, data.data(), data.size());
 }
 
 using http_header = std::pair<std::string, std::string>;
@@ -90,30 +91,41 @@ std::string http1_headers(int status, const char *reason,
 std::string http1_response(int status, const char *reason,
                            const std::string &body, bool include_body,
                            const rpc_http2_server_metadata *metadata,
-                           const std::vector<http_header> &headers = {}) {
+                           const std::vector<http_header> &headers = {},
+                           const char *content_type = "text/plain") {
   std::string response = http1_headers(status, reason, body.size(),
-                                       "text/plain", headers, metadata);
+                                       content_type, headers, metadata);
   if (include_body) {
     response += body;
   }
   return response;
 }
 
-bool send_file(lupine_socket_t fd, const std::string &path) {
-  std::ifstream input(path, std::ios::binary);
-  if (!input) {
-    return false;
-  }
-  char data[64 * 1024];
-  while (input) {
-    input.read(data, sizeof(data));
-    std::streamsize size = input.gcount();
-    if (size > 0 &&
-        !send_all(fd, std::string(data, static_cast<size_t>(size)))) {
+void set_http_timeout(lupine_socket_t fd) {
+#ifdef _WIN32
+  DWORD timeout = 2000;
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
+             reinterpret_cast<const char *>(&timeout), sizeof(timeout));
+  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO,
+             reinterpret_cast<const char *>(&timeout), sizeof(timeout));
+#else
+  timeval timeout = {2, 0};
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+#endif
+}
+
+bool send_bundle(lupine_socket_t fd,
+                 const lupine_client_bundle_payload &bundle) {
+  size_t sent = 0;
+  for (size_t i = 0; i < bundle.chunk_count; ++i) {
+    const lupine_client_bundle_chunk &chunk = bundle.chunks[i];
+    if (chunk.data == nullptr || !send_all(fd, chunk.data, chunk.size)) {
       return false;
     }
+    sent += chunk.size;
   }
-  return input.eof();
+  return sent == bundle.size;
 }
 
 std::string ascii_lower(std::string value) {
@@ -169,10 +181,11 @@ int serve_client_bundle(lupine_socket_t fd, const std::string &method,
   if (!lupine_client_bundle_request_platform(path, &platform)) {
     return 0;
   }
-  lupine_client_bundle bundle;
-  const char *root =
-      metadata == nullptr ? nullptr : metadata->client_bundle_dir;
-  if (!lupine_client_bundle_lookup(root, platform, &bundle)) {
+  const lupine_client_bundle_registry *registry =
+      metadata == nullptr ? nullptr : metadata->client_bundles;
+  const lupine_client_bundle_payload *bundle =
+      lupine_client_bundle_lookup(registry, platform);
+  if (bundle == nullptr) {
     send_all(fd,
              http1_response(503, "Service Unavailable",
                             "client bundle unavailable\n", !head, metadata));
@@ -180,26 +193,28 @@ int serve_client_bundle(lupine_socket_t fd, const std::string &method,
   }
 
   std::vector<http_header> headers = {
-      {"etag", bundle.etag},
-      {"content-digest", bundle.content_digest},
+      {"etag", bundle->etag},
+      {"content-digest", bundle->content_digest},
       {"cache-control", "no-cache"},
   };
-  if (request_header(request, "if-none-match") == bundle.etag) {
+  if (request_header(request, "if-none-match") == bundle->etag) {
     return send_all(fd, http1_headers(304, "Not Modified", 0, nullptr, headers,
                                       metadata))
                ? 1
                : -1;
   }
 
-  if (!send_all(fd, http1_headers(200, "OK", bundle.size,
+  if (!send_all(fd, http1_headers(200, "OK", bundle->size,
                                   "application/vnd.lupine.client-bundle.v1+zip",
                                   headers, metadata))) {
     return -1;
   }
-  return head || send_file(fd, bundle.path) ? 1 : -1;
+  return head || send_bundle(fd, *bundle) ? 1 : -1;
 }
 
-int serve_http1(lupine_socket_t fd, const rpc_http2_server_metadata *metadata) {
+int serve_http1(lupine_socket_t fd, const rpc_http2_server_metadata *metadata,
+                lupine_metrics_handler metrics) {
+  set_http_timeout(fd);
   std::string request;
   while (request.find("\r\n\r\n") == std::string::npos) {
     if (request.size() >= kMaxHttp1RequestBytes) {
@@ -241,6 +256,10 @@ int serve_http1(lupine_socket_t fd, const rpc_http2_server_metadata *metadata) {
   bool head = method == "HEAD";
   if (path == "/" && (head || method == "GET")) {
     send_all(fd, http1_response(200, "OK", "lupine\n", !head, metadata));
+  } else if (metrics != nullptr && method == "GET" &&
+             (path == "/metrics" || path.rfind("/metrics?", 0) == 0)) {
+    send_all(fd, http1_response(200, "OK", metrics(), true, metadata, {},
+                                "text/plain; version=0.0.4; charset=utf-8"));
   } else {
     send_all(fd,
              http1_response(404, "Not Found", "not found\n", !head, metadata));
@@ -259,7 +278,8 @@ int lupine_h2_preface_check(const unsigned char *data, size_t len) {
 }
 
 int lupine_connection_dispatch(lupine_socket_t connfd,
-                               const rpc_http2_server_metadata *metadata) {
+                               const rpc_http2_server_metadata *metadata,
+                               lupine_metrics_handler metrics) {
   for (;;) {
     unsigned char data[kH2PrefaceLength];
     ssize_t received = peek_bytes(connfd, data, sizeof(data));
@@ -274,7 +294,7 @@ int lupine_connection_dispatch(lupine_socket_t connfd,
       return 0;
     }
     if (verdict < 0) {
-      return serve_http1(connfd, metadata);
+      return serve_http1(connfd, metadata, metrics);
     }
     // A preface prefix shorter than 24 bytes: the bytes stay queued because
     // of MSG_PEEK, so another blocking peek returns immediately. Sleep

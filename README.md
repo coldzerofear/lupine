@@ -3,42 +3,6 @@
 LUPINE is a GPU over IP bridge allowing GPUs on remote machines to be attached
 to CPU-only machines.
 
-## Hosted Demo
-
-Connect to a hosted demo server with a T4 attached for free. This might take a while if there's no GPU
-currently provisioned, but subsequent requests should be faster.
-
-```
-$ docker run --rm \
-  -e LUPINE_SERVER=demo.lupinemachines.com:14833 \
-  ghcr.io/lupinemachines/lupine-client:cuda-13.3.1-ubuntu24.04 \
-  nvidia-smi -L
-GPU 0: Tesla T4 (via lupine demo.lupinemachines.com) (UUID: GPU-b80ae1b9-863f-8f91-7c63-d351fabff035)
-```
-
-Python applications can opt into that endpoint without adding LUPINE API
-calls:
-
-```sh
-pip install "lupine[auto]"
-python existing_torch_program.py
-```
-
-The startup hook preserves an explicit `LUPINE_SERVER`; set
-`LUPINE_AUTO=0` to disable it for a process. It does not change
-`LUPINE_DISABLE_LOCAL`.
-
-## macOS client
-
-The LUPINE server publishes universal2 CUDA driver, runtime, and NVML client
-shims for the Python client. Native CUDA consumers can load those dylibs and use a remote GPU
-without NVIDIA software on the Mac.
-
-The official macOS PyTorch wheel is CPU-only, however, so loading the shims
-cannot add its compiled-out CUDA backend. Run PyTorch workloads with a
-CUDA-enabled Linux or Windows build; macOS Python can use the native shims
-directly through `ctypes` or another CUDA consumer.
-
 ## Quick Start
 
 Use the published GHCR images. The examples below pin CUDA 13.3.1 on
@@ -90,15 +54,39 @@ Inside the client container, `LD_LIBRARY_PATH=/opt/lupine/lib` is already set,
 so CUDA driver users pick up the LUPINE `libcuda.so.1` shim and NVML users such
 as `nvidia-smi` pick up the LUPINE `libnvidia-ml.so.1` shim automatically.
 
+## Prometheus Metrics
+
+Linux servers built with CUDA and NVML expose Prometheus metrics on the RPC
+port without monitoring-specific configuration:
+
+```bash
+curl http://<server>:14833/metrics
+```
+
+The endpoint reports host GPU memory capacity, memory use and utilization,
+plus memory and utilization for each connected client process. It also exports
+the mapping between client identity, the Lupine connection child, and the host
+PID reported by NVML. Values are collected when `/metrics` is requested, so
+the server does no background NVML polling.
+
+Client metadata is optional. Servers advertise support during the HTTP/2
+handshake, and clients skip the report when that capability is absent.
+
 ## Client compatibility
 
-Each production server image carries the matching Linux, macOS, and Windows
-client objects for amd64 and arm64. Python clients fetch the current object
-from `/.well-known/lupine/client/v1/<os>/<arch>`, verify its strong ETag,
-content digest, manifest, and file hashes, and cache it locally. The selected
-ETag is also asserted when the RPC connection opens, closing the race between
+Each production server executable embeds the matching Linux, macOS, and
+Windows client objects for amd64 and arm64; there is no client-bundle directory
+to deploy beside it. Python clients fetch the current object from
+`/.well-known/lupine/client/v1/<os>/<arch>`, verify its strong ETag, content
+digest, manifest, and file hashes, and cache it locally. The selected ETag is
+also asserted when the RPC connection opens, closing the race between
 discovery and a server upgrade. `LUPINE_LIBDIR` remains an explicit local
 override for development.
+
+Linux client objects target the manylinux2014 ABI (glibc 2.17) and statically
+include their private C++, HTTP/2, and TLS dependencies. They therefore work on
+newer glibc distributions, including Ubuntu 22.04, without requiring host copies
+of libstdc++, nghttp2, or OpenSSL.
 
 ## Graceful Server Checkpoints
 
@@ -342,6 +330,12 @@ cmake --build build
 CMake builds the CUDA driver shim at `build/libcuda.so.1`, the NVML shim at
 `build/libnvidia-ml.so.1`, the HIP shim at `build/libamdhip64.so.1`, and the
 server at `build/lupine_driver_server`.
+
+Redistributable server builds pass `LUPINE_CLIENT_BUNDLE_INPUT` with staged
+native client directories. CMake deterministically assembles all six platform
+routes and links them into `lupine_driver_server`. The Docker `server` target
+requires that generated registry, so a server image cannot be produced without
+the clients.
 
 The Lupine server must be running before initiating client commands.
 

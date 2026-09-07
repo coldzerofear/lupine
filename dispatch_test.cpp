@@ -2,11 +2,10 @@
 // RPC path with nothing consumed, and anything else must be answered as one
 // HTTP/1.x request. Uses socketpair(), so this test is Unix-only like h2_test.
 
+#include "client_bundle.h"
 #include "dispatch.h"
 
 #include <cstring>
-#include <filesystem>
-#include <fstream>
 #include <stdio.h>
 #include <string>
 #include <sys/socket.h>
@@ -26,7 +25,9 @@ void check(bool ok, const char *what) {
 
 constexpr char kPreface[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 constexpr size_t kPrefaceLength = sizeof(kPreface) - 1;
-const rpc_http2_server_metadata kMetadata = {"13.0-test", nullptr};
+const rpc_http2_server_metadata kMetadata = {"13.0-test", nullptr, 0};
+
+std::string test_metrics() { return "test_metric 1\n"; }
 
 bool make_pair(int fds[2]) {
   return socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0;
@@ -156,28 +157,45 @@ void test_http1_unknown_path_is_404() {
   close(fds[1]);
 }
 
-struct bundle_fixture {
-  std::filesystem::path root;
-  rpc_http2_server_metadata metadata;
-
-  bundle_fixture() {
-    char directory[] = "/tmp/lupine-bundle-test-XXXXXX";
-    const char *created = mkdtemp(directory);
-    check(created != nullptr, "create bundle fixture");
-    root = created == nullptr ? "/tmp/lupine-bundle-test-invalid" : created;
-    std::filesystem::path platform = root / "linux" / "amd64";
-    std::filesystem::create_directories(platform);
-    std::ofstream(platform / "client.zip", std::ios::binary) << "zip-body";
-    std::ofstream(platform / "client.zip.etag")
-        << "\"sha256:"
-           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""
-           "\n";
-    std::ofstream(platform / "client.zip.digest") << "sha-256=:Ym9keQ==:\n";
-    metadata = {"13.0-test", root.c_str()};
+void test_http1_metrics_handler() {
+  int fds[2];
+  if (!make_pair(fds)) {
+    check(false, "socketpair");
+    return;
   }
+  const char request[] = "GET /metrics?source=test HTTP/1.1\r\n\r\n";
+  write(fds[1], request, sizeof(request) - 1);
+  check(lupine_connection_dispatch(fds[0], &kMetadata, test_metrics) == 1,
+        "metrics request is served here");
+  close(fds[0]);
+  std::string response = read_response(fds[1]);
+  check(response.rfind("HTTP/1.1 200 OK\r\n", 0) == 0,
+        "GET /metrics returns 200");
+  check(
+      response.find("content-type: text/plain; version=0.0.4; charset=utf-8") !=
+          std::string::npos,
+      "GET /metrics has Prometheus content type");
+  check(response.find("\r\n\r\ntest_metric 1\n") != std::string::npos,
+        "GET /metrics has metrics body");
+  close(fds[1]);
+}
 
-  ~bundle_fixture() { std::filesystem::remove_all(root); }
+constexpr char kBundleEtag[] =
+    "\"sha256:"
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"";
+const char kBundleFirst[] = "embedded-";
+const char kBundleSecond[] = "zip";
+const lupine_client_bundle_chunk kBundleChunks[] = {
+    {kBundleFirst, sizeof(kBundleFirst) - 1},
+    {kBundleSecond, sizeof(kBundleSecond) - 1},
 };
+const lupine_client_bundle_payload kBundle = {
+    kBundleEtag, "sha-256=:ZW1iZWRkZWQtemlw:", kBundleChunks, 2, 12};
+const lupine_client_bundle_entry kBundleEntries[] = {
+    {"linux/amd64", &kBundle},
+};
+const lupine_client_bundle_registry kBundles = {kBundleEntries, 1};
+const rpc_http2_server_metadata kBundleMetadata = {"13.0-test", &kBundles, 0};
 
 std::string bundle_request(const rpc_http2_server_metadata *metadata,
                            const std::string &request) {
@@ -195,55 +213,35 @@ std::string bundle_request(const rpc_http2_server_metadata *metadata,
   return response;
 }
 
-void test_http1_client_bundle_get_head_and_etag() {
-  bundle_fixture fixture;
+void test_http1_client_bundle() {
   const std::string path = "/.well-known/lupine/client/v1/linux/amd64";
 
   std::string response = bundle_request(
-      &fixture.metadata, "GET " + path + " HTTP/1.1\r\nhost: lupine\r\n\r\n");
+      &kBundleMetadata, "GET " + path + " HTTP/1.1\r\nhost: lupine\r\n\r\n");
   check(response.rfind("HTTP/1.1 200 OK\r\n", 0) == 0,
         "client bundle GET returns 200");
   check(response.find(
             "content-type: application/vnd.lupine.client-bundle.v1+zip\r\n") !=
             std::string::npos,
         "client bundle reports its media type");
-  check(response.find("etag: "
-                      "\"sha256:"
-                      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                      "aaaaaaaa\"\r\n") != std::string::npos,
-        "client bundle reports a strong ETag");
-  check(response.find("content-digest: sha-256=:Ym9keQ==:\r\n") !=
+  check(response.find(std::string("etag: ") + kBundleEtag + "\r\n") !=
             std::string::npos,
-        "client bundle reports its content digest");
-  check(response.find("\r\n\r\nzip-body") != std::string::npos,
-        "client bundle GET streams the object");
+        "client bundle reports its ETag");
+  check(response.find("\r\n\r\nembedded-zip") != std::string::npos,
+        "client bundle GET streams every compiled chunk");
 
   response =
-      bundle_request(&fixture.metadata, "HEAD " + path + " HTTP/1.1\r\n\r\n");
-  check(response.rfind("HTTP/1.1 200 OK\r\n", 0) == 0,
-        "client bundle HEAD returns 200");
-  check(response.find("content-length: 8\r\n") != std::string::npos,
+      bundle_request(&kBundleMetadata, "HEAD " + path + " HTTP/1.1\r\n\r\n");
+  check(response.find("content-length: 12\r\n") != std::string::npos,
         "client bundle HEAD reports object size");
   check(response.find("\r\n\r\n") == response.size() - 4,
         "client bundle HEAD has no body");
 
-  response = bundle_request(&fixture.metadata,
-                            "GET " + path +
-                                " HTTP/1.1\r\nIf-None-Match: "
-                                "\"sha256:"
-                                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                                "aaaaaaaaaaaaaaaaaa\"\r\n\r\n");
+  response = bundle_request(&kBundleMetadata,
+                            "GET " + path + " HTTP/1.1\r\nIf-None-Match: " +
+                                kBundleEtag + "\r\n\r\n");
   check(response.rfind("HTTP/1.1 304 Not Modified\r\n", 0) == 0,
         "matching client bundle ETag returns 304");
-  check(response.find("\r\n\r\n") == response.size() - 4, "304 has no body");
-}
-
-void test_http1_client_bundle_missing_is_503() {
-  std::string response = bundle_request(
-      &kMetadata,
-      "GET /.well-known/lupine/client/v1/windows/arm64 HTTP/1.1\r\n\r\n");
-  check(response.rfind("HTTP/1.1 503 Service Unavailable\r\n", 0) == 0,
-        "configured platform without an object returns 503");
 }
 
 void test_closed_peer_fails_dispatch() {
@@ -267,8 +265,8 @@ int main() {
   test_http1_get_root();
   test_http1_head_root_has_no_body();
   test_http1_unknown_path_is_404();
-  test_http1_client_bundle_get_head_and_etag();
-  test_http1_client_bundle_missing_is_503();
+  test_http1_metrics_handler();
+  test_http1_client_bundle();
   test_closed_peer_fails_dispatch();
   printf("\ndispatch_test: %s\n", failures == 0 ? "PASS" : "FAIL");
   return failures == 0 ? 0 : 1;

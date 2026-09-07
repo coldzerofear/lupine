@@ -34,19 +34,13 @@ permissions:
   packages: write
 
 jobs:
-  # Same bundle source as the upstream server image (#689): python.yml builds
-  # the native client shims for all six platforms and packages them as the
-  # lupine-client-bundles artifact; the server serves them at
-  # /.well-known/lupine/client/v1/<platform>.
-  client-bundles:
-    name: Build all client bundle variants
-    uses: ./.github/workflows/python.yml
-    with:
-      checkout_ref: ${{ github.event.release.tag_name || github.sha }}
-
+  # NOTE: client bundles are no longer produced by python.yml or served from a
+  # directory. Upstream #690/#691 build per-platform native clients in
+  # native-clients.yml and embed them into the server binary at build time via
+  # LUPINE_CLIENT_BUNDLE_INPUT. Until the static server build is rewired to that
+  # embed model, this image ships no bundles (endpoint answers 503).
   build:
     name: Static server CUDA ${{ matrix.cuda.version }} / ${{ matrix.platform.arch }}
-    needs: client-bundles
     runs-on: ${{ matrix.platform.runner }}
     timeout-minutes: 60
     strategy:
@@ -73,12 +67,6 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
-
-      - name: Download all client bundle variants
-        uses: actions/download-artifact@v8
-        with:
-          name: lupine-client-bundles
-          path: client-bundles
 
       - name: Free runner disk space
         run: |
@@ -122,7 +110,6 @@ jobs:
             CUDA_VERSION=${{ matrix.cuda.version }}
             MAX_GLIBC=2.28
             GCC_TOOLSET=${{ matrix.cuda.gcc_toolset }}
-            LUPINE_REQUIRE_CLIENT_BUNDLES=1
           tags: ${{ steps.image-tags.outputs.static }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}

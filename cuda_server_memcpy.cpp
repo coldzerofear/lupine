@@ -1841,6 +1841,7 @@ void lupine_server_finish_context_detach(conn_t *conn, CUcontext context,
 }
 
 void lupine_server_cleanup_connection(conn_t *conn) {
+  lupine_server_cleanup_log_callbacks(conn);
   std::unique_ptr<lupine_staging_state> owned_state;
   if (!lupine_staging_states().erase_fn(
           conn, [&owned_state](std::unique_ptr<lupine_staging_state> &state) {
@@ -2835,13 +2836,15 @@ int handle_cuMemcpyAtoH_v2(conn_t *conn) {
 }
 
 int handle_cuMemcpyDtoHAsync_v2(conn_t *conn) {
+  uint64_t async_sequence = 0;
   void *dstHost = nullptr;
   CUdeviceptr srcDevice = 0;
   size_t byteCount = 0;
   CUstream stream = nullptr;
   CUresult result = CUDA_ERROR_INVALID_VALUE;
 
-  if (rpc_read(conn, &dstHost, sizeof(dstHost)) < 0 ||
+  if (rpc_read(conn, &async_sequence, sizeof(async_sequence)) < 0 ||
+      rpc_read(conn, &dstHost, sizeof(dstHost)) < 0 ||
       rpc_read(conn, &srcDevice, sizeof(srcDevice)) < 0 ||
       rpc_read(conn, &byteCount, sizeof(byteCount)) < 0 ||
       rpc_read(conn, &stream, sizeof(stream)) < 0) {
@@ -2849,6 +2852,10 @@ int handle_cuMemcpyDtoHAsync_v2(conn_t *conn) {
   }
 
   if (rpc_read_end(conn) < 0) {
+    return -1;
+  }
+
+  if (rpc_async_sequence_begin(conn, async_sequence) < 0) {
     return -1;
   }
 
@@ -2903,5 +2910,6 @@ int handle_cuMemcpyDtoHAsync_v2(conn_t *conn) {
   } else if (host != nullptr) {
     free(host);
   }
+  rpc_async_sequence_end(conn);
   return 0;
 }

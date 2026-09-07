@@ -20,6 +20,8 @@ set(LUPINE_CUDA_VERSION_OVERRIDE "" CACHE STRING
     "CUDA version reported by an SDK-free server build")
 set(LUPINE_PRECOMPILED_OPS "" CACHE PATH
     "Optional directory containing precompiled device operations")
+set(LUPINE_CLIENT_BUNDLE_INPUT "" CACHE PATH
+    "Directory containing staged native clients to embed in the server")
 
 # Sanitizers are applied only to the CPU-only *_test executables. Set to a
 # -fsanitize value such as "address,undefined" or "thread"; empty disables.
@@ -32,31 +34,109 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 include(CTest)
 find_package(Threads REQUIRED)
-find_path(NGHTTP2_INCLUDE_DIR nghttp2/nghttp2.h REQUIRED)
-
 # Self-contained artifacts. The client shims are injected into arbitrary
 # container images whose library sets we do not control; a runtime dependency
 # on libnghttp2/libssl/libstdc++ there either fails to resolve or must be
-# shipped alongside, where it shadows the image own copies for every process
+# shipped alongside, where it shadows the image's own copies for every process
 # (observed breaking ollama llama-server). With this ON those deps are linked
 # statically and glibc is the only runtime dependency; the export version
 # scripts already hide the embedded symbols from .dynsym. The server takes the
 # same treatment so it needs no CUDA runtime base image.
-# Declared BEFORE the finds: an unconditional find_library would poison the
-# cache and turn the static lookup below into a no-op.
 option(LUPINE_STATIC_DEPS
        "Statically link nghttp2/OpenSSL/libstdc++/libgcc into the client shims and the server" OFF)
+
+# Each branch below fully resolves nghttp2 + OpenSSL and sets these two; the
+# defaults cover the common dynamic build.
+set(LUPINE_STATIC_RUNTIME_LINK_OPTIONS "")
+set(LUPINE_MANYLINUX2014 OFF)
+
 if(LUPINE_STATIC_DEPS)
+    # Our rocky8 static image: static nghttp2/OpenSSL (paths usually passed via
+    # -DNGHTTP2_*/-DOPENSSL_ROOT_DIR) plus static libstdc++/libgcc, so glibc is
+    # the only runtime dependency.
+    find_path(NGHTTP2_INCLUDE_DIR nghttp2/nghttp2.h REQUIRED)
     find_library(NGHTTP2_LIBRARY libnghttp2.a REQUIRED)
     set(OPENSSL_USE_STATIC_LIBS TRUE)
-    # Plain g++ driver flags; with no device code CMake links via the host
-    # launcher (g++), which takes them bare.
     set(LUPINE_STATIC_RUNTIME_LINK_OPTIONS -static-libstdc++ -static-libgcc)
+    find_package(OpenSSL QUIET)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+       "$ENV{AUDITWHEEL_POLICY}" STREQUAL "manylinux2014")
+    set(LUPINE_MANYLINUX2014 ON)
+    include(ExternalProject)
+    include(FetchContent)
+    include(ProcessorCount)
+    if(POLICY CMP0135)
+        cmake_policy(SET CMP0135 NEW)
+    endif()
+    find_package(Perl REQUIRED)
+    find_program(LUPINE_MAKE_EXECUTABLE NAMES gmake make REQUIRED)
+
+    ProcessorCount(LUPINE_BUILD_JOBS)
+    if(NOT LUPINE_BUILD_JOBS)
+        set(LUPINE_BUILD_JOBS 2)
+    endif()
+
+    set(LUPINE_OPENSSL_PREFIX
+        "${CMAKE_BINARY_DIR}/manylinux2014/openssl")
+    file(MAKE_DIRECTORY "${LUPINE_OPENSSL_PREFIX}/include")
+
+    function(lupine_add_manylinux_nghttp2)
+        set(BUILD_SHARED_LIBS OFF)
+        set(BUILD_STATIC_LIBS ON)
+        set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+        set(ENABLE_LIB_ONLY ON)
+        FetchContent_Declare(lupine_manylinux_nghttp2
+        URL
+            https://github.com/nghttp2/nghttp2/releases/download/v1.70.0/nghttp2-1.70.0.tar.gz
+        URL_HASH
+            SHA256=aa317e2cf9dca6afa0aed68f8fad6ff303ec6982e25a78c75c0b65e2b9b3ded5)
+        FetchContent_MakeAvailable(lupine_manylinux_nghttp2)
+    endfunction()
+    lupine_add_manylinux_nghttp2()
+    set(NGHTTP2_INCLUDE_DIR "")
+    set(NGHTTP2_LIBRARY nghttp2_static)
+
+    ExternalProject_Add(lupine_manylinux_openssl_external
+        URL
+            https://github.com/openssl/openssl/releases/download/openssl-3.5.8/openssl-3.5.8.tar.gz
+        URL_HASH
+            SHA256=a8f84a39918ec6415ce765d9b429d313ba97b8143169c172e734b9514464f5b2
+        BUILD_IN_SOURCE TRUE
+        CONFIGURE_COMMAND
+            ${PERL_EXECUTABLE} <SOURCE_DIR>/Configure
+            --prefix=${LUPINE_OPENSSL_PREFIX}
+            --openssldir=/etc/ssl
+            --libdir=lib
+            no-module
+            no-shared
+            no-tests
+            no-zlib
+            -fPIC
+        BUILD_COMMAND
+            ${LUPINE_MAKE_EXECUTABLE} -j${LUPINE_BUILD_JOBS}
+        INSTALL_COMMAND ${LUPINE_MAKE_EXECUTABLE} install_sw
+        BUILD_BYPRODUCTS
+            ${LUPINE_OPENSSL_PREFIX}/lib/libcrypto.a
+            ${LUPINE_OPENSSL_PREFIX}/lib/libssl.a)
+
+    add_library(OpenSSL::Crypto STATIC IMPORTED GLOBAL)
+    set_target_properties(OpenSSL::Crypto PROPERTIES
+        IMPORTED_LOCATION "${LUPINE_OPENSSL_PREFIX}/lib/libcrypto.a"
+        INTERFACE_INCLUDE_DIRECTORIES "${LUPINE_OPENSSL_PREFIX}/include"
+        INTERFACE_LINK_LIBRARIES "Threads::Threads;${CMAKE_DL_LIBS}")
+    add_dependencies(OpenSSL::Crypto lupine_manylinux_openssl_external)
+    add_library(OpenSSL::SSL STATIC IMPORTED GLOBAL)
+    set_target_properties(OpenSSL::SSL PROPERTIES
+        IMPORTED_LOCATION "${LUPINE_OPENSSL_PREFIX}/lib/libssl.a"
+        INTERFACE_INCLUDE_DIRECTORIES "${LUPINE_OPENSSL_PREFIX}/include"
+        INTERFACE_LINK_LIBRARIES OpenSSL::Crypto)
+    add_dependencies(OpenSSL::SSL lupine_manylinux_openssl_external)
+    set(OpenSSL_FOUND TRUE)
 else()
+    find_path(NGHTTP2_INCLUDE_DIR nghttp2/nghttp2.h REQUIRED)
     find_library(NGHTTP2_LIBRARY nghttp2 REQUIRED)
-    set(LUPINE_STATIC_RUNTIME_LINK_OPTIONS "")
+    find_package(OpenSSL QUIET)
 endif()
-find_package(OpenSSL QUIET)
 
 set(MIN_CUDA_VERSION 11.0)
 if(LUPINE_BUILD_CUDA OR LUPINE_BUILD_NVML)
@@ -201,6 +281,15 @@ function(lupine_internal_target target)
     )
 endfunction()
 
+function(lupine_manylinux2014_client target)
+    if(LUPINE_MANYLINUX2014)
+        target_link_options(${target} PRIVATE
+            -static-libgcc
+            -static-libstdc++
+            "LINKER:--exclude-libs,libcrypto.a:libgcc.a:libgcc_eh.a:libnghttp2.a:libssl.a:libstdc++.a")
+    endif()
+endfunction()
+
 function(lupine_apply_sanitizer target)
     if(LUPINE_SANITIZE)
         target_compile_options(${target} PRIVATE
@@ -246,6 +335,9 @@ target_include_directories(lupine_rpc_core
     PRIVATE ${NGHTTP2_INCLUDE_DIR})
 target_link_libraries(lupine_rpc_core PUBLIC
     Threads::Threads ${NGHTTP2_LIBRARY} lupine_lz4)
+if(LUPINE_MANYLINUX2014)
+    add_dependencies(lupine_rpc_core lupine_manylinux_openssl_external)
+endif()
 if(OpenSSL_FOUND)
     target_compile_definitions(lupine_rpc_core PRIVATE LUPINE_TLS_OPENSSL)
     target_link_libraries(lupine_rpc_core PUBLIC OpenSSL::SSL OpenSSL::Crypto)
@@ -258,7 +350,8 @@ if(WIN32)
 endif()
 
 add_library(lupine_client_transport STATIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/transport.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/transport.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/monitor_client.cpp)
 lupine_internal_target(lupine_client_transport)
 target_include_directories(lupine_client_transport PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR})
@@ -318,6 +411,7 @@ if(LUPINE_BUILD_CUDA)
     endif()
     set_target_properties(lupine_cuda_client PROPERTIES
         POSITION_INDEPENDENT_CODE ON)
+    lupine_manylinux2014_client(lupine_cuda_client)
     if(WIN32)
         target_compile_definitions(lupine_cuda_client PRIVATE
             LUPINE_WINDOWS_POSIX_SHIMS
@@ -332,11 +426,6 @@ if(LUPINE_BUILD_CUDA)
             -Wno-deprecated-declarations)
         set_target_properties(lupine_cuda_client PROPERTIES OUTPUT_NAME cuda)
         if(NOT APPLE)
-            if(NOT LUPINE_STATIC_DEPS)
-                # Naming stdc++ would link the dynamic library regardless of
-                # -static-libstdc++.
-                target_link_libraries(lupine_cuda_client PRIVATE stdc++)
-            endif()
             target_link_options(lupine_cuda_client PRIVATE
                 ${LUPINE_STATIC_RUNTIME_LINK_OPTIONS}
                 "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/cuda_client.exports")
@@ -357,6 +446,7 @@ if(LUPINE_BUILD_NVML)
     target_link_libraries(lupine_nvml_client PRIVATE lupine_client_transport)
     set_target_properties(lupine_nvml_client PROPERTIES
         POSITION_INDEPENDENT_CODE ON)
+    lupine_manylinux2014_client(lupine_nvml_client)
     if(WIN32)
         target_compile_definitions(lupine_nvml_client PRIVATE
             LUPINE_WINDOWS_POSIX_SHIMS
@@ -372,9 +462,6 @@ if(LUPINE_BUILD_NVML)
         set_target_properties(lupine_nvml_client PROPERTIES
             OUTPUT_NAME nvidia-ml)
         if(NOT APPLE)
-            if(NOT LUPINE_STATIC_DEPS)
-                target_link_libraries(lupine_nvml_client PRIVATE stdc++)
-            endif()
             target_link_options(lupine_nvml_client PRIVATE
                 ${LUPINE_STATIC_RUNTIME_LINK_OPTIONS}
                 "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/nvml.exports")
@@ -419,6 +506,10 @@ if(LUPINE_BUILD_SERVER)
             ${CUDAToolkit_INCLUDE_DIRS})
         target_compile_definitions(lupine_cuda_server PRIVATE
             LUPINE_RPC_SERVER)
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND LUPINE_BUILD_NVML)
+            target_compile_definitions(lupine_cuda_server PRIVATE
+                LUPINE_MONITORING_ENABLED)
+        endif()
         if(MSVC)
             target_compile_options(lupine_cuda_server PRIVATE /wd4996)
         else()
@@ -432,7 +523,8 @@ if(LUPINE_BUILD_SERVER)
 
     if(LUPINE_BUILD_NVML)
         add_library(lupine_nvml_server STATIC
-            ${CMAKE_CURRENT_SOURCE_DIR}/nvml_server.cpp)
+            ${CMAKE_CURRENT_SOURCE_DIR}/nvml_server.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/nvml_runtime.cpp)
         lupine_internal_target(lupine_nvml_server)
         target_include_directories(lupine_nvml_server PRIVATE
             ${CUDAToolkit_INCLUDE_DIRS})
@@ -453,6 +545,13 @@ if(LUPINE_BUILD_SERVER)
     add_executable(lupine_driver_server
         ${CMAKE_CURRENT_SOURCE_DIR}/server.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/codegen/registry.cpp)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND LUPINE_BUILD_CUDA AND
+       LUPINE_BUILD_NVML)
+        target_sources(lupine_driver_server PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/monitor_server.cpp)
+        target_compile_definitions(lupine_driver_server PRIVATE
+            LUPINE_MONITORING_ENABLED)
+    endif()
     target_include_directories(lupine_driver_server PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/codegen
@@ -460,6 +559,57 @@ if(LUPINE_BUILD_SERVER)
     target_link_libraries(lupine_driver_server PRIVATE
         lupine_server_core lupine_ipc ${CMAKE_DL_LIBS})
     target_link_options(lupine_driver_server PRIVATE ${LUPINE_STATIC_RUNTIME_LINK_OPTIONS})
+    if(LUPINE_CLIENT_BUNDLE_INPUT)
+        if(NOT IS_DIRECTORY "${LUPINE_CLIENT_BUNDLE_INPUT}")
+            message(FATAL_ERROR
+                "LUPINE_CLIENT_BUNDLE_INPUT is not a directory: ${LUPINE_CLIENT_BUNDLE_INPUT}")
+        endif()
+        find_program(UV_EXECUTABLE uv REQUIRED)
+        set(LUPINE_CLIENT_BUNDLE_GENERATED_DIR
+            ${CMAKE_CURRENT_BINARY_DIR}/client-bundles)
+
+        function(lupine_embed_client_bundle tag platforms)
+            set(files ${ARGN})
+            set(input_dir
+                ${LUPINE_CLIENT_BUNDLE_INPUT}/lupine-client-${tag})
+            set(output_dir ${LUPINE_CLIENT_BUNDLE_GENERATED_DIR}/${tag})
+            set(archive ${output_dir}/client.zip)
+            set(source ${LUPINE_CLIENT_BUNDLE_GENERATED_DIR}/${tag}.cpp)
+            string(REPLACE "-" "_" symbol ${tag})
+            set(inputs)
+            foreach(file IN LISTS files)
+                list(APPEND inputs ${input_dir}/${file})
+            endforeach()
+            add_custom_command(
+                OUTPUT ${source}
+                BYPRODUCTS ${archive}
+                COMMAND ${UV_EXECUTABLE} run --script
+                        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/bundle_codegen.py
+                        ${input_dir} ${archive} "${platforms}"
+                        lupine_embedded_client_bundle_${symbol} ${source} ${files}
+                DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/cmake/bundle_codegen.py
+                        ${inputs}
+                COMMENT "Embedding ${tag} client bundle"
+                VERBATIM)
+            target_sources(lupine_driver_server PRIVATE ${source})
+        endfunction()
+
+        lupine_embed_client_bundle(linux-x86_64 "linux/amd64"
+            libcuda.so.1 libcudart.so.13 libnvidia-ml.so.1)
+        lupine_embed_client_bundle(linux-aarch64 "linux/arm64"
+            libcuda.so.1 libcudart.so.13 libnvidia-ml.so.1)
+        lupine_embed_client_bundle(macosx-universal2
+            "macos/amd64;macos/arm64"
+            libcuda.dylib libcudart.dylib libnvidia-ml.dylib)
+        lupine_embed_client_bundle(win-amd64 "windows/amd64"
+            nvcuda.dll cudart64_13.dll nvml.dll)
+        lupine_embed_client_bundle(win-arm64 "windows/arm64"
+            nvcuda.dll cudart64_13.dll nvml.dll)
+        target_compile_definitions(lupine_driver_server PRIVATE
+            LUPINE_EMBED_CLIENT_BUNDLES)
+        message(STATUS
+            "Embedding server client bundles from: ${LUPINE_CLIENT_BUNDLE_INPUT}")
+    endif()
     if(LUPINE_BUILD_CUDA)
         target_compile_definitions(lupine_driver_server PRIVATE
             LUPINE_BUILD_CUDA_BACKEND
@@ -507,7 +657,9 @@ endif()
 # through on Windows (issue #656, in test_rpc_write_queue_grows), so it stays
 # off that platform until the transport difference behind that is understood.
 if(BUILD_TESTING AND NOT WIN32)
-    add_executable(h2_test ${CMAKE_CURRENT_SOURCE_DIR}/h2_test.cpp)
+    add_executable(h2_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/h2_test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/monitor_client.cpp)
     target_include_directories(h2_test PRIVATE ${NGHTTP2_INCLUDE_DIR})
     if(CUDAToolkit_VERSION)
         target_compile_definitions(h2_test PRIVATE

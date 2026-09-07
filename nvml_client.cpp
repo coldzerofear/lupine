@@ -85,6 +85,7 @@ const lupine_client_transport_config &nvml_transport_config() {
     config.strict_endpoints = true;
     config.log_missing_server = true;
     config.dispatch = nvml_transport_dispatch;
+    config.connection_kind = "nvml";
     return config;
   }();
   return config;
@@ -97,7 +98,7 @@ void nvml_retire_thread_lane(uint64_t lane_id) {
 pthread_once_t nvml_rpc_lifecycle_once = PTHREAD_ONCE_INIT;
 
 void nvml_install_rpc_lifecycle_hooks() {
-  const rpc_lifecycle_hooks hooks = {nullptr, nvml_retire_thread_lane};
+  const rpc_lifecycle_hooks hooks = {nullptr, nvml_retire_thread_lane, nullptr};
   if (rpc_set_lifecycle_hooks(&hooks) < 0) {
     LUPINE_LOG_ERROR("Failed to install NVML RPC lifecycle hooks");
   }
