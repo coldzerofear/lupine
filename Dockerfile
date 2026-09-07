@@ -588,7 +588,7 @@ RUN LD_LIBRARY_PATH=/probe/stubs LUPINE_PORT=not-a-port /probe/lupine_driver_ser
 # Bigger image, but required to run. Client bundles are embedded in the binary
 # (LUPINE_CLIENT_BUNDLE_INPUT at build time, upstream #691); served over
 # HTTP/1.x on the RPC port at /.well-known/lupine/client/v1/<platform>.
-FROM nvidia/cuda:${CUDA_VERSION}-base-rockylinux8 AS server-static
+FROM nvidia/cuda:${CUDA_VERSION}-${CUDA_IMAGE_FLAVOR}-rockylinux8 AS server-static
 
 ARG CUDA_VERSION
 ARG MAX_GLIBC=2.28
@@ -607,9 +607,6 @@ COPY --from=server-static-build /opt/lupine/build-static-server/lupine_driver_se
 
 RUN chmod +x /opt/lupine/bin/lupine_driver_server
 
-# Find the runtime-injected driver (and cuda-compat) ahead of anything else, the
-# same order the upstream server image uses.
-ENV LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/compat
 ENV LUPINE_PORT=14833
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
