@@ -514,8 +514,15 @@ ENV PATH="${CUDA_HOME}/bin:${PATH}"
 # embedded-bundle source compiled into the server (upstream #691).
 COPY --from=uv /usr/local/bin/uv /usr/local/bin/uv
 
+# bundle_codegen.py (run by uv to embed the client bundles) is a pure-stdlib
+# script needing only python >= 3.10. Install python3.12 and force uv to use the
+# system interpreter, so the build never reaches out to GitHub for a managed
+# CPython (that download 504'd in CI and is an unnecessary network dependency).
+ENV UV_PYTHON_PREFERENCE=only-system
+
 RUN dnf install -y --enablerepo=powertools \
         gcc gcc-c++ libstdc++-static make cmake binutils file tar gzip \
+        python3.12 \
     && if [ -n "${GCC_TOOLSET}" ]; then \
          dnf install -y "${GCC_TOOLSET}-gcc" "${GCC_TOOLSET}-gcc-c++"; \
        fi \
