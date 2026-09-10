@@ -314,9 +314,10 @@ RUN set -eux; \
       -DNGHTTP2_INCLUDE_DIR=/opt/static-deps/include \
       -DNGHTTP2_LIBRARY=/opt/static-deps/lib/libnghttp2.a \
       -DOPENSSL_ROOT_DIR=/opt/static-deps \
+      -DCMAKE_SHARED_LINKER_FLAGS="-static-libstdc++ -static-libgcc" \
       -DCMAKE_LIBRARY_PATH="${CUDA_HOME}/lib64/stubs"; \
     cmake --build /opt/lupine/build-static --parallel "$(nproc)" \
-      --target lupine_cuda_client lupine_nvml_client
+      --target lupine_cuda_client lupine_cudart_client lupine_nvml_client
 
 RUN chmod +x /opt/lupine/deploy/check_static_client.sh \
     && /opt/lupine/deploy/check_static_client.sh \
@@ -324,36 +325,27 @@ RUN chmod +x /opt/lupine/deploy/check_static_client.sh \
          /opt/lupine/build-static/libnvidia-ml.so.1 \
          "${MAX_GLIBC}"
 
-# libcudart.so.13 rides along for CUDA 13 artifacts, same as the server-served
-# bundles: a runtime-API translation layer linked directly against our
-# libcuda.so.1 ($ORIGIN rpath, so the flat artifact dir just works). Built only
-# on 13.x lanes - its SONAME and symbol surface are the CUDA-13 ones (torch
-# cu13's 101 undefined symbols). Staged into cudart-dist/ so later stages can
-# COPY unconditionally; the directory stays empty on other lanes.
+# libcudart.so.<major> is now a first-class codegen shim (lupine_cudart_client,
+# built above), version-matched to this lane's CUDA (so.11.0 / so.12 / so.13)
+# and linked against our libcuda.so.1 ($ORIGIN rpath). It ships alongside the
+# other shims so an injected image without a CUDA runtime can use it. Same
+# glibc-only gate as the other shims; no longer 13.x-only.
 RUN set -eux; \
-    mkdir -p /opt/lupine/build-static/cudart-dist; \
-    case "${CUDA_VERSION}" in 13.*) ;; *) exit 0;; esac; \
-    if [ -n "${GCC_TOOLSET}" ]; then export PATH="/opt/rh/${GCC_TOOLSET}/root/usr/bin:${PATH}"; fi; \
-    cmake -S /opt/lupine/python/cudart -B /opt/lupine/build-cudart \
-      -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" \
-      -DLUPINE_CUDA_INCLUDE_DIR="${CUDA_HOME}/include" \
-      -DLUPINE_CLIENT_DIR=/opt/lupine/build-static \
-      -DCMAKE_SHARED_LINKER_FLAGS="-static-libstdc++ -static-libgcc"; \
-    cmake --build /opt/lupine/build-cudart --parallel "$(nproc)"; \
-    so=/opt/lupine/build-cudart/libcudart.so.13; \
+    so="$(ls /opt/lupine/build-static/libcudart.so.* 2>/dev/null \
+            | grep -E 'libcudart\.so\.[0-9.]+$' | head -1)"; \
+    test -n "$so"; \
     if readelf -d "$so" | grep NEEDED | \
          grep -vE 'lib(c|m|dl|rt|pthread)\.so|ld-linux|libcuda\.so\.1'; then \
       echo "libcudart has an unexpected dependency"; exit 1; \
     fi; \
     if nm -D --defined-only "$so" | awk '{print $3}' | \
-         grep -vE '^(cuda|__cuda|libcudart\.so\.13$)'; then \
+         grep -vE '^(cuda|__cuda|libcudart\.so)'; then \
       echo "libcudart leaks non-cudart symbols"; exit 1; \
     fi; \
     ceiling="$(readelf -V "$so" | grep -oE 'GLIBC_[0-9.]+' | sed 's/GLIBC_//' | sort -V | tail -1)"; \
     if ! printf '%s\n%s\n' "$ceiling" "$MAX_GLIBC" | sort -C -V; then \
       echo "libcudart needs glibc $ceiling > $MAX_GLIBC"; exit 1; \
-    fi; \
-    cp "$so" /opt/lupine/build-static/cudart-dist/
+    fi
 
 # Load-probe helper: RTLD_NOW forces every relocation, so a missing dependency
 # or undefined symbol fails at build time, not in a user pod.
@@ -435,10 +427,10 @@ FROM rockylinux:8-minimal AS client-static-loadtest
 COPY --from=client-static-build /opt/lupine/build-static/libcuda.so.1 /probe/libcuda.so.1
 COPY --from=client-static-build /opt/lupine/build-static/libnvidia-ml.so.1 /probe/libnvidia-ml.so.1
 COPY --from=client-static-build /opt/lupine/build-static/loadprobe /probe/loadprobe
-COPY --from=client-static-build /opt/lupine/build-static/cudart-dist/ /probe/
+COPY --from=client-static-build /opt/lupine/build-static/libcudart.so.* /probe/
 
 RUN /probe/loadprobe /probe/libcuda.so.1 /probe/libnvidia-ml.so.1 \
-    && if [ -e /probe/libcudart.so.13 ]; then /probe/loadprobe /probe/libcudart.so.13; fi \
+    && for c in /probe/libcudart.so.*; do [ -e "$c" ] && /probe/loadprobe "$c"; done \
     && touch /probe/loadtest-passed
 
 # Final artifact carrier. busybox so an init container can `cp -a` the
@@ -461,12 +453,14 @@ COPY --from=client-static-loadtest /probe/loadtest-passed /artifacts/.loadtest-p
 COPY --from=client-static-build /opt/lupine/build-static/libcuda.so.1 /artifacts/libcuda.so.1
 COPY --from=client-static-build /opt/lupine/build-static/libnvidia-ml.so.1 /artifacts/libnvidia-ml.so.1
 COPY --from=client-static-smi /opt/nvidia-smi /artifacts/nvidia-smi
-COPY --from=client-static-build /opt/lupine/build-static/cudart-dist/ /artifacts/
+COPY --from=client-static-build /opt/lupine/build-static/libcudart.so.* /artifacts/
 
 RUN printf 'cuda_version=%s\nmin_glibc=%s\n' \
       "${CUDA_VERSION}" "${MAX_GLIBC}" > /artifacts/metadata \
     && ln -s libcuda.so.1 /artifacts/libcuda.so \
-    && ln -s libnvidia-ml.so.1 /artifacts/libnvidia-ml.so
+    && ln -s libnvidia-ml.so.1 /artifacts/libnvidia-ml.so \
+    && cudart="$(ls /artifacts/libcudart.so.* | grep -E 'libcudart\.so\.[0-9.]+$' | head -1)" \
+    && ln -s "$(basename "$cudart")" /artifacts/libcudart.so
 
 CMD ["sh", "-c", "cp -a /artifacts/. \"${ARTIFACTS_DEST:-/target}/\" && echo copied to ${ARTIFACTS_DEST:-/target}"]
 
