@@ -3,6 +3,9 @@
 #ifdef LUPINE_BUILD_CUDA_BACKEND
 #include <cuda.h>
 #endif
+#ifdef LUPINE_BUILD_CUDART_BACKEND
+#include <cuda_runtime_api.h>
+#endif
 #include "gen_rpc_ids.h"
 
 // clang-format off
@@ -383,6 +386,237 @@
   HANDLER(RPC_cuMemPrefetchAsync, handle_cuMemPrefetchAsync, rpc_backend::cuda) \
   HANDLER(RPC_cuMemAdvise, handle_cuMemAdvise, rpc_backend::cuda) \
   HANDLER(RPC_cuGraphExecUpdate, handle_cuGraphExecUpdate, rpc_backend::cuda)
+#define LUPINE_CUDART_RPC_HANDLERS(HANDLER) \
+  HANDLER(RPC_cudaGetErrorName, handle_cudaGetErrorName, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGetErrorString, handle_cudaGetErrorString, rpc_backend::cudart) \
+  HANDLER(RPC_cudaLaunchCooperativeKernel, handle_cudaLaunchCooperativeKernel, rpc_backend::cudart) \
+  HANDLER(RPC_cudaLaunchKernel, handle_cudaLaunchKernel, rpc_backend::cudart) \
+  HANDLER(RPC_cudaLaunchKernelExC, handle_cudaLaunchKernelExC, rpc_backend::cudart) \
+  HANDLER(RPC___cudaUnregisterFatBinary, handle___cudaUnregisterFatBinary, rpc_backend::cudart) \
+  HANDLER(RPC___cudaRegisterFatBinary, handle___cudaRegisterFatBinary, rpc_backend::cudart) \
+  HANDLER(RPC_lupineCudartFuncParamLayout, handle_lupineCudartFuncParamLayout, rpc_backend::cudart) \
+  HANDLER(RPC_cudaArrayGetInfo, handle_cudaArrayGetInfo, rpc_backend::cudart) \
+  HANDLER(RPC_cudaArrayGetMemoryRequirements, handle_cudaArrayGetMemoryRequirements, rpc_backend::cudart) \
+  HANDLER(RPC_cudaArrayGetPlane, handle_cudaArrayGetPlane, rpc_backend::cudart) \
+  HANDLER(RPC_cudaArrayGetSparseProperties, handle_cudaArrayGetSparseProperties, rpc_backend::cudart) \
+  HANDLER(RPC_cudaChooseDevice, handle_cudaChooseDevice, rpc_backend::cudart) \
+  HANDLER(RPC_cudaCreateChannelDesc, handle_cudaCreateChannelDesc, rpc_backend::cudart) \
+  HANDLER(RPC_cudaCreateSurfaceObject, handle_cudaCreateSurfaceObject, rpc_backend::cudart) \
+  HANDLER(RPC_cudaCreateTextureObject, handle_cudaCreateTextureObject, rpc_backend::cudart) \
+  HANDLER(RPC_cudaCtxResetPersistingL2Cache, handle_cudaCtxResetPersistingL2Cache, rpc_backend::cudart) \
+  HANDLER(RPC_cudaDestroyExternalMemory, handle_cudaDestroyExternalMemory, rpc_backend::cudart) \
+  HANDLER(RPC_cudaDestroyExternalSemaphore, handle_cudaDestroyExternalSemaphore, rpc_backend::cudart) \
+  HANDLER(RPC_cudaDestroySurfaceObject, handle_cudaDestroySurfaceObject, rpc_backend::cudart) \
+  HANDLER(RPC_cudaDestroyTextureObject, handle_cudaDestroyTextureObject, rpc_backend::cudart) \
+  HANDLER(RPC_cudaDeviceCanAccessPeer, handle_cudaDeviceCanAccessPeer, rpc_backend::cudart) \
+  HANDLER(RPC_cudaDeviceDisablePeerAccess, handle_cudaDeviceDisablePeerAccess, rpc_backend::cudart) \
+  HANDLER(RPC_cudaDeviceEnablePeerAccess, handle_cudaDeviceEnablePeerAccess, rpc_backend::cudart) \
+  HANDLER(RPC_cudaDeviceFlushGPUDirectRDMAWrites, handle_cudaDeviceFlushGPUDirectRDMAWrites, rpc_backend::cudart) \
+  HANDLER(RPC_cudaDeviceGetAttribute, handle_cudaDeviceGetAttribute, rpc_backend::cudart) \
+  HANDLER(RPC_cudaDeviceGetByPCIBusId, handle_cudaDeviceGetByPCIBusId, rpc_backend::cudart) \
+  HANDLER(RPC_cudaDeviceGetCacheConfig, handle_cudaDeviceGetCacheConfig, rpc_backend::cudart) \
+  HANDLER(RPC_cudaDeviceGetDefaultMemPool, handle_cudaDeviceGetDefaultMemPool, rpc_backend::cudart) \
+  HANDLER(RPC_cudaDeviceGetGraphMemAttribute, handle_cudaDeviceGetGraphMemAttribute, rpc_backend::cudart) \
+  HANDLER(RPC_cudaDeviceGetLimit, handle_cudaDeviceGetLimit, rpc_backend::cudart) \
+  HANDLER(RPC_cudaDeviceGetMemPool, handle_cudaDeviceGetMemPool, rpc_backend::cudart) \
+  HANDLER(RPC_cudaDeviceGetP2PAttribute, handle_cudaDeviceGetP2PAttribute, rpc_backend::cudart) \
+  HANDLER(RPC_cudaDeviceGetPCIBusId, handle_cudaDeviceGetPCIBusId, rpc_backend::cudart) \
+  HANDLER(RPC_cudaDeviceGetStreamPriorityRange, handle_cudaDeviceGetStreamPriorityRange, rpc_backend::cudart) \
+  HANDLER(RPC_cudaDeviceGetTexture1DLinearMaxWidth, handle_cudaDeviceGetTexture1DLinearMaxWidth, rpc_backend::cudart) \
+  HANDLER(RPC_cudaDeviceGraphMemTrim, handle_cudaDeviceGraphMemTrim, rpc_backend::cudart) \
+  HANDLER(RPC_cudaDeviceReset, handle_cudaDeviceReset, rpc_backend::cudart) \
+  HANDLER(RPC_cudaDeviceSetCacheConfig, handle_cudaDeviceSetCacheConfig, rpc_backend::cudart) \
+  HANDLER(RPC_cudaDeviceSetGraphMemAttribute, handle_cudaDeviceSetGraphMemAttribute, rpc_backend::cudart) \
+  HANDLER(RPC_cudaDeviceSetLimit, handle_cudaDeviceSetLimit, rpc_backend::cudart) \
+  HANDLER(RPC_cudaDeviceSetMemPool, handle_cudaDeviceSetMemPool, rpc_backend::cudart) \
+  HANDLER(RPC_cudaDeviceSynchronize, handle_cudaDeviceSynchronize, rpc_backend::cudart) \
+  HANDLER(RPC_cudaDriverGetVersion, handle_cudaDriverGetVersion, rpc_backend::cudart) \
+  HANDLER(RPC_cudaEventCreate, handle_cudaEventCreate, rpc_backend::cudart) \
+  HANDLER(RPC_cudaEventCreateWithFlags, handle_cudaEventCreateWithFlags, rpc_backend::cudart) \
+  HANDLER(RPC_cudaEventDestroy, handle_cudaEventDestroy, rpc_backend::cudart) \
+  HANDLER(RPC_cudaEventElapsedTime, handle_cudaEventElapsedTime, rpc_backend::cudart) \
+  HANDLER(RPC_cudaEventQuery, handle_cudaEventQuery, rpc_backend::cudart) \
+  HANDLER(RPC_cudaEventRecord, handle_cudaEventRecord, rpc_backend::cudart) \
+  HANDLER(RPC_cudaEventRecordWithFlags, handle_cudaEventRecordWithFlags, rpc_backend::cudart) \
+  HANDLER(RPC_cudaEventSynchronize, handle_cudaEventSynchronize, rpc_backend::cudart) \
+  HANDLER(RPC_cudaExternalMemoryGetMappedBuffer, handle_cudaExternalMemoryGetMappedBuffer, rpc_backend::cudart) \
+  HANDLER(RPC_cudaExternalMemoryGetMappedMipmappedArray, handle_cudaExternalMemoryGetMappedMipmappedArray, rpc_backend::cudart) \
+  HANDLER(RPC_cudaFree, handle_cudaFree, rpc_backend::cudart) \
+  HANDLER(RPC_cudaFreeArray, handle_cudaFreeArray, rpc_backend::cudart) \
+  HANDLER(RPC_cudaFreeAsync, handle_cudaFreeAsync, rpc_backend::cudart) \
+  HANDLER(RPC_cudaFreeHost, handle_cudaFreeHost, rpc_backend::cudart) \
+  HANDLER(RPC_cudaFreeMipmappedArray, handle_cudaFreeMipmappedArray, rpc_backend::cudart) \
+  HANDLER(RPC_cudaFuncGetAttributes, handle_cudaFuncGetAttributes, rpc_backend::cudart) \
+  HANDLER(RPC_cudaFuncSetAttribute, handle_cudaFuncSetAttribute, rpc_backend::cudart) \
+  HANDLER(RPC_cudaFuncSetCacheConfig, handle_cudaFuncSetCacheConfig, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGetChannelDesc, handle_cudaGetChannelDesc, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGetDevice, handle_cudaGetDevice, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGetDeviceCount, handle_cudaGetDeviceCount, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGetDeviceFlags, handle_cudaGetDeviceFlags, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGetDeviceProperties, handle_cudaGetDeviceProperties, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGetExportTable, handle_cudaGetExportTable, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGetLastError, handle_cudaGetLastError, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGetMipmappedArrayLevel, handle_cudaGetMipmappedArrayLevel, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGetSurfaceObjectResourceDesc, handle_cudaGetSurfaceObjectResourceDesc, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGetSymbolAddress, handle_cudaGetSymbolAddress, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGetSymbolSize, handle_cudaGetSymbolSize, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGetTextureObjectResourceDesc, handle_cudaGetTextureObjectResourceDesc, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGetTextureObjectResourceViewDesc, handle_cudaGetTextureObjectResourceViewDesc, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGetTextureObjectTextureDesc, handle_cudaGetTextureObjectTextureDesc, rpc_backend::cudart) \
+  HANDLER(RPC_cudaHostAlloc, handle_cudaHostAlloc, rpc_backend::cudart) \
+  HANDLER(RPC_cudaHostGetDevicePointer, handle_cudaHostGetDevicePointer, rpc_backend::cudart) \
+  HANDLER(RPC_cudaHostGetFlags, handle_cudaHostGetFlags, rpc_backend::cudart) \
+  HANDLER(RPC_cudaHostRegister, handle_cudaHostRegister, rpc_backend::cudart) \
+  HANDLER(RPC_cudaHostUnregister, handle_cudaHostUnregister, rpc_backend::cudart) \
+  HANDLER(RPC_cudaImportExternalMemory, handle_cudaImportExternalMemory, rpc_backend::cudart) \
+  HANDLER(RPC_cudaImportExternalSemaphore, handle_cudaImportExternalSemaphore, rpc_backend::cudart) \
+  HANDLER(RPC_cudaIpcCloseMemHandle, handle_cudaIpcCloseMemHandle, rpc_backend::cudart) \
+  HANDLER(RPC_cudaIpcGetEventHandle, handle_cudaIpcGetEventHandle, rpc_backend::cudart) \
+  HANDLER(RPC_cudaIpcGetMemHandle, handle_cudaIpcGetMemHandle, rpc_backend::cudart) \
+  HANDLER(RPC_cudaIpcOpenEventHandle, handle_cudaIpcOpenEventHandle, rpc_backend::cudart) \
+  HANDLER(RPC_cudaIpcOpenMemHandle, handle_cudaIpcOpenMemHandle, rpc_backend::cudart) \
+  HANDLER(RPC_cudaLaunchHostFunc, handle_cudaLaunchHostFunc, rpc_backend::cudart) \
+  HANDLER(RPC_cudaMalloc, handle_cudaMalloc, rpc_backend::cudart) \
+  HANDLER(RPC_cudaMalloc3D, handle_cudaMalloc3D, rpc_backend::cudart) \
+  HANDLER(RPC_cudaMalloc3DArray, handle_cudaMalloc3DArray, rpc_backend::cudart) \
+  HANDLER(RPC_cudaMallocArray, handle_cudaMallocArray, rpc_backend::cudart) \
+  HANDLER(RPC_cudaMallocAsync, handle_cudaMallocAsync, rpc_backend::cudart) \
+  HANDLER(RPC_cudaMallocFromPoolAsync, handle_cudaMallocFromPoolAsync, rpc_backend::cudart) \
+  HANDLER(RPC_cudaMallocHost, handle_cudaMallocHost, rpc_backend::cudart) \
+  HANDLER(RPC_cudaMallocManaged, handle_cudaMallocManaged, rpc_backend::cudart) \
+  HANDLER(RPC_cudaMallocMipmappedArray, handle_cudaMallocMipmappedArray, rpc_backend::cudart) \
+  HANDLER(RPC_cudaMallocPitch, handle_cudaMallocPitch, rpc_backend::cudart) \
+  HANDLER(RPC_cudaMemGetInfo, handle_cudaMemGetInfo, rpc_backend::cudart) \
+  HANDLER(RPC_cudaMemPoolCreate, handle_cudaMemPoolCreate, rpc_backend::cudart) \
+  HANDLER(RPC_cudaMemPoolDestroy, handle_cudaMemPoolDestroy, rpc_backend::cudart) \
+  HANDLER(RPC_cudaMemPoolExportPointer, handle_cudaMemPoolExportPointer, rpc_backend::cudart) \
+  HANDLER(RPC_cudaMemPoolGetAccess, handle_cudaMemPoolGetAccess, rpc_backend::cudart) \
+  HANDLER(RPC_cudaMemPoolGetAttribute, handle_cudaMemPoolGetAttribute, rpc_backend::cudart) \
+  HANDLER(RPC_cudaMemPoolImportPointer, handle_cudaMemPoolImportPointer, rpc_backend::cudart) \
+  HANDLER(RPC_cudaMemPoolSetAccess, handle_cudaMemPoolSetAccess, rpc_backend::cudart) \
+  HANDLER(RPC_cudaMemPoolSetAttribute, handle_cudaMemPoolSetAttribute, rpc_backend::cudart) \
+  HANDLER(RPC_cudaMemPoolTrimTo, handle_cudaMemPoolTrimTo, rpc_backend::cudart) \
+  HANDLER(RPC_cudaMemRangeGetAttribute, handle_cudaMemRangeGetAttribute, rpc_backend::cudart) \
+  HANDLER(RPC_cudaMemRangeGetAttributes, handle_cudaMemRangeGetAttributes, rpc_backend::cudart) \
+  HANDLER(RPC_cudaMemcpy3D, handle_cudaMemcpy3D, rpc_backend::cudart) \
+  HANDLER(RPC_cudaMemcpy3DAsync, handle_cudaMemcpy3DAsync, rpc_backend::cudart) \
+  HANDLER(RPC_cudaMemcpy3DPeer, handle_cudaMemcpy3DPeer, rpc_backend::cudart) \
+  HANDLER(RPC_cudaMemcpy3DPeerAsync, handle_cudaMemcpy3DPeerAsync, rpc_backend::cudart) \
+  HANDLER(RPC_cudaMemset, handle_cudaMemset, rpc_backend::cudart) \
+  HANDLER(RPC_cudaMemset2D, handle_cudaMemset2D, rpc_backend::cudart) \
+  HANDLER(RPC_cudaMemset2DAsync, handle_cudaMemset2DAsync, rpc_backend::cudart) \
+  HANDLER(RPC_cudaMemset3D, handle_cudaMemset3D, rpc_backend::cudart) \
+  HANDLER(RPC_cudaMemset3DAsync, handle_cudaMemset3DAsync, rpc_backend::cudart) \
+  HANDLER(RPC_cudaMemsetAsync, handle_cudaMemsetAsync, rpc_backend::cudart) \
+  HANDLER(RPC_cudaMipmappedArrayGetMemoryRequirements, handle_cudaMipmappedArrayGetMemoryRequirements, rpc_backend::cudart) \
+  HANDLER(RPC_cudaMipmappedArrayGetSparseProperties, handle_cudaMipmappedArrayGetSparseProperties, rpc_backend::cudart) \
+  HANDLER(RPC_cudaOccupancyAvailableDynamicSMemPerBlock, handle_cudaOccupancyAvailableDynamicSMemPerBlock, rpc_backend::cudart) \
+  HANDLER(RPC_cudaOccupancyMaxActiveBlocksPerMultiprocessor, handle_cudaOccupancyMaxActiveBlocksPerMultiprocessor, rpc_backend::cudart) \
+  HANDLER(RPC_cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags, handle_cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags, rpc_backend::cudart) \
+  HANDLER(RPC_cudaOccupancyMaxActiveClusters, handle_cudaOccupancyMaxActiveClusters, rpc_backend::cudart) \
+  HANDLER(RPC_cudaOccupancyMaxPotentialClusterSize, handle_cudaOccupancyMaxPotentialClusterSize, rpc_backend::cudart) \
+  HANDLER(RPC_cudaPeekAtLastError, handle_cudaPeekAtLastError, rpc_backend::cudart) \
+  HANDLER(RPC_cudaPointerGetAttributes, handle_cudaPointerGetAttributes, rpc_backend::cudart) \
+  HANDLER(RPC_cudaRuntimeGetVersion, handle_cudaRuntimeGetVersion, rpc_backend::cudart) \
+  HANDLER(RPC_cudaSetDevice, handle_cudaSetDevice, rpc_backend::cudart) \
+  HANDLER(RPC_cudaSetDeviceFlags, handle_cudaSetDeviceFlags, rpc_backend::cudart) \
+  HANDLER(RPC_cudaSetValidDevices, handle_cudaSetValidDevices, rpc_backend::cudart) \
+  HANDLER(RPC_cudaSignalExternalSemaphoresAsync, handle_cudaSignalExternalSemaphoresAsync, rpc_backend::cudart) \
+  HANDLER(RPC_cudaStreamAddCallback, handle_cudaStreamAddCallback, rpc_backend::cudart) \
+  HANDLER(RPC_cudaStreamAttachMemAsync, handle_cudaStreamAttachMemAsync, rpc_backend::cudart) \
+  HANDLER(RPC_cudaStreamBeginCapture, handle_cudaStreamBeginCapture, rpc_backend::cudart) \
+  HANDLER(RPC_cudaStreamCopyAttributes, handle_cudaStreamCopyAttributes, rpc_backend::cudart) \
+  HANDLER(RPC_cudaStreamCreate, handle_cudaStreamCreate, rpc_backend::cudart) \
+  HANDLER(RPC_cudaStreamCreateWithFlags, handle_cudaStreamCreateWithFlags, rpc_backend::cudart) \
+  HANDLER(RPC_cudaStreamCreateWithPriority, handle_cudaStreamCreateWithPriority, rpc_backend::cudart) \
+  HANDLER(RPC_cudaStreamDestroy, handle_cudaStreamDestroy, rpc_backend::cudart) \
+  HANDLER(RPC_cudaStreamEndCapture, handle_cudaStreamEndCapture, rpc_backend::cudart) \
+  HANDLER(RPC_cudaStreamGetAttribute, handle_cudaStreamGetAttribute, rpc_backend::cudart) \
+  HANDLER(RPC_cudaStreamGetFlags, handle_cudaStreamGetFlags, rpc_backend::cudart) \
+  HANDLER(RPC_cudaStreamGetPriority, handle_cudaStreamGetPriority, rpc_backend::cudart) \
+  HANDLER(RPC_cudaStreamIsCapturing, handle_cudaStreamIsCapturing, rpc_backend::cudart) \
+  HANDLER(RPC_cudaStreamQuery, handle_cudaStreamQuery, rpc_backend::cudart) \
+  HANDLER(RPC_cudaStreamSetAttribute, handle_cudaStreamSetAttribute, rpc_backend::cudart) \
+  HANDLER(RPC_cudaStreamSynchronize, handle_cudaStreamSynchronize, rpc_backend::cudart) \
+  HANDLER(RPC_cudaStreamWaitEvent, handle_cudaStreamWaitEvent, rpc_backend::cudart) \
+  HANDLER(RPC_cudaThreadExchangeStreamCaptureMode, handle_cudaThreadExchangeStreamCaptureMode, rpc_backend::cudart) \
+  HANDLER(RPC_cudaUserObjectCreate, handle_cudaUserObjectCreate, rpc_backend::cudart) \
+  HANDLER(RPC_cudaUserObjectRelease, handle_cudaUserObjectRelease, rpc_backend::cudart) \
+  HANDLER(RPC_cudaUserObjectRetain, handle_cudaUserObjectRetain, rpc_backend::cudart) \
+  HANDLER(RPC_cudaWaitExternalSemaphoresAsync, handle_cudaWaitExternalSemaphoresAsync, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphAddChildGraphNode, handle_cudaGraphAddChildGraphNode, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphAddEmptyNode, handle_cudaGraphAddEmptyNode, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphAddEventRecordNode, handle_cudaGraphAddEventRecordNode, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphAddEventWaitNode, handle_cudaGraphAddEventWaitNode, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphAddExternalSemaphoresSignalNode, handle_cudaGraphAddExternalSemaphoresSignalNode, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphAddExternalSemaphoresWaitNode, handle_cudaGraphAddExternalSemaphoresWaitNode, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphAddHostNode, handle_cudaGraphAddHostNode, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphAddKernelNode, handle_cudaGraphAddKernelNode, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphAddMemAllocNode, handle_cudaGraphAddMemAllocNode, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphAddMemFreeNode, handle_cudaGraphAddMemFreeNode, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphAddMemsetNode, handle_cudaGraphAddMemsetNode, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphChildGraphNodeGetGraph, handle_cudaGraphChildGraphNodeGetGraph, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphClone, handle_cudaGraphClone, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphCreate, handle_cudaGraphCreate, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphDebugDotPrint, handle_cudaGraphDebugDotPrint, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphDestroy, handle_cudaGraphDestroy, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphDestroyNode, handle_cudaGraphDestroyNode, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphEventRecordNodeGetEvent, handle_cudaGraphEventRecordNodeGetEvent, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphEventRecordNodeSetEvent, handle_cudaGraphEventRecordNodeSetEvent, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphEventWaitNodeGetEvent, handle_cudaGraphEventWaitNodeGetEvent, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphEventWaitNodeSetEvent, handle_cudaGraphEventWaitNodeSetEvent, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphExecChildGraphNodeSetParams, handle_cudaGraphExecChildGraphNodeSetParams, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphExecDestroy, handle_cudaGraphExecDestroy, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphExecEventRecordNodeSetEvent, handle_cudaGraphExecEventRecordNodeSetEvent, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphExecEventWaitNodeSetEvent, handle_cudaGraphExecEventWaitNodeSetEvent, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphExecExternalSemaphoresSignalNodeSetParams, handle_cudaGraphExecExternalSemaphoresSignalNodeSetParams, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphExecExternalSemaphoresWaitNodeSetParams, handle_cudaGraphExecExternalSemaphoresWaitNodeSetParams, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphExecHostNodeSetParams, handle_cudaGraphExecHostNodeSetParams, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphExecKernelNodeSetParams, handle_cudaGraphExecKernelNodeSetParams, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphExecMemsetNodeSetParams, handle_cudaGraphExecMemsetNodeSetParams, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphExternalSemaphoresSignalNodeGetParams, handle_cudaGraphExternalSemaphoresSignalNodeGetParams, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphExternalSemaphoresSignalNodeSetParams, handle_cudaGraphExternalSemaphoresSignalNodeSetParams, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphExternalSemaphoresWaitNodeGetParams, handle_cudaGraphExternalSemaphoresWaitNodeGetParams, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphExternalSemaphoresWaitNodeSetParams, handle_cudaGraphExternalSemaphoresWaitNodeSetParams, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphGetNodes, handle_cudaGraphGetNodes, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphGetRootNodes, handle_cudaGraphGetRootNodes, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphHostNodeGetParams, handle_cudaGraphHostNodeGetParams, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphHostNodeSetParams, handle_cudaGraphHostNodeSetParams, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphInstantiateWithFlags, handle_cudaGraphInstantiateWithFlags, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphKernelNodeGetAttribute, handle_cudaGraphKernelNodeGetAttribute, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphKernelNodeGetParams, handle_cudaGraphKernelNodeGetParams, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphKernelNodeSetAttribute, handle_cudaGraphKernelNodeSetAttribute, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphKernelNodeSetParams, handle_cudaGraphKernelNodeSetParams, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphLaunch, handle_cudaGraphLaunch, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphMemAllocNodeGetParams, handle_cudaGraphMemAllocNodeGetParams, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphMemFreeNodeGetParams, handle_cudaGraphMemFreeNodeGetParams, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphMemsetNodeGetParams, handle_cudaGraphMemsetNodeGetParams, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphMemsetNodeSetParams, handle_cudaGraphMemsetNodeSetParams, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphNodeFindInClone, handle_cudaGraphNodeFindInClone, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphNodeGetEnabled, handle_cudaGraphNodeGetEnabled, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphNodeGetType, handle_cudaGraphNodeGetType, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphNodeSetEnabled, handle_cudaGraphNodeSetEnabled, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphReleaseUserObject, handle_cudaGraphReleaseUserObject, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphRetainUserObject, handle_cudaGraphRetainUserObject, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphUpload, handle_cudaGraphUpload, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphicsMapResources, handle_cudaGraphicsMapResources, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphicsResourceGetMappedMipmappedArray, handle_cudaGraphicsResourceGetMappedMipmappedArray, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphicsResourceGetMappedPointer, handle_cudaGraphicsResourceGetMappedPointer, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphicsResourceSetMapFlags, handle_cudaGraphicsResourceSetMapFlags, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphicsSubResourceGetMappedArray, handle_cudaGraphicsSubResourceGetMappedArray, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphicsUnmapResources, handle_cudaGraphicsUnmapResources, rpc_backend::cudart) \
+  HANDLER(RPC_cudaGraphicsUnregisterResource, handle_cudaGraphicsUnregisterResource, rpc_backend::cudart) \
+  HANDLER(RPC___cudaRegisterFunction, handle___cudaRegisterFunction, rpc_backend::cudart) \
+  HANDLER(RPC___cudaRegisterVar, handle___cudaRegisterVar, rpc_backend::cudart) \
+  HANDLER(RPC___cudaRegisterManagedVar, handle___cudaRegisterManagedVar, rpc_backend::cudart) \
+  HANDLER(RPC___cudaRegisterTexture, handle___cudaRegisterTexture, rpc_backend::cudart) \
+  HANDLER(RPC___cudaRegisterSurface, handle___cudaRegisterSurface, rpc_backend::cudart) \
+  HANDLER(RPC___cudaRegisterHostVar, handle___cudaRegisterHostVar, rpc_backend::cudart) \
+  HANDLER(RPC___cudaRegisterUnifiedTable, handle___cudaRegisterUnifiedTable, rpc_backend::cudart) \
+  HANDLER(RPC___cudaPushCallConfiguration, handle___cudaPushCallConfiguration, rpc_backend::cudart) \
+  HANDLER(RPC___cudaPopCallConfiguration, handle___cudaPopCallConfiguration, rpc_backend::cudart) \
+  HANDLER(RPC___cudaRegisterFatBinaryEnd, handle___cudaRegisterFatBinaryEnd, rpc_backend::cudart) \
+  HANDLER(RPC___cudaInitModule, handle___cudaInitModule, rpc_backend::cudart)
 #define LUPINE_NVML_RPC_HANDLERS(HANDLER) \
   HANDLER(RPC_nvmlDeviceGetComputeRunningProcesses, handle_nvmlDeviceGetComputeRunningProcesses, rpc_backend::nvml) \
   HANDLER(RPC_nvmlDeviceGetComputeRunningProcesses_v2, handle_nvmlDeviceGetComputeRunningProcesses_v2, rpc_backend::nvml) \
@@ -615,6 +849,366 @@ LUPINE_DECLARE_HANDLER(RPC_cuLogsDumpToMemory, handle_cuLogsDumpToMemory,
                        rpc_backend::cuda)
 #endif
 #endif
+#ifdef LUPINE_BUILD_CUDART_BACKEND
+LUPINE_CUDART_RPC_HANDLERS(LUPINE_DECLARE_HANDLER)
+#if CUDART_VERSION >= 12000
+LUPINE_DECLARE_HANDLER(RPC_cudaFuncGetName, handle_cudaFuncGetName,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC___cudaLaunchKernel, handle___cudaLaunchKernel,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaDevResourceGenerateDesc,
+                       handle_cudaDevResourceGenerateDesc, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaDevSmResourceSplit,
+                       handle_cudaDevSmResourceSplit, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaDevSmResourceSplitByCount,
+                       handle_cudaDevSmResourceSplitByCount,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaDeviceGetDevResource,
+                       handle_cudaDeviceGetDevResource, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaDeviceGetExecutionCtx,
+                       handle_cudaDeviceGetExecutionCtx, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaDeviceGetHostAtomicCapabilities,
+                       handle_cudaDeviceGetHostAtomicCapabilities,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaDeviceGetP2PAtomicCapabilities,
+                       handle_cudaDeviceGetP2PAtomicCapabilities,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 12000
+LUPINE_DECLARE_HANDLER(RPC_cudaDeviceRegisterAsyncNotification,
+                       handle_cudaDeviceRegisterAsyncNotification,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 12000
+LUPINE_DECLARE_HANDLER(RPC_cudaDeviceUnregisterAsyncNotification,
+                       handle_cudaDeviceUnregisterAsyncNotification,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaExecutionCtxDestroy,
+                       handle_cudaExecutionCtxDestroy, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaExecutionCtxGetDevResource,
+                       handle_cudaExecutionCtxGetDevResource,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaExecutionCtxGetDevice,
+                       handle_cudaExecutionCtxGetDevice, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaExecutionCtxGetId, handle_cudaExecutionCtxGetId,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaExecutionCtxRecordEvent,
+                       handle_cudaExecutionCtxRecordEvent, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaExecutionCtxStreamCreate,
+                       handle_cudaExecutionCtxStreamCreate, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaExecutionCtxSynchronize,
+                       handle_cudaExecutionCtxSynchronize, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaExecutionCtxWaitEvent,
+                       handle_cudaExecutionCtxWaitEvent, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaFuncGetParamCount, handle_cudaFuncGetParamCount,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 12000
+LUPINE_DECLARE_HANDLER(RPC_cudaFuncGetParamInfo, handle_cudaFuncGetParamInfo,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaGetDriverEntryPoint,
+                       handle_cudaGetDriverEntryPoint, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaGetDriverEntryPointByVersion,
+                       handle_cudaGetDriverEntryPointByVersion,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaGetFuncBySymbol, handle_cudaGetFuncBySymbol,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 12000
+LUPINE_DECLARE_HANDLER(RPC_cudaGetKernel, handle_cudaGetKernel,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaGreenCtxCreate, handle_cudaGreenCtxCreate,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 12000
+LUPINE_DECLARE_HANDLER(RPC_cudaInitDevice, handle_cudaInitDevice,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaKernelSetAttributeForDevice,
+                       handle_cudaKernelSetAttributeForDevice,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaLaunchHostFunc_v2, handle_cudaLaunchHostFunc_v2,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaLibraryEnumerateKernels,
+                       handle_cudaLibraryEnumerateKernels, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaLibraryGetGlobal, handle_cudaLibraryGetGlobal,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaLibraryGetKernel, handle_cudaLibraryGetKernel,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaLibraryGetKernelCount,
+                       handle_cudaLibraryGetKernelCount, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaLibraryGetManaged, handle_cudaLibraryGetManaged,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaLibraryGetUnifiedFunction,
+                       handle_cudaLibraryGetUnifiedFunction,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaLibraryLoadData, handle_cudaLibraryLoadData,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaLibraryLoadFromFile,
+                       handle_cudaLibraryLoadFromFile, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaLibraryUnload, handle_cudaLibraryUnload,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaLogsCurrent, handle_cudaLogsCurrent,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaLogsDumpToFile, handle_cudaLogsDumpToFile,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaLogsDumpToMemory, handle_cudaLogsDumpToMemory,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaLogsRegisterCallback,
+                       handle_cudaLogsRegisterCallback, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaLogsUnregisterCallback,
+                       handle_cudaLogsUnregisterCallback, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaMemAdvise, handle_cudaMemAdvise,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaMemDiscardAndPrefetchBatchAsync,
+                       handle_cudaMemDiscardAndPrefetchBatchAsync,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaMemDiscardBatchAsync,
+                       handle_cudaMemDiscardBatchAsync, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaMemGetDefaultMemPool,
+                       handle_cudaMemGetDefaultMemPool, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaMemGetMemPool, handle_cudaMemGetMemPool,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaMemPrefetchAsync, handle_cudaMemPrefetchAsync,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaMemPrefetchBatchAsync,
+                       handle_cudaMemPrefetchBatchAsync, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaMemSetMemPool, handle_cudaMemSetMemPool,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaMemcpy3DBatchAsync,
+                       handle_cudaMemcpy3DBatchAsync, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaMemcpy3DWithAttributesAsync,
+                       handle_cudaMemcpy3DWithAttributesAsync,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaMemcpyBatchAsync, handle_cudaMemcpyBatchAsync,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaMemcpyWithAttributesAsync,
+                       handle_cudaMemcpyWithAttributesAsync,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 12000
+LUPINE_DECLARE_HANDLER(RPC_cudaStreamBeginCaptureToGraph,
+                       handle_cudaStreamBeginCaptureToGraph,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaStreamBeginRecaptureToGraph,
+                       handle_cudaStreamBeginRecaptureToGraph,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaStreamGetCaptureInfo,
+                       handle_cudaStreamGetCaptureInfo, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaStreamGetDevResource,
+                       handle_cudaStreamGetDevResource, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaStreamGetDevice, handle_cudaStreamGetDevice,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 12000
+LUPINE_DECLARE_HANDLER(RPC_cudaStreamGetId, handle_cudaStreamGetId,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaStreamUpdateCaptureDependencies,
+                       handle_cudaStreamUpdateCaptureDependencies,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaGraphAddDependencies,
+                       handle_cudaGraphAddDependencies, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaGraphAddNode, handle_cudaGraphAddNode,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 12000
+LUPINE_DECLARE_HANDLER(RPC_cudaGraphConditionalHandleCreate,
+                       handle_cudaGraphConditionalHandleCreate,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaGraphConditionalHandleCreate_v2,
+                       handle_cudaGraphConditionalHandleCreate_v2,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 12000
+LUPINE_DECLARE_HANDLER(RPC_cudaGraphExecGetFlags, handle_cudaGraphExecGetFlags,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaGraphExecGetId, handle_cudaGraphExecGetId,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 12000
+LUPINE_DECLARE_HANDLER(RPC_cudaGraphExecNodeSetParams,
+                       handle_cudaGraphExecNodeSetParams, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 12000
+LUPINE_DECLARE_HANDLER(RPC_cudaGraphExecUpdate, handle_cudaGraphExecUpdate,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaGraphGetEdges, handle_cudaGraphGetEdges,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaGraphGetId, handle_cudaGraphGetId,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 12000
+LUPINE_DECLARE_HANDLER(RPC_cudaGraphInstantiate, handle_cudaGraphInstantiate,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 12000
+LUPINE_DECLARE_HANDLER(RPC_cudaGraphInstantiateWithParams,
+                       handle_cudaGraphInstantiateWithParams,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaGraphKernelNodeCopyAttributes,
+                       handle_cudaGraphKernelNodeCopyAttributes,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaGraphNodeGetContainingGraph,
+                       handle_cudaGraphNodeGetContainingGraph,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaGraphNodeGetDependencies,
+                       handle_cudaGraphNodeGetDependencies, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaGraphNodeGetDependentNodes,
+                       handle_cudaGraphNodeGetDependentNodes,
+                       rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaGraphNodeGetLocalId,
+                       handle_cudaGraphNodeGetLocalId, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaGraphNodeGetParams,
+                       handle_cudaGraphNodeGetParams, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaGraphNodeGetToolsId,
+                       handle_cudaGraphNodeGetToolsId, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 12000
+LUPINE_DECLARE_HANDLER(RPC_cudaGraphNodeSetParams,
+                       handle_cudaGraphNodeSetParams, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC_cudaGraphRemoveDependencies,
+                       handle_cudaGraphRemoveDependencies, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+LUPINE_DECLARE_HANDLER(RPC___cudaGetKernel, handle___cudaGetKernel,
+                       rpc_backend::cudart)
+#endif
+#endif
 #ifdef LUPINE_BUILD_NVML_BACKEND
 LUPINE_NVML_RPC_HANDLERS(LUPINE_DECLARE_HANDLER)
 
@@ -749,6 +1343,261 @@ const rpc_handler_registry &lupine_rpc_handlers() {
       LUPINE_REGISTER_HANDLER(RPC_cuLogsDumpToMemory, handle_cuLogsDumpToMemory, rpc_backend::cuda)
 #endif
 #endif
+#ifdef LUPINE_BUILD_CUDART_BACKEND
+      LUPINE_CUDART_RPC_HANDLERS(LUPINE_REGISTER_HANDLER)
+#if CUDART_VERSION >= 12000
+      LUPINE_REGISTER_HANDLER(RPC_cudaFuncGetName, handle_cudaFuncGetName, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC___cudaLaunchKernel, handle___cudaLaunchKernel, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaDevResourceGenerateDesc, handle_cudaDevResourceGenerateDesc, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaDevSmResourceSplit, handle_cudaDevSmResourceSplit, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaDevSmResourceSplitByCount, handle_cudaDevSmResourceSplitByCount, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaDeviceGetDevResource, handle_cudaDeviceGetDevResource, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaDeviceGetExecutionCtx, handle_cudaDeviceGetExecutionCtx, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaDeviceGetHostAtomicCapabilities, handle_cudaDeviceGetHostAtomicCapabilities, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaDeviceGetP2PAtomicCapabilities, handle_cudaDeviceGetP2PAtomicCapabilities, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 12000
+      LUPINE_REGISTER_HANDLER(RPC_cudaDeviceRegisterAsyncNotification, handle_cudaDeviceRegisterAsyncNotification, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 12000
+      LUPINE_REGISTER_HANDLER(RPC_cudaDeviceUnregisterAsyncNotification, handle_cudaDeviceUnregisterAsyncNotification, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaExecutionCtxDestroy, handle_cudaExecutionCtxDestroy, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaExecutionCtxGetDevResource, handle_cudaExecutionCtxGetDevResource, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaExecutionCtxGetDevice, handle_cudaExecutionCtxGetDevice, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaExecutionCtxGetId, handle_cudaExecutionCtxGetId, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaExecutionCtxRecordEvent, handle_cudaExecutionCtxRecordEvent, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaExecutionCtxStreamCreate, handle_cudaExecutionCtxStreamCreate, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaExecutionCtxSynchronize, handle_cudaExecutionCtxSynchronize, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaExecutionCtxWaitEvent, handle_cudaExecutionCtxWaitEvent, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaFuncGetParamCount, handle_cudaFuncGetParamCount, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 12000
+      LUPINE_REGISTER_HANDLER(RPC_cudaFuncGetParamInfo, handle_cudaFuncGetParamInfo, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaGetDriverEntryPoint, handle_cudaGetDriverEntryPoint, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaGetDriverEntryPointByVersion, handle_cudaGetDriverEntryPointByVersion, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaGetFuncBySymbol, handle_cudaGetFuncBySymbol, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 12000
+      LUPINE_REGISTER_HANDLER(RPC_cudaGetKernel, handle_cudaGetKernel, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaGreenCtxCreate, handle_cudaGreenCtxCreate, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 12000
+      LUPINE_REGISTER_HANDLER(RPC_cudaInitDevice, handle_cudaInitDevice, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaKernelSetAttributeForDevice, handle_cudaKernelSetAttributeForDevice, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaLaunchHostFunc_v2, handle_cudaLaunchHostFunc_v2, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaLibraryEnumerateKernels, handle_cudaLibraryEnumerateKernels, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaLibraryGetGlobal, handle_cudaLibraryGetGlobal, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaLibraryGetKernel, handle_cudaLibraryGetKernel, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaLibraryGetKernelCount, handle_cudaLibraryGetKernelCount, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaLibraryGetManaged, handle_cudaLibraryGetManaged, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaLibraryGetUnifiedFunction, handle_cudaLibraryGetUnifiedFunction, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaLibraryLoadData, handle_cudaLibraryLoadData, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaLibraryLoadFromFile, handle_cudaLibraryLoadFromFile, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaLibraryUnload, handle_cudaLibraryUnload, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaLogsCurrent, handle_cudaLogsCurrent, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaLogsDumpToFile, handle_cudaLogsDumpToFile, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaLogsDumpToMemory, handle_cudaLogsDumpToMemory, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaLogsRegisterCallback, handle_cudaLogsRegisterCallback, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaLogsUnregisterCallback, handle_cudaLogsUnregisterCallback, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaMemAdvise, handle_cudaMemAdvise, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaMemDiscardAndPrefetchBatchAsync, handle_cudaMemDiscardAndPrefetchBatchAsync, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaMemDiscardBatchAsync, handle_cudaMemDiscardBatchAsync, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaMemGetDefaultMemPool, handle_cudaMemGetDefaultMemPool, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaMemGetMemPool, handle_cudaMemGetMemPool, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaMemPrefetchAsync, handle_cudaMemPrefetchAsync, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaMemPrefetchBatchAsync, handle_cudaMemPrefetchBatchAsync, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaMemSetMemPool, handle_cudaMemSetMemPool, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaMemcpy3DBatchAsync, handle_cudaMemcpy3DBatchAsync, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaMemcpy3DWithAttributesAsync, handle_cudaMemcpy3DWithAttributesAsync, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaMemcpyBatchAsync, handle_cudaMemcpyBatchAsync, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaMemcpyWithAttributesAsync, handle_cudaMemcpyWithAttributesAsync, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 12000
+      LUPINE_REGISTER_HANDLER(RPC_cudaStreamBeginCaptureToGraph, handle_cudaStreamBeginCaptureToGraph, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaStreamBeginRecaptureToGraph, handle_cudaStreamBeginRecaptureToGraph, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaStreamGetCaptureInfo, handle_cudaStreamGetCaptureInfo, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaStreamGetDevResource, handle_cudaStreamGetDevResource, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaStreamGetDevice, handle_cudaStreamGetDevice, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 12000
+      LUPINE_REGISTER_HANDLER(RPC_cudaStreamGetId, handle_cudaStreamGetId, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaStreamUpdateCaptureDependencies, handle_cudaStreamUpdateCaptureDependencies, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaGraphAddDependencies, handle_cudaGraphAddDependencies, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaGraphAddNode, handle_cudaGraphAddNode, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 12000
+      LUPINE_REGISTER_HANDLER(RPC_cudaGraphConditionalHandleCreate, handle_cudaGraphConditionalHandleCreate, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaGraphConditionalHandleCreate_v2, handle_cudaGraphConditionalHandleCreate_v2, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 12000
+      LUPINE_REGISTER_HANDLER(RPC_cudaGraphExecGetFlags, handle_cudaGraphExecGetFlags, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaGraphExecGetId, handle_cudaGraphExecGetId, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 12000
+      LUPINE_REGISTER_HANDLER(RPC_cudaGraphExecNodeSetParams, handle_cudaGraphExecNodeSetParams, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 12000
+      LUPINE_REGISTER_HANDLER(RPC_cudaGraphExecUpdate, handle_cudaGraphExecUpdate, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaGraphGetEdges, handle_cudaGraphGetEdges, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaGraphGetId, handle_cudaGraphGetId, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 12000
+      LUPINE_REGISTER_HANDLER(RPC_cudaGraphInstantiate, handle_cudaGraphInstantiate, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 12000
+      LUPINE_REGISTER_HANDLER(RPC_cudaGraphInstantiateWithParams, handle_cudaGraphInstantiateWithParams, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaGraphKernelNodeCopyAttributes, handle_cudaGraphKernelNodeCopyAttributes, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaGraphNodeGetContainingGraph, handle_cudaGraphNodeGetContainingGraph, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaGraphNodeGetDependencies, handle_cudaGraphNodeGetDependencies, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaGraphNodeGetDependentNodes, handle_cudaGraphNodeGetDependentNodes, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaGraphNodeGetLocalId, handle_cudaGraphNodeGetLocalId, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaGraphNodeGetParams, handle_cudaGraphNodeGetParams, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaGraphNodeGetToolsId, handle_cudaGraphNodeGetToolsId, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 12000
+      LUPINE_REGISTER_HANDLER(RPC_cudaGraphNodeSetParams, handle_cudaGraphNodeSetParams, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC_cudaGraphRemoveDependencies, handle_cudaGraphRemoveDependencies, rpc_backend::cudart)
+#endif
+#if CUDART_VERSION >= 13000
+      LUPINE_REGISTER_HANDLER(RPC___cudaGetKernel, handle___cudaGetKernel, rpc_backend::cudart)
+#endif
+#endif
 #ifdef LUPINE_BUILD_NVML_BACKEND
       LUPINE_NVML_RPC_HANDLERS(LUPINE_REGISTER_HANDLER)
 
@@ -764,5 +1613,6 @@ const rpc_handler_registry &lupine_rpc_handlers() {
 }
 
 #undef LUPINE_CUDA_RPC_HANDLERS
+#undef LUPINE_CUDART_RPC_HANDLERS
 #undef LUPINE_NVML_RPC_HANDLERS
 #undef LUPINE_HIP_RPC_HANDLERS
