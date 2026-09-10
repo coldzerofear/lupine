@@ -762,21 +762,10 @@ extern "C" void lupine_remember_loaded_module_for_rpc(CUmodule module) {
   lupine_remember_loaded_module(module);
 }
 
-static bool lupine_env_enabled(const char *name) {
-  const char *value = getenv(name);
-  if (value == nullptr || strcmp(value, "0") == 0) {
-    return false;
-  }
-  return strcasecmp(value, "false") != 0 && strcasecmp(value, "no") != 0;
-}
-
 static void *lupine_local_libcuda_handle() {
   static std::once_flag once;
   static void *handle = nullptr;
   std::call_once(once, []() {
-    if (lupine_env_enabled("LUPINE_DISABLE_LOCAL")) {
-      return;
-    }
     const char *override_path = getenv("LUPINE_REAL_LIBCUDA");
 #if defined(_WIN32)
     if (override_path != nullptr && override_path[0] != '\0') {
@@ -833,9 +822,11 @@ extern "C" void *lupine_real_cuda_symbol(const char *name) {
 // Client-answered entry points must fail with NOT_INITIALIZED until cuInit;
 // forwarded ones get the server's own state.
 static std::atomic<bool> lupine_cuda_initialized{false};
+CUresult lupine_refresh_runtime_context();
 
 static bool lupine_cuda_is_initialized() {
-  return lupine_cuda_initialized.load(std::memory_order_acquire);
+  return lupine_refresh_runtime_context() == CUDA_SUCCESS &&
+         lupine_cuda_initialized.load(std::memory_order_acquire);
 }
 
 static CUresult lupine_remote_cuInit(conn_t *conn, unsigned int flags) {
@@ -876,7 +867,11 @@ extern "C" CUresult cuInit(unsigned int flags) {
     lupine_cuda_initialized.store(true, std::memory_order_release);
     return CUDA_SUCCESS;
   }
-  return first_error;
+  if (first_error != CUDA_SUCCESS) {
+    return first_error;
+  }
+  return getenv("LUPINE_SERVER") != nullptr ? CUDA_ERROR_DEVICE_UNAVAILABLE
+                                            : CUDA_ERROR_NO_DEVICE;
 }
 
 extern "C" CUresult cuDeviceGetCount(int *count) {
@@ -1272,6 +1267,10 @@ extern "C" CUresult cuModuleGetFunction(CUfunction *function, CUmodule module,
   return result;
 }
 
+static CUresult lupine_load_recorded_library_on_route(CUlibrary source_library,
+                                                      lupine_route route,
+                                                      CUlibrary *library);
+
 static CUresult lupine_load_recorded_module_on_route(CUmodule source_module,
                                                      lupine_route route,
                                                      CUmodule *module) {
@@ -1285,27 +1284,49 @@ static CUresult lupine_load_recorded_module_on_route(CUmodule source_module,
   }
 
   lupine_module_image_record record;
+  CUlibrary parent_library = nullptr;
   {
     std::lock_guard<std::mutex> lock(lupine_library_kernel_mutex());
     auto it = lupine_module_images().find(source_module);
     if (it == lupine_module_images().end()) {
-      // No recorded image, so the module cannot be replicated elsewhere. It is
-      // still valid on the route that already owns it (cuModuleLoad, for one,
-      // never records an image), so hand that handle back untouched and only
-      // fail when a genuinely different route is asked for.
       if (lupine_route_identity(lupine_route_for_module(source_module)) ==
           route_id) {
         *module = source_module;
         return CUDA_SUCCESS;
       }
-      return CUDA_ERROR_NOT_FOUND;
+      auto library = lupine_library_modules().find(source_module);
+      if (library == lupine_library_modules().end()) {
+        // No recorded image or parent library means the module cannot be
+        // reconstructed on another route (cuModuleLoad, for one, records
+        // neither).
+        return CUDA_ERROR_NOT_FOUND;
+      }
+      parent_library = library->second;
+    } else {
+      auto cached = it->second.modules_by_route.find(route_id);
+      if (cached != it->second.modules_by_route.end()) {
+        *module = cached->second;
+        return CUDA_SUCCESS;
+      }
+      record = it->second;
     }
-    auto cached = it->second.modules_by_route.find(route_id);
-    if (cached != it->second.modules_by_route.end()) {
-      *module = cached->second;
-      return CUDA_SUCCESS;
+  }
+
+  if (parent_library != nullptr) {
+    CUlibrary library = nullptr;
+    CUresult result =
+        lupine_load_recorded_library_on_route(parent_library, route, &library);
+    if (result != CUDA_SUCCESS || library == nullptr) {
+      return result;
     }
-    record = it->second;
+
+    CUmodule loaded = nullptr;
+    result = cuLibraryGetModule(&loaded, library);
+    if (result != CUDA_SUCCESS || loaded == nullptr) {
+      return result;
+    }
+    *module = loaded;
+    return CUDA_SUCCESS;
   }
 
   CUmodule loaded = nullptr;
@@ -1891,7 +1912,8 @@ lupine_translate_private_function_for_rpc(CUfunction function) {
   return lupine_translate_private_function(function);
 }
 
-static bool lupine_device_attribute_is_virtualized(CUdevice_attribute attrib) {
+extern "C" bool
+lupine_device_attribute_is_virtualized(CUdevice_attribute attrib) {
   switch (attrib) {
   case CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS:
   case CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES:
@@ -3377,6 +3399,49 @@ static thread_local CUcontext lupine_current_context = nullptr;
 static thread_local CUcontext lupine_default_context_hint = nullptr;
 static std::atomic<CUcontext> lupine_global_default_context_hint{nullptr};
 static thread_local auto *lupine_context_stack = new std::vector<CUcontext>();
+static thread_local conn_t *lupine_pending_runtime_context = nullptr;
+
+extern "C" void lupine_invalidate_runtime_context(conn_t *conn) {
+  lupine_pending_runtime_context = conn;
+}
+
+// Runtime calls may initialize or change the server lane's driver context.
+// Query it only when a subsequent driver call needs the client-side cache.
+// This observes CUDA state; it never calls cuInit or creates a context.
+CUresult lupine_refresh_runtime_context() {
+  conn_t *conn = lupine_pending_runtime_context;
+  if (conn == nullptr) {
+    return CUDA_SUCCESS;
+  }
+  lupine_pending_runtime_context = nullptr;
+  CUcontext context = nullptr;
+  CUresult result = CUDA_ERROR_DEVICE_UNAVAILABLE;
+  if (lupine_prepare_rpc(conn) < 0 ||
+      rpc_write_start_request(conn, RPC_cuCtxGetCurrent) < 0 ||
+      rpc_wait_for_response(conn) < 0 ||
+      rpc_read(conn, &context, sizeof(context)) < 0 ||
+      rpc_read(conn, &result, sizeof(result)) < 0 || rpc_read_end(conn) < 0) {
+    return CUDA_ERROR_DEVICE_UNAVAILABLE;
+  }
+  if (result == CUDA_SUCCESS) {
+    lupine_cuda_initialized.store(true, std::memory_order_release);
+    lupine_current_context = context;
+    if (context != nullptr) {
+      lupine_note_context_owner(context, conn);
+      lupine_default_context_hint = context;
+      lupine_global_default_context_hint.store(context,
+                                               std::memory_order_relaxed);
+    }
+    lupine_lane_context_cache_store(
+        lupine_route_identity(lupine_remote_route_for_conn(conn)), context);
+  }
+  // Registration alone need not initialize CUDA. There is no context to
+  // cache yet, but pre-init calls such as cuDriverGetVersion must still route.
+  if (result == CUDA_ERROR_NOT_INITIALIZED) {
+    return CUDA_SUCCESS;
+  }
+  return result;
+}
 
 CUcontext lupine_current_context_hint() { return lupine_current_context; }
 
@@ -5042,9 +5107,15 @@ cuLibraryLoadData(CUlibrary *library, const void *code,
 
   lupine_route route = lupine_route_for_current_context();
   if (lupine_route_is_local(route)) {
-    return lupine_call_real_cuda_fn(
+    CUresult result = lupine_call_real_cuda_fn(
         "cuLibraryLoadData", library, code, jitOptions, jitOptionsValues,
         numJitOptions, libraryOptions, libraryOptionValues, numLibraryOptions);
+    if (result == CUDA_SUCCESS) {
+      lupine_note_library_owner_route(*library, route);
+      lupine_record_library_image(*library, route, kind, image_bytes.data(),
+                                  image_bytes.size(), code);
+    }
+    return result;
   }
 
   conn_t *conn = lupine_route_remote_conn(route);
@@ -7014,33 +7085,18 @@ static CUresult lupine_cuStreamGetCaptureInfo(
 // answer NONE locally while this is zero.
 std::atomic<int> lupine_active_stream_captures{0};
 
-class lupine_capture_begin_guard {
-public:
-  lupine_capture_begin_guard() { lupine_checkpoint::capture_begin(); }
+extern "C" void lupine_stream_capture_begin() {
+  lupine_checkpoint::capture_begin();
+}
 
-  ~lupine_capture_begin_guard() {
-    if (!completed_) {
-      lupine_checkpoint::capture_begin_complete(false);
-    }
+extern "C" void lupine_stream_capture_begin_complete(bool started) {
+  lupine_checkpoint::capture_begin_complete(started);
+  if (started) {
+    lupine_active_stream_captures.fetch_add(1);
   }
+}
 
-  CUresult complete(CUresult result) {
-    if (!completed_) {
-      completed_ = true;
-      bool started = result == CUDA_SUCCESS;
-      lupine_checkpoint::capture_begin_complete(started);
-      if (started) {
-        lupine_active_stream_captures.fetch_add(1);
-      }
-    }
-    return result;
-  }
-
-private:
-  bool completed_ = false;
-};
-
-static CUresult lupine_complete_stream_end_capture(CUresult result) {
+extern "C" CUresult lupine_complete_stream_end_capture(CUresult result) {
   // CUDA_SUCCESS ends a valid capture. An invalidated or unjoined capture also
   // leaves capture mode when EndCapture reports the terminal error. Errors
   // such as WRONG_THREAD and UNMATCHED leave the tracked capture untouched.
@@ -8732,7 +8788,8 @@ CUresult cuGetProcAddress_v2(const char *symbol, void **pfn, int cudaVersion,
     return CUDA_SUCCESS;
   }
   if (strcmp(symbol, "cuGetProcAddress") == 0) {
-    *pfn = (void *)&cuGetProcAddress;
+    *pfn = cudaVersion >= 12000 ? (void *)&cuGetProcAddress_v2
+                                : (void *)&cuGetProcAddress;
     if (symbolStatus != nullptr) {
       *symbolStatus = CU_GET_PROC_ADDRESS_SUCCESS;
     }

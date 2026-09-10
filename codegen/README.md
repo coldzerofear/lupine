@@ -2,7 +2,7 @@ Codegen works via a human-in-the-loop system. It's quite challenging to build a 
 infer what parameters should be sent and received so we instead have a two-step process.
 
 First, `annotationgen.py` reads an SDK header such as `cuda.h` or `nvml.h` and copies its function signatures
-into that target's annotation file (`annotations_cuda.h`, `annotations_nvml.h`, `annotations_hip.h`; one file per
+into that target's annotation file (`annotations_cuda.h`, `annotations_cudart.h`, `annotations_nvml.h`, `annotations_hip.h`; one file per
 shim library). These files are intended to be modified by humans. In particular, the `@param` annotations
 have significant meanings.
 
@@ -29,6 +29,13 @@ generated client wrapper before it writes the RPC. Supported kinds are
 owner. `DEVICE` and `CONTEXT` routing is inferred from the first non-pointer
 `CUdevice` or `CUcontext` parameter, so those annotations are only needed when
 the routing key is not the first matching parameter.
+
+Forwarding backends also accept `@routingkey EVENT <param>`. Their client must
+provide `connection_for_event(event)`, which selects the connection without
+changing the event handle sent to the server.
+Likewise, `@routingkey STREAM <param>` uses `connection_for_stream(stream)`.
+The backend helper handles default streams; the stream argument is sent
+unchanged.
 
 NVML wrappers use the same mechanism. A by-value `nvmlDevice_t` parameter
 infers `NVML_DEVICE` routing: the generated client resolves its owning server
