@@ -31,10 +31,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
-#if defined(__APPLE__)
-#include <mach/mach.h>
-#include <mach/mach_vm.h>
-#elif !defined(__GLIBC__)
+#if !defined(__APPLE__) && !defined(__GLIBC__)
 #error "Lupine CUDA client requires glibc, macOS, or Windows"
 #endif
 #endif
@@ -6897,61 +6894,17 @@ static void lupine_complete_pending_log_callbacks(conn_t *, int32_t) {}
 static void lupine_discard_pending_log_callbacks(conn_t *) {}
 #endif
 
-static bool lupine_is_writable_user_pointer(const void *ptr, size_t size) {
-  if (ptr == nullptr || size == 0) {
-    return false;
-  }
-  uintptr_t start = reinterpret_cast<uintptr_t>(ptr);
-  uintptr_t end = start + size;
-  if (end < start) {
-    return false;
-  }
+// Include admitted capture starts, not just completed BeginCapture calls: a
+// different thread may query after the server starts capture but before the
+// initiating thread receives its reply.
+std::atomic<int> lupine_active_stream_captures{0};
 
-#if defined(_WIN32)
-  MEMORY_BASIC_INFORMATION info = {};
-  if (VirtualQuery(ptr, &info, sizeof(info)) == 0 || info.State != MEM_COMMIT) {
-    return false;
+static bool lupine_stream_handle_is_known(CUstream hStream) {
+  if (hStream == nullptr || hStream == CU_STREAM_LEGACY ||
+      hStream == CU_STREAM_PER_THREAD) {
+    return true;
   }
-  uintptr_t region_start = reinterpret_cast<uintptr_t>(info.BaseAddress);
-  uintptr_t region_end = region_start + info.RegionSize;
-  DWORD protection = info.Protect & 0xff;
-  bool writable = protection == PAGE_READWRITE ||
-                  protection == PAGE_WRITECOPY ||
-                  protection == PAGE_EXECUTE_READWRITE ||
-                  protection == PAGE_EXECUTE_WRITECOPY;
-  return start >= region_start && end <= region_end && writable &&
-         (info.Protect & PAGE_GUARD) == 0;
-#elif defined(__APPLE__)
-  mach_vm_address_t region = static_cast<mach_vm_address_t>(start);
-  mach_vm_size_t region_size = 0;
-  vm_region_basic_info_data_64_t info = {};
-  mach_msg_type_number_t info_count = VM_REGION_BASIC_INFO_COUNT_64;
-  mach_port_t object_name = MACH_PORT_NULL;
-  kern_return_t result = mach_vm_region(
-      mach_task_self(), &region, &region_size, VM_REGION_BASIC_INFO_64,
-      reinterpret_cast<vm_region_info_t>(&info), &info_count, &object_name);
-  if (object_name != MACH_PORT_NULL) {
-    mach_port_deallocate(mach_task_self(), object_name);
-  }
-  return result == KERN_SUCCESS && region <= start &&
-         end <= region + region_size && (info.protection & VM_PROT_WRITE) != 0;
-#else
-  std::ifstream maps("/proc/self/maps");
-  std::string line;
-  while (std::getline(maps, line)) {
-    uintptr_t region_start = 0;
-    uintptr_t region_end = 0;
-    char perms[5] = {};
-    if (sscanf(line.c_str(), "%lx-%lx %4s", &region_start, &region_end,
-               perms) != 3) {
-      continue;
-    }
-    if (start >= region_start && end <= region_end && perms[1] == 'w') {
-      return true;
-    }
-  }
-  return false;
-#endif
+  return lupine_route_for_known_stream(hStream).kind != LUPINE_ROUTE_INVALID;
 }
 
 static CUresult lupine_cuStreamGetCaptureInfo(
@@ -6994,6 +6947,17 @@ static CUresult lupine_cuStreamGetCaptureInfo(
   }
 #endif
 
+  // Like cuStreamIsCapturing, this query needs no server state when no capture
+  // is outstanding. Optional outputs are only defined during active capture.
+  // Keep unknown streams and uninitialized/detached contexts on the RPC path.
+  if (captureStatus_out != nullptr && lupine_cuda_is_initialized() &&
+      lupine_current_context != nullptr &&
+      lupine_active_stream_captures.load() == 0 &&
+      lupine_stream_handle_is_known(stream)) {
+    *captureStatus_out = CU_STREAM_CAPTURE_STATUS_NONE;
+    return CUDA_SUCCESS;
+  }
+
   CUstreamCaptureStatus status = CU_STREAM_CAPTURE_STATUS_NONE;
   cuuint64_t id = 0;
   CUgraph graph = nullptr;
@@ -7032,25 +6996,6 @@ static CUresult lupine_cuStreamGetCaptureInfo(
     return CUDA_ERROR_DEVICE_UNAVAILABLE;
   }
 
-  bool num_dependencies_writable =
-      numDependencies_out != nullptr &&
-      lupine_is_writable_user_pointer(numDependencies_out,
-                                      sizeof(*numDependencies_out));
-  if (edgeData_out != nullptr &&
-      (numDependencies_out == nullptr || !num_dependencies_writable)) {
-    numDependencies_out = reinterpret_cast<size_t *>(edgeData_out);
-    edgeData_out = nullptr;
-    num_dependencies_writable = lupine_is_writable_user_pointer(
-        numDependencies_out, sizeof(*numDependencies_out));
-  }
-  if (numDependencies_out != nullptr && !num_dependencies_writable) {
-    numDependencies_out = nullptr;
-  }
-  if (edgeData_out != nullptr &&
-      !lupine_is_writable_user_pointer(edgeData_out, sizeof(*edgeData_out))) {
-    edgeData_out = nullptr;
-  }
-
   if (captureStatus_out != nullptr) {
     *captureStatus_out = status;
   }
@@ -7080,19 +7025,15 @@ static CUresult lupine_cuStreamGetCaptureInfo(
   return return_value;
 }
 
-// Stream captures started by this client and not yet terminated. A stream can
-// only be capturing if we started the capture, so cuStreamIsCapturing can
-// answer NONE locally while this is zero.
-std::atomic<int> lupine_active_stream_captures{0};
-
 extern "C" void lupine_stream_capture_begin() {
   lupine_checkpoint::capture_begin();
+  lupine_active_stream_captures.fetch_add(1);
 }
 
 extern "C" void lupine_stream_capture_begin_complete(bool started) {
   lupine_checkpoint::capture_begin_complete(started);
-  if (started) {
-    lupine_active_stream_captures.fetch_add(1);
+  if (!started) {
+    lupine_active_stream_captures.fetch_sub(1);
   }
 }
 
@@ -7107,14 +7048,6 @@ extern "C" CUresult lupine_complete_stream_end_capture(CUresult result) {
     lupine_active_stream_captures.fetch_sub(1);
   }
   return result;
-}
-
-static bool lupine_stream_handle_is_known(CUstream hStream) {
-  if (hStream == nullptr || hStream == CU_STREAM_LEGACY ||
-      hStream == CU_STREAM_PER_THREAD) {
-    return true;
-  }
-  return lupine_route_for_known_stream(hStream).kind != LUPINE_ROUTE_INVALID;
 }
 
 extern "C" CUresult cuStreamIsCapturing(CUstream hStream,
@@ -7254,17 +7187,6 @@ extern "C" CUresult cuStreamGetCaptureInfo_v2(
 #ifdef cuStreamGetCaptureInfo
 #undef cuStreamGetCaptureInfo
 #endif
-#if CUDA_VERSION >= 12000
-extern "C" CUresult cuStreamGetCaptureInfo(
-    CUstream stream, CUstreamCaptureStatus *captureStatus_out,
-    cuuint64_t *id_out, CUgraph *graph_out,
-    const CUgraphNode **dependencies_out, const CUgraphEdgeData **edgeData_out,
-    size_t *numDependencies_out) {
-  return lupine_cuStreamGetCaptureInfo(stream, captureStatus_out, id_out,
-                                       graph_out, dependencies_out,
-                                       edgeData_out, numDependencies_out);
-}
-#else
 extern "C" CUresult
 cuStreamGetCaptureInfo(CUstream stream,
                        CUstreamCaptureStatus *captureStatus_out,
@@ -7272,7 +7194,6 @@ cuStreamGetCaptureInfo(CUstream stream,
   return lupine_cuStreamGetCaptureInfo(stream, captureStatus_out, id_out,
                                        nullptr, nullptr, nullptr, nullptr);
 }
-#endif
 
 extern "C" CUresult
 cuStreamBeginCaptureToGraph(CUstream hStream, CUgraph hGraph,
@@ -8634,6 +8555,20 @@ CUresult cuGetProcAddress_v2(const char *symbol, void **pfn, int cudaVersion,
   // Most wrappers route purely by symbol name. A few CUDA APIs changed ABI
   // without changing the name and must also use the requested API version.
   (void)flags;
+
+  if (strcmp(symbol, "cuStreamGetCaptureInfo") == 0) {
+    if (cudaVersion >= 12030) {
+      *pfn = reinterpret_cast<void *>(&cuStreamGetCaptureInfo_v3);
+    } else if (cudaVersion >= 11030) {
+      *pfn = reinterpret_cast<void *>(&cuStreamGetCaptureInfo_v2);
+    } else {
+      *pfn = reinterpret_cast<void *>(&cuStreamGetCaptureInfo);
+    }
+    if (symbolStatus != nullptr) {
+      *symbolStatus = CU_GET_PROC_ADDRESS_SUCCESS;
+    }
+    return CUDA_SUCCESS;
+  }
 
   auto resolve_graph_query = [&](const char *candidate, void *legacy,
                                  void *edge_data) {
