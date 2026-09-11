@@ -4382,22 +4382,17 @@ int handle_cuStreamSynchronize(conn_t *conn) {
 }
 
 int handle_cuGraphLaunch(conn_t *conn) {
+  uint64_t async_sequence = 0;
   CUgraphExec exec = nullptr;
   CUstream stream = nullptr;
-  if (rpc_read(conn, &exec, sizeof(exec)) < 0 ||
-      rpc_read(conn, &stream, sizeof(stream)) < 0) {
+  if (rpc_read(conn, &async_sequence, sizeof(async_sequence)) < 0 ||
+      rpc_read(conn, &exec, sizeof(exec)) < 0 ||
+      rpc_read(conn, &stream, sizeof(stream)) < 0 || rpc_read_end(conn) < 0 ||
+      rpc_async_sequence_begin(conn, async_sequence) < 0) {
     return -1;
   }
-  int request_id = rpc_read_end(conn);
-  if (request_id < 0) {
-    return -1;
-  }
-  CUresult result = cuGraphLaunch(exec, stream);
-  lupine_note_graph_launch(exec, stream, result);
-  if (rpc_write_start_response(conn, request_id) < 0 ||
-      rpc_write(conn, &result, sizeof(result)) < 0 || rpc_write_end(conn) < 0) {
-    return -1;
-  }
+  lupine_note_graph_launch(exec, stream, cuGraphLaunch(exec, stream));
+  rpc_async_sequence_end(conn);
   return 0;
 }
 

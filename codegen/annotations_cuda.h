@@ -2720,6 +2720,7 @@ CUresult cuGraphNodeGetEnabled(CUgraphExec hGraphExec, CUgraphNode hNode,
  */
 CUresult cuGraphUpload(CUgraphExec hGraphExec, CUstream hStream);
 /**
+ * @async
  * @param hGraphExec SEND_ONLY
  * @param hStream SEND_ONLY
  * @disabled server

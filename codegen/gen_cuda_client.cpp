@@ -5199,15 +5199,17 @@ CUresult cuGraphLaunch(CUgraphExec hGraphExec, CUstream hStream) {
   if (lupine_route_is_local(route))
     return lupine_call_real_cuda_fn("cuGraphLaunch", hGraphExec, hStream);
   conn_t *conn = lupine_route_remote_conn(route);
+  uint64_t async_sequence = 0;
   if (lupine_prepare_rpc(conn) < 0 ||
-      rpc_write_start_request(conn, RPC_cuGraphLaunch) < 0 ||
+      rpc_write_start_async_request(conn, RPC_cuGraphLaunch, &async_sequence) <
+          0 ||
+      rpc_write(conn, &async_sequence, sizeof(async_sequence)) < 0 ||
       rpc_write(conn, &hGraphExec, sizeof(CUgraphExec)) < 0 ||
       rpc_write(conn, &hStream, sizeof(CUstream)) < 0 ||
-      rpc_wait_for_response(conn) < 0 ||
-      rpc_read(conn, &return_value, sizeof(CUresult)) < 0 ||
-      rpc_read_end(conn) < 0)
+      rpc_write_end(conn) < 0) {
     return CUDA_ERROR_DEVICE_UNAVAILABLE;
-  return return_value;
+  }
+  return CUDA_SUCCESS;
 }
 
 CUresult cuGraphExecDestroy(CUgraphExec hGraphExec) {

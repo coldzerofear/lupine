@@ -17,6 +17,7 @@
 #include <string.h>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -7028,6 +7029,28 @@ static bool lupine_stream_handle_is_known(CUstream hStream) {
   return lupine_route_for_known_stream(hStream).kind != LUPINE_ROUTE_INVALID;
 }
 
+// A stream's capture id and graph are fixed from the moment it enters a
+// capture (BeginCapture, or joining through an event wait) until that capture
+// ends, including after it rejoins the origin; only the dependency set moves.
+// The first ACTIVE reply per stream therefore answers later status/id/graph
+// queries until any capture ends. An invalidated capture keeps answering
+// ACTIVE here until EndCapture reports it. Entries carry the epoch current
+// when their query was issued, so a reply that lands after a concurrent
+// EndCapture cannot describe the next capture.
+struct lupine_stream_capture_entry {
+  uint64_t epoch;
+  cuuint64_t id;
+  CUgraph graph;
+};
+static std::atomic<uint64_t> lupine_stream_capture_epoch{0};
+
+static libcuckoo::cuckoohash_map<CUstream, lupine_stream_capture_entry> &
+lupine_stream_capture_cache() {
+  static auto *cache =
+      new libcuckoo::cuckoohash_map<CUstream, lupine_stream_capture_entry>();
+  return *cache;
+}
+
 static CUresult lupine_cuStreamGetCaptureInfo(
     CUstream stream, CUstreamCaptureStatus *captureStatus_out,
     cuuint64_t *id_out, CUgraph *graph_out,
@@ -7082,6 +7105,23 @@ static CUresult lupine_cuStreamGetCaptureInfo(
   CUstreamCaptureStatus status = CU_STREAM_CAPTURE_STATUS_NONE;
   cuuint64_t id = 0;
   CUgraph graph = nullptr;
+  uint64_t epoch = lupine_stream_capture_epoch.load();
+  lupine_stream_capture_entry cached;
+  if (dependencies_out == nullptr && edgeData_out == nullptr &&
+      numDependencies_out == nullptr &&
+      lupine_stream_capture_cache().find(stream, cached) &&
+      cached.epoch == epoch) {
+    if (captureStatus_out != nullptr) {
+      *captureStatus_out = CU_STREAM_CAPTURE_STATUS_ACTIVE;
+    }
+    if (id_out != nullptr) {
+      *id_out = cached.id;
+    }
+    if (graph_out != nullptr) {
+      *graph_out = cached.graph;
+    }
+    return CUDA_SUCCESS;
+  }
   size_t dependency_count = 0;
   bool has_edge_data = false;
   conn_t *conn = lupine_route_remote_conn(route);
@@ -7142,6 +7182,11 @@ static CUresult lupine_cuStreamGetCaptureInfo(
     for (CUgraphNode dependency : capture_dependencies) {
       lupine_note_graph_node_owner_route(dependency, route);
     }
+    if (status == CU_STREAM_CAPTURE_STATUS_ACTIVE && stream != nullptr &&
+        stream != CU_STREAM_LEGACY && stream != CU_STREAM_PER_THREAD) {
+      lupine_stream_capture_cache().insert_or_assign(
+          stream, lupine_stream_capture_entry{epoch, id, graph});
+    }
   }
   return return_value;
 }
@@ -7166,6 +7211,8 @@ extern "C" CUresult lupine_complete_stream_end_capture(CUresult result) {
       result == CUDA_ERROR_STREAM_CAPTURE_INVALIDATED ||
       result == CUDA_ERROR_STREAM_CAPTURE_UNJOINED) {
     lupine_checkpoint::capture_end();
+    lupine_stream_capture_epoch.fetch_add(1);
+    lupine_stream_capture_cache().clear();
     lupine_active_stream_captures.fetch_sub(1);
   }
   return result;
@@ -9027,6 +9074,7 @@ lupine_manual_function_map() {
       {"cuProfilerInitialize", (void *)cuProfilerInitialize},
       {"cuProfilerStart", (void *)cuProfilerStart},
       {"cuProfilerStop", (void *)cuProfilerStop},
+      {"cuStreamCreateWithPriority", (void *)cuStreamCreateWithPriority},
       {"cuStreamDestroy", (void *)cuStreamDestroy},
       {"cuEventDestroy", (void *)cuEventDestroy},
       {"cuEventDestroy_v2", (void *)cuEventDestroy_v2},
