@@ -8,7 +8,7 @@ nothing here asks which one it is writing.
 from dataclasses import dataclass
 import textwrap
 
-from cxxheaderparser.types import Function, Parameter, Pointer
+from cxxheaderparser.types import Array, Function, FunctionType, Parameter, Pointer
 
 from ops import (
     ArrayOperation,
@@ -17,6 +17,9 @@ from ops import (
     NullableArrayOperation,
     NullableOperation,
     NullTerminatedOperation,
+    ScalarOperation,
+    VersionedStructOperation,
+    format_array,
 )
 
 
@@ -33,6 +36,17 @@ class Backend:
     lookup_on_all_connections: bool = False
     # The status a declaration the annotation file says nothing about returns.
     not_supported: str = ""
+    # When set, an @async call is submitted fire-and-forget whenever the
+    # client's submit_async(conn) says so and returns this status; otherwise
+    # it is an ordinary request. The server answers only the requests.
+    async_success: str = ""
+    # The library also exports every entry point under this prefix (NCCL's
+    # profiling interface), as an alias of the same definition.
+    alias_prefix: str = ""
+
+
+def optional_async(backend: "Backend", metadata) -> bool:
+    return bool(metadata.async_fire_forget and backend.async_success)
 
 
 def unsupported(function, metadata) -> bool:
@@ -62,6 +76,12 @@ def format_function_params(function: Function) -> list[str]:
                     name=param.name + "[]",
                 )
             )
+        elif param.name and isinstance(param.type, Array):
+            params.append(format_array(param.type, param.name))
+        elif param.name and isinstance(param.type, Pointer) and isinstance(
+            param.type.ptr_to, FunctionType
+        ):
+            params.append(param.type.format_decl(param.name))
         elif param.name:
             params.append(
                 f"{param.type.format()} {param.name}"
@@ -99,7 +119,9 @@ def write_client_validation(f, backend: Backend, function, operations):
             checks.append(f"{name} == nullptr")
         elif isinstance(operation, DereferenceOperation):
             checks.append(f"{name} == nullptr")
-        elif isinstance(operation, ArrayOperation):
+        elif isinstance(operation, ArrayOperation) and operation.counted:
+            checks.append(f"({operation.length} != 0 && {name} == nullptr)")
+        elif isinstance(operation, ArrayOperation) and not operation.nullable:
             checks.append(
                 f"({operation.transfer_size_expr()} != 0 && {name} == nullptr)"
             )
@@ -125,7 +147,15 @@ def write_client_rpc(f, backend: Backend, function, operations, metadata):
     name = function.name.format()
     result = function.return_type.format()
     params = ", ".join(format_function_params(function))
+    submit = optional_async(backend, metadata)
+    if submit and (
+        result != backend.result
+        or any(getattr(operation, "recv", False) for operation in operations)
+    ):
+        raise RuntimeError(f"{name}: @async needs a status result and SEND_ONLY parameters")
     f.write(f"static {result} lupine_rpc_{name}(conn_t *conn")
+    if submit:
+        f.write(", bool submit_async")
     if params:
         f.write(f", {params}")
     f.write(") {\n")
@@ -133,7 +163,18 @@ def write_client_rpc(f, backend: Backend, function, operations, metadata):
         initial_value = "rpc_error()" if result == backend.result else "{}"
         f.write(f"  {result} return_value = {initial_value};\n")
     for operation in operations:
-        if isinstance(operation, (InOutCountOperation, NullableArrayOperation)):
+        if isinstance(
+            operation,
+            (
+                InOutCountOperation,
+                NullableArrayOperation,
+                ScalarOperation,
+                VersionedStructOperation,
+            ),
+        ) or (
+            isinstance(operation, ArrayOperation)
+            and (operation.nullable or operation.counted)
+        ):
             f.write(operation.client_declaration())
         elif isinstance(operation, NullTerminatedOperation):
             f.write(
@@ -145,7 +186,23 @@ def write_client_rpc(f, backend: Backend, function, operations, metadata):
             )
 
     opening = "  if (conn == nullptr ||\n      " if backend.guard_null_conn else "  if ("
+    if submit:
+        # The ticket leads the request; a request that expects its answer
+        # carries the all-ones ticket instead of one.
+        f.write("  uint64_t async_sequence = ~uint64_t{0};\n")
+        f.write("  if (submit_async) {\n")
+        f.write(
+            f"  {opening}rpc_write_start_async_request(conn, RPC_{name}, &async_sequence) < 0 ||\n"
+            "      rpc_write(conn, &async_sequence, sizeof(async_sequence)) < 0 ||\n"
+        )
+        for operation in operations:
+            operation.client_rpc_write(f)
+        f.write("      rpc_write_end(conn) < 0) {\n")
+        f.write("    return rpc_error();\n  }\n")
+        f.write(f"  return {backend.async_success};\n  }}\n")
     f.write(f"{opening}rpc_write_start_request(conn, RPC_{name}) < 0 ||\n")
+    if submit:
+        f.write("      rpc_write(conn, &async_sequence, sizeof(async_sequence)) < 0 ||\n")
     for operation in operations:
         operation.client_rpc_write(f)
     f.write("      rpc_wait_for_response(conn) < 0 ||\n")
@@ -179,6 +236,8 @@ def write_client_wrapper(f, backend: Backend, function, operations, metadata):
     write_client_validation(f, backend, function, operations)
 
     call_args = format_call_args(function)
+    if optional_async(backend, metadata):
+        call_args = ["submit_async(conn)"] + call_args
     suffix = f", {', '.join(call_args)}" if call_args else ""
     call = f"lupine_rpc_{name}(conn{suffix})"
     if metadata.routing_kind == "ALL" and backend.lookup_on_all_connections:
@@ -218,6 +277,13 @@ def write_client_wrapper(f, backend: Backend, function, operations, metadata):
             "  conn_t *conn = connection_for_event("
             f"{metadata.routing_parameter.name});\n"
         )
+    elif metadata.routing_kind == "HANDLE":
+        if metadata.routing_parameter is None:
+            raise RuntimeError(f"{name}: HANDLE routing requires a parameter")
+        f.write(
+            "  conn_t *conn = connection_for_handle("
+            f"{metadata.routing_parameter.name});\n"
+        )
     elif metadata.routing_kind == "STREAM":
         if metadata.routing_parameter is None:
             raise RuntimeError(f"{name}: STREAM routing requires a parameter")
@@ -230,7 +296,11 @@ def write_client_wrapper(f, backend: Backend, function, operations, metadata):
     else:
         raise RuntimeError(f"{name}: unsupported routing key {metadata.routing_kind}")
     template = metadata.client_call_template
-    if template is not None:
+    if template is not None and result == "void":
+        f.write(textwrap.indent(template.before_call, "  "))
+        f.write(f"  {call};\n")
+        f.write(textwrap.indent(template.after_call, "  "))
+    elif template is not None:
         f.write(textwrap.indent(template.before_call, "  "))
         f.write(f"  {result} return_value = {call};\n")
         f.write(textwrap.indent(template.after_call, "  "))
@@ -268,14 +338,19 @@ def write_server_handler(f, backend: Backend, function, operations, metadata):
                 f.write(f"  std::memset(&{argument}, 0, sizeof({argument}));\n")
             else:
                 f.write(f"  {argument} = {{}};\n")
+    submit = optional_async(backend, metadata)
+    always_async = metadata.async_fire_forget and not submit
     if metadata.async_fire_forget:
         f.write("  uint64_t async_sequence = 0;\n")
     f.write("  int request_id;\n")
-    if not metadata.async_fire_forget and result != "void":
+    if not always_async and result != "void":
         f.write(f"  {result} return_value;\n")
     if backend.symbol_lookup:
         fn_params = ", ".join(
-            parameter.type.format() for parameter in function.parameters
+            format_array(parameter.type)
+            if isinstance(parameter.type, Array)
+            else parameter.type.format()
+            for parameter in function.parameters
         )
         f.write(f"  using fn_t = {result} (*)({fn_params});\n")
         f.write("  fn_t fn = nullptr;\n")
@@ -300,9 +375,15 @@ def write_server_handler(f, backend: Backend, function, operations, metadata):
         graph_exec = metadata.graph_exec_node.graph_exec.name
         node = metadata.graph_exec_node.node.name
         f.write(f"  {node} = lupine_htod_graph_exec_node({graph_exec}, {node});\n")
-    if metadata.async_fire_forget:
+    if always_async:
         f.write("  if (rpc_async_sequence_begin(conn, async_sequence) < 0)\n")
         f.write("    goto ERROR_0;\n\n")
+    elif submit:
+        f.write(
+            "  if (async_sequence != ~uint64_t{0} &&\n"
+            "      rpc_async_sequence_begin(conn, async_sequence) < 0)\n"
+            "    goto ERROR_0;\n\n"
+        )
 
     call_args = []
     for parameter in function.parameters:
@@ -317,7 +398,7 @@ def write_server_handler(f, backend: Backend, function, operations, metadata):
     args = ", ".join(call_args)
     if backend.symbol_lookup:
         f.write(f'  fn = {backend.symbol_lookup}<fn_t>("{name}");\n')
-        if result == backend.result and not metadata.async_fire_forget:
+        if result == backend.result and not always_async:
             f.write(
                 "  return_value = fn == nullptr ? function_not_found()\n"
                 f"                               : fn({args});\n\n"
@@ -325,21 +406,26 @@ def write_server_handler(f, backend: Backend, function, operations, metadata):
         else:
             f.write("  if (fn == nullptr)\n")
             f.write("    goto ERROR_0;\n")
-            if result == "void" or metadata.async_fire_forget:
+            if result == "void" or always_async:
                 f.write(f"  fn({args});\n\n")
             else:
                 f.write(f"  return_value = fn({args});\n\n")
-    elif metadata.async_fire_forget or result == "void":
+    elif always_async or result == "void":
         f.write(f"  {entry}({args});\n\n")
     else:
         f.write(f"  return_value = {entry}({args});\n\n")
-    if metadata.async_fire_forget:
+    if always_async:
         f.write("  rpc_async_sequence_end(conn);\n\n")
+    elif submit:
+        f.write("  if (async_sequence != ~uint64_t{0}) {\n")
+        f.write("    rpc_async_sequence_end(conn);\n")
+        write_server_buffer_cleanup(f, owned_buffers, "    ")
+        f.write("    return 0;\n  }\n\n")
 
     if metadata.clear_fields:
         write_cleared_fields(f, metadata, "  ", ".")
         f.write("\n")
-    if not metadata.async_fire_forget:
+    if not always_async:
         f.write("  if (rpc_write_start_response(conn, request_id) < 0 ||\n")
         for operation in operations:
             operation.server_rpc_write(f)
@@ -355,3 +441,79 @@ def write_server_handler(f, backend: Backend, function, operations, metadata):
     f.write("}\n\n")
     if metadata.guard is not None:
         f.write("#endif\n\n")
+
+
+def write_scalar_slot(f, functions_with_annotations):
+    """The server-side slot a pointer-mode scalar's value lands in."""
+    if not any(
+        isinstance(operation, ScalarOperation)
+        for _, _, operations, _ in functions_with_annotations
+        for operation in operations
+    ):
+        return
+    f.write(
+        "// A pointer-mode scalar's value lands in the handler's inline slot,\n"
+        "// or on the heap when it is wider.\n"
+        "static unsigned char *lupine_scalar_slot(std::vector<unsigned char> &heap,\n"
+        "                                         unsigned char *slot, size_t size,\n"
+        "                                         uint32_t width) {\n"
+        "  if (width <= size) {\n"
+        "    return slot;\n"
+        "  }\n"
+        "  heap.resize(width);\n"
+        "  return heap.data();\n"
+        "}\n\n"
+    )
+
+
+def write_versioned_struct_helper(f, functions_with_annotations):
+    """Widens a caller's configuration struct and points its strings at copies."""
+    if not any(
+        isinstance(operation, VersionedStructOperation)
+        for _, _, operations, _ in functions_with_annotations
+        for operation in operations
+    ):
+        return
+    f.write(
+        "template <typename T>\n"
+        "static T *lupine_versioned_struct(\n"
+        "    std::vector<unsigned char> &bytes, uint64_t size,\n"
+        "    std::initializer_list<std::pair<size_t, const char *>> strings,\n"
+        "    std::initializer_list<size_t> cleared) {\n"
+        "  if (size == 0) {\n"
+        "    return nullptr;\n"
+        "  }\n"
+        "  for (const auto &string : strings) {\n"
+        "    if (string.first + sizeof(char *) <= size) {\n"
+        "      std::memcpy(bytes.data() + string.first, &string.second,\n"
+        "                  sizeof(char *));\n"
+        "    }\n"
+        "  }\n"
+        "  const void *null = nullptr;\n"
+        "  for (size_t offset : cleared) {\n"
+        "    if (offset + sizeof(void *) <= size) {\n"
+        "      std::memcpy(bytes.data() + offset, &null, sizeof(void *));\n"
+        "    }\n"
+        "  }\n"
+        "  return reinterpret_cast<T *>(bytes.data());\n"
+        "}\n\n"
+    )
+
+
+def write_profiling_aliases(f, backend: Backend, functions_with_annotations):
+    """Exports each public entry point again under the backend's alias prefix."""
+    if not backend.alias_prefix:
+        return
+    for function, _, _, metadata in functions_with_annotations:
+        name = function.name.format()
+        if name.startswith("lupine"):
+            continue
+        if metadata.guard is not None:
+            f.write(f"#if {metadata.guard}\n")
+        params = ", ".join(format_function_params(function))
+        f.write(
+            f'extern "C" {function.return_type.format()} {backend.alias_prefix}{name}({params})\n'
+            f'    __attribute__((alias("{name}")));\n'
+        )
+        if metadata.guard is not None:
+            f.write("#endif\n")

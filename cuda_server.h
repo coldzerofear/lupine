@@ -15,6 +15,7 @@ int handle_cuModuleLoadDataEx(conn_t *conn);
 int handle_lupineFunctionParamLayoutSnapshot(conn_t *conn);
 int handle_lupineFunctionAttributeSnapshot(conn_t *conn);
 int handle_cuLibraryLoadData(conn_t *conn);
+int handle_lupineMemcpyDtoHAsyncPinned(conn_t *conn);
 int handle_cuMemPoolSetAttribute(conn_t *conn);
 int handle_cuMemPoolGetAttribute(conn_t *conn);
 int handle_cuMemExportToShareableHandle(conn_t *conn);
@@ -64,6 +65,7 @@ int handle_cuEventRecord(conn_t *conn);
 int handle_cuEventRecordWithFlags(conn_t *conn);
 int handle_cuEventQuery(conn_t *conn);
 int handle_lupineEventQueryBatch(conn_t *conn);
+int handle_lupineStreamPoolInit(conn_t *conn);
 int handle_cuStreamWaitEvent(conn_t *conn);
 int handle_cuStreamBeginCaptureToGraph(conn_t *conn);
 int handle_cuStreamUpdateCaptureDependencies(conn_t *conn);
@@ -98,6 +100,9 @@ int handle_cuTensorMapEncodeTiled(conn_t *conn);
 
 bool lupine_server_initialize_connection(conn_t *conn);
 void lupine_server_cleanup_connection(conn_t *conn);
+// Fails every copy still waiting for chunks: a lost bulk connection can never
+// deliver them.
+void lupine_server_bulk_connection_lost();
 void lupine_server_cleanup_log_callbacks(conn_t *conn);
 
 int handle_cuDevicePrimaryCtxRetain(conn_t *conn);
