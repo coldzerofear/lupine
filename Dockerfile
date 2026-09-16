@@ -324,7 +324,65 @@ ENTRYPOINT ["/opt/lupine/bin/lupine_driver_server"]
 # (11.7-13.1, amd64+arm64), and an artifact only loads on glibc >= its
 # builder's. gcc-toolset supplies a newer compiler where nvcc requires one;
 # its libstdc++ delta links statically by design, so the floor stays 2.28.
+#
+# cuDNN, NCCL and cuSPARSELt ship outside the CUDA toolkit -- the RHEL/dnf
+# counterparts of the Ubuntu packages the regular client image installs for
+# the same reason (see the cudnn-headers/nccl-headers/cusparselt-headers
+# stages above). Everything else lupine_runtime_clients can build (cuBLAS,
+# cuFFT, cuRAND, cuSPARSE, cuSOLVER, NVRTC, nvJitLink, nvJPEG, NPP, cuFile,
+# CUPTI) ships inside the CUDA devel image already, so those need nothing
+# extra here. nvSHMEM is skipped: NVIDIA does not publish an RHEL8 package
+# for it, so LUPINE_BUILD_NVSHMEM's own header search simply never finds one
+# and that one shim is left out, the same way it is for CUDA 11 upstream.
 # ---------------------------------------------------------------------------
+
+FROM nvidia/cuda:${CUDA_VERSION}-${CUDA_IMAGE_FLAVOR}-rockylinux8 AS static-cudnn-headers
+
+ARG CUDA_VERSION
+
+# cuDNN 9's headers are a separate subpackage from its devel meta-package (the
+# latter only pulls in the runtime + this one); installing the headers package
+# directly skips a runtime .so this build never links against.
+RUN dnf install -y "libcudnn9-headers-cuda-${CUDA_VERSION%%.*}" \
+    && mkdir -p /opt/cudnn/include \
+    && cp /usr/include/cudnn*.h /opt/cudnn/include/ \
+    && dnf clean all
+
+FROM nvidia/cuda:${CUDA_VERSION}-${CUDA_IMAGE_FLAVOR}-rockylinux8 AS static-nccl-headers
+
+ARG CUDA_VERSION
+
+# NCCL's RHEL package carries no CUDA-major suffix, only a "+cudaX.Y" release
+# tag, and dnf's default "latest" pick is not necessarily built for this
+# lane's CUDA series -- the same reason the Ubuntu lane greps apt-cache
+# madison for the newest release naming this series specifically.
+RUN set -eux; \
+    series="$(printf '%s' "${CUDA_VERSION}" | awk -F. '{print $1"."$2}')"; \
+    nevra="$(dnf list --showduplicates libnccl-devel 2>/dev/null \
+              | awk -v s="+cuda${series}" '$1 ~ /^libnccl-devel\./ && index($2, s) {print $2}' \
+              | sort -V | tail -1)"; \
+    test -n "$nevra"; \
+    dnf install -y "libnccl-devel-${nevra}"; \
+    mkdir -p /opt/nccl/include; \
+    cp /usr/include/nccl.h /opt/nccl/include/; \
+    dnf clean all
+
+FROM nvidia/cuda:${CUDA_VERSION}-${CUDA_IMAGE_FLAVOR}-rockylinux8 AS static-cusparselt-headers
+
+ARG CUDA_VERSION
+
+# cuSPARSELt moved from one flat package to a CUDA-major-suffixed one partway
+# through its RHEL releases; try the current naming first and fall back to the
+# one it replaced. Older CUDA majors (11) may have neither -- left with an
+# empty include dir, LUPINE_BUILD_CUSPARSELT's own header search finds nothing
+# and that shim is simply left out for that lane, same as nvSHMEM.
+RUN set -eux; \
+    mkdir -p /opt/cusparselt/include; \
+    dnf install -y "libcusparselt0-devel-cuda-${CUDA_VERSION%%.*}" \
+      || dnf install -y libcusparselt-devel \
+      || true; \
+    cp /usr/include/cusparseLt.h /opt/cusparselt/include/ 2>/dev/null || true; \
+    dnf clean all
 
 FROM nvidia/cuda:${CUDA_VERSION}-${CUDA_IMAGE_FLAVOR}-rockylinux8 AS client-static-build
 
@@ -385,6 +443,12 @@ RUN set -eux; \
     make install_sw; \
     cd ..; rm -rf "openssl-${OPENSSL_VERSION}" openssl.tar.gz
 
+# Headers for the libraries that ship outside the toolkit; see the stages
+# above. Copied beside the toolkit's own so a single -I finds everything.
+COPY --from=static-cudnn-headers /opt/cudnn/include/ /usr/local/cuda/include/
+COPY --from=static-nccl-headers /opt/nccl/include/ /usr/local/cuda/include/
+COPY --from=static-cusparselt-headers /opt/cusparselt/include/ /usr/local/cuda/include/
+
 WORKDIR /opt/lupine
 COPY . /opt/lupine
 
@@ -394,6 +458,10 @@ COPY . /opt/lupine
 # scl_source does for our purposes; cmake and nvcc pick the compiler from PATH.
 # The configure/build markers exist because BuildKit only shows the failing
 # step tail -- "exit code 2" alone told us nothing the first time this broke.
+#
+# lupine_runtime_clients is every runtime/library client shim CMake found
+# headers for (see CMakeLists.txt); it always includes lupine_cudart_client,
+# so naming that one alongside it would be redundant.
 RUN set -eux; \
     if [ -n "${GCC_TOOLSET}" ]; then export PATH="/opt/rh/${GCC_TOOLSET}/root/usr/bin:${PATH}"; fi; \
     cmake -S /opt/lupine -B /opt/lupine/build-static \
@@ -405,35 +473,46 @@ RUN set -eux; \
       -DCMAKE_SHARED_LINKER_FLAGS="-static-libstdc++ -static-libgcc" \
       -DCMAKE_LIBRARY_PATH="${CUDA_HOME}/lib64/stubs"; \
     cmake --build /opt/lupine/build-static --parallel "$(nproc)" \
-      --target lupine_cuda_client lupine_cudart_client lupine_nvml_client
+      --target lupine_cuda_client lupine_runtime_clients lupine_nvml_client
 
-RUN chmod +x /opt/lupine/deploy/check_static_client.sh \
-    && /opt/lupine/deploy/check_static_client.sh \
-         /opt/lupine/build-static/libcuda.so.1 \
-         /opt/lupine/build-static/libnvidia-ml.so.1 \
-         "${MAX_GLIBC}"
-
-# libcudart.so.<major> is now a first-class codegen shim (lupine_cudart_client,
-# built above), version-matched to this lane's CUDA (so.11.0 / so.12 / so.13)
-# and linked against our libcuda.so.1 ($ORIGIN rpath). It ships alongside the
-# other shims so an injected image without a CUDA runtime can use it. Same
-# glibc-only gate as the other shims; no longer 13.x-only.
+# Every shim beyond the two roots: libcudart.so.<major> (a first-class codegen
+# shim, lupine_cudart_client) plus whatever lupine_runtime_clients built --
+# some entries are absent on a given CUDA major (nvJitLink needs >= 12.4,
+# cuFile/CUPTI need their own headers, cuSPARSELt needs the header stage above
+# to have found something) and the glob+existence-test below only picks up
+# what actually got built. Each links against libcuda.so.1/libcudart.so.* over
+# its own $ORIGIN rpath (BUILD_RPATH "$ORIGIN" in CMakeLists.txt) rather than
+# carrying its own copy of the transport, so the bundle is self-contained as a
+# whole even though no single shim beyond the roots is on its own.
 RUN set -eux; \
-    so="$(ls /opt/lupine/build-static/libcudart.so.* 2>/dev/null \
-            | grep -E 'libcudart\.so\.[0-9.]+$' | head -1)"; \
-    test -n "$so"; \
-    if readelf -d "$so" | grep NEEDED | \
-         grep -vE 'lib(c|m|dl|rt|pthread)\.so|ld-linux|libcuda\.so\.1'; then \
-      echo "libcudart has an unexpected dependency"; exit 1; \
-    fi; \
-    if nm -D --defined-only "$so" | awk '{print $3}' | \
-         grep -vE '^(cuda|__cuda|libcudart\.so)'; then \
-      echo "libcudart leaks non-cudart symbols"; exit 1; \
-    fi; \
-    ceiling="$(readelf -V "$so" | grep -oE 'GLIBC_[0-9.]+' | sed 's/GLIBC_//' | sort -V | tail -1)"; \
-    if ! printf '%s\n%s\n' "$ceiling" "$MAX_GLIBC" | sort -C -V; then \
-      echo "libcudart needs glibc $ceiling > $MAX_GLIBC"; exit 1; \
-    fi
+    deps=""; \
+    for f in /opt/lupine/build-static/libcudart.so.* \
+             /opt/lupine/build-static/libcublas.so.* \
+             /opt/lupine/build-static/libcublasLt.so.* \
+             /opt/lupine/build-static/libcufft.so.* \
+             /opt/lupine/build-static/libcudnn.so.* \
+             /opt/lupine/build-static/libcurand.so.* \
+             /opt/lupine/build-static/libcusparse.so.* \
+             /opt/lupine/build-static/libcusparseLt.so.* \
+             /opt/lupine/build-static/libcusolver.so.* \
+             /opt/lupine/build-static/libcusolverMg.so.* \
+             /opt/lupine/build-static/libnvrtc.so.* \
+             /opt/lupine/build-static/libnvJitLink.so.* \
+             /opt/lupine/build-static/libnccl.so.* \
+             /opt/lupine/build-static/libnvjpeg.so.* \
+             /opt/lupine/build-static/libnpp*.so.* \
+             /opt/lupine/build-static/libcufile.so.* \
+             /opt/lupine/build-static/libcupti.so.*; \
+    do [ -e "$f" ] && deps="$deps $f"; done; \
+    chmod +x /opt/lupine/deploy/check_static_client.sh; \
+    /opt/lupine/deploy/check_static_client.sh "${MAX_GLIBC}" \
+      /opt/lupine/build-static/libcuda.so.1 \
+      /opt/lupine/build-static/libnvidia-ml.so.1 \
+      -- $deps; \
+    mkdir -p /opt/lupine/shims; \
+    cp -P /opt/lupine/build-static/libcuda.so.1 \
+          /opt/lupine/build-static/libnvidia-ml.so.1 \
+          $deps /opt/lupine/shims/
 
 # Load-probe helper: RTLD_NOW forces every relocation, so a missing dependency
 # or undefined symbol fails at build time, not in a user pod.
@@ -512,14 +591,17 @@ RUN set -eux; \
 
 FROM rockylinux:8-minimal AS client-static-loadtest
 
-COPY --from=client-static-build /opt/lupine/build-static/libcuda.so.1 /probe/libcuda.so.1
-COPY --from=client-static-build /opt/lupine/build-static/libnvidia-ml.so.1 /probe/libnvidia-ml.so.1
+# The whole bundle, whatever shims this CUDA major actually built -- each
+# dependent shim's $ORIGIN rpath then finds its sibling(s) right here, exactly
+# as it will in an injected image where they are dropped in together.
+COPY --from=client-static-build /opt/lupine/shims/ /probe/
 COPY --from=client-static-build /opt/lupine/build-static/loadprobe /probe/loadprobe
-COPY --from=client-static-build /opt/lupine/build-static/libcudart.so.* /probe/
 
-RUN /probe/loadprobe /probe/libcuda.so.1 /probe/libnvidia-ml.so.1 \
-    && for c in /probe/libcudart.so.*; do [ -e "$c" ] && /probe/loadprobe "$c"; done \
-    && touch /probe/loadtest-passed
+RUN set -eux; \
+    for so in /probe/*.so /probe/*.so.*; do \
+      [ -e "$so" ] && /probe/loadprobe "$so"; \
+    done; \
+    touch /probe/loadtest-passed
 
 # Final artifact carrier. busybox so an init container can `cp -a` the
 # artifacts into a shared volume; nothing here ever executes the shims.
@@ -538,17 +620,21 @@ LABEL io.lupine.min-glibc="${MAX_GLIBC}"
 # The loadtest stage produces no artifact we ship; copying its marker makes it
 # a hard build dependency so the probe cannot be skipped by stage pruning.
 COPY --from=client-static-loadtest /probe/loadtest-passed /artifacts/.loadtest-passed
-COPY --from=client-static-build /opt/lupine/build-static/libcuda.so.1 /artifacts/libcuda.so.1
-COPY --from=client-static-build /opt/lupine/build-static/libnvidia-ml.so.1 /artifacts/libnvidia-ml.so.1
+COPY --from=client-static-build /opt/lupine/shims/ /artifacts/
 COPY --from=client-static-smi /opt/nvidia-smi /artifacts/nvidia-smi
-COPY --from=client-static-build /opt/lupine/build-static/libcudart.so.* /artifacts/
 
-RUN printf 'cuda_version=%s\nmin_glibc=%s\n' \
-      "${CUDA_VERSION}" "${MAX_GLIBC}" > /artifacts/metadata \
-    && ln -s libcuda.so.1 /artifacts/libcuda.so \
-    && ln -s libnvidia-ml.so.1 /artifacts/libnvidia-ml.so \
-    && cudart="$(ls /artifacts/libcudart.so.* | grep -E 'libcudart\.so\.[0-9.]+$' | head -1)" \
-    && ln -s "$(basename "$cudart")" /artifacts/libcudart.so
+# One unversioned "libfoo.so" per shim, for the -lfoo / dlopen("libfoo.so")
+# callers who do not name a soname. Loops rather than naming each of the ~20
+# shims so a future one needs no matching line here.
+RUN set -eux; \
+    printf 'cuda_version=%s\nmin_glibc=%s\n' \
+      "${CUDA_VERSION}" "${MAX_GLIBC}" > /artifacts/metadata; \
+    for versioned in /artifacts/*.so.*; do \
+      [ -e "$versioned" ] || continue; \
+      base="$(basename "$versioned")"; \
+      name="${base%%.so.*}.so"; \
+      [ -e "/artifacts/$name" ] || ln -s "$base" "/artifacts/$name"; \
+    done
 
 CMD ["sh", "-c", "cp -a /artifacts/. \"${ARTIFACTS_DEST:-/target}/\" && echo copied to ${ARTIFACTS_DEST:-/target}"]
 
@@ -625,6 +711,16 @@ RUN set -eux; \
     make install; \
     cd ..; rm -rf "nghttp2-${NGHTTP2_VERSION}" nghttp2.tar.gz
 
+# Headers for the libraries that ship outside the toolkit; see the
+# static-cudnn-headers/static-nccl-headers/static-cusparselt-headers stages
+# above the client lane. The per-library lupine_*_server static components
+# link into lupine_driver_server automatically once CMake finds these (see
+# CMakeLists.txt's repeated target_link_libraries(lupine_driver_server ...)),
+# so no target list change is needed here, only the headers to find.
+COPY --from=static-cudnn-headers /opt/cudnn/include/ /usr/local/cuda/include/
+COPY --from=static-nccl-headers /opt/nccl/include/ /usr/local/cuda/include/
+COPY --from=static-cusparselt-headers /opt/cusparselt/include/ /usr/local/cuda/include/
+
 WORKDIR /opt/lupine
 COPY . /opt/lupine
 
@@ -695,7 +791,26 @@ LABEL io.lupine.min-glibc="${MAX_GLIBC}"
 COPY --from=server-static-runprobe /probe/runprobe-passed /opt/lupine/.runprobe-passed
 COPY --from=server-static-build /opt/lupine/build-static-server/lupine_driver_server /opt/lupine/bin/lupine_driver_server
 
-RUN chmod +x /opt/lupine/bin/lupine_driver_server
+# cuBLAS, cuFFT, cuRAND, cuSPARSE, cuSOLVER, NVRTC, nvJitLink, nvJPEG, NPP,
+# cuFile and CUPTI ship inside this base image already (it is the same
+# CUDA-toolkit-on-rockylinux8 image server-static-build used), so their
+# lupine_*_server components can dlopen the real library without anything
+# more here. cuDNN, NCCL and cuSPARSELt ship outside the toolkit -- install
+# just their runtime .so (no headers/static libs, unlike the builder), with
+# the same version pinning and graceful skip as the header stages above.
+RUN set -eux; \
+    cuda_major="${CUDA_VERSION%%.*}"; \
+    series="$(printf '%s' "${CUDA_VERSION}" | awk -F. '{print $1"."$2}')"; \
+    dnf install -y "libcudnn9-cuda-${cuda_major}" || true; \
+    nccl_nevra="$(dnf list --showduplicates libnccl 2>/dev/null \
+                   | awk -v s="+cuda${series}" '$1 ~ /^libnccl\./ && index($2, s) {print $2}' \
+                   | sort -V | tail -1)"; \
+    if [ -n "$nccl_nevra" ]; then dnf install -y "libnccl-${nccl_nevra}"; fi; \
+    dnf install -y "libcusparselt0-cuda-${cuda_major}" \
+      || dnf install -y libcusparselt0 \
+      || true; \
+    dnf clean all; \
+    chmod +x /opt/lupine/bin/lupine_driver_server
 
 ENV LUPINE_PORT=14833
 ENV NVIDIA_VISIBLE_DEVICES=all

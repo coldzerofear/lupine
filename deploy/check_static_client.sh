@@ -1,53 +1,87 @@
 #!/usr/bin/env bash
 #
-# Verify a LUPINE_STATIC_DEPS=ON client shim is actually self-contained.
+# Verify a LUPINE_STATIC_DEPS=ON client shim bundle is actually self-contained.
 #
 # The static build exists so the shims can be dropped into arbitrary container
 # images. Every check here guards one way that promise silently breaks:
 #
-#   1. ldd allowlist     - a stray DT_NEEDED (libnghttp2, libssl, libstdc++)
-#                          reintroduces the dependency the build exists to
-#                          remove. glibc family only.
+#   1. ldd allowlist     - a stray DT_NEEDED (libnghttp2, libssl, libstdc++, or
+#                          a lupine artifact absent from this bundle) reintroduces
+#                          a dependency the target image would have to satisfy.
+#                          The root shims (libcuda.so.1, libnvidia-ml.so.1) each
+#                          own an RPC connection and must depend on glibc alone;
+#                          every other shim forwards through one of those over
+#                          its $ORIGIN rpath, so it may also depend on another
+#                          file in this same bundle.
 #   2. .dynsym export    - embedded nghttp2/OpenSSL/libstdc++ symbols leaking
 #                          into .dynsym would interpose on the target image's
 #                          own copies (the version scripts must hide them).
+#                          Checked on every shim: none of them should carry
+#                          these regardless of tier.
 #   3. TLS presence      - find_package(OpenSSL QUIET) degrades SILENTLY when
-#                          OpenSSL is missing on the builder; the artifact then
+#                          OpenSSL is missing on the builder; a root shim then
 #                          refuses https:// endpoints at runtime. Static
 #                          libcrypto embeds its version string, so its absence
-#                          is detectable here rather than in production.
+#                          is detectable here rather than in production. Only
+#                          the root shims carry their own copy of the transport
+#                          (and so TLS support); the rest forward through them.
 #   4. glibc ceiling     - the artifact loads only on images whose glibc is >=
-#                          the max version referenced. The ceiling is an input
-#                          (per builder base); exceeding it means the build ran
-#                          on a newer base than the artifact claims to support.
+#                          the max version referenced. Checked on every shim.
 #
-# Usage: check_static_client.sh <libcuda.so.1> <libnvidia-ml.so.1> <max-glibc>
-#   e.g. check_static_client.sh build/libcuda.so.1 build/libnvidia-ml.so.1 2.35
+# Usage: check_static_client.sh <max-glibc> <root.so>... -- <dependent.so>...
+#   e.g. check_static_client.sh 2.28 build/libcuda.so.1 build/libnvidia-ml.so.1 \
+#          -- build/libcudart.so.13 build/libcublas.so.13
 
 set -o errexit
 set -o nounset
 set -o pipefail
 
-LIBCUDA="${1:?usage: $0 <libcuda.so.1> <libnvidia-ml.so.1> <max-glibc>}"
-LIBNVML="${2:?missing libnvidia-ml.so.1}"
-MAX_GLIBC="${3:?missing max glibc version (e.g. 2.35)}"
+MAX_GLIBC="${1:?usage: $0 <max-glibc> <root.so>... -- <dependent.so>...}"
+shift
+
+roots=()
+while [[ $# -gt 0 && "$1" != "--" ]]; do
+  roots+=("$1")
+  shift
+done
+if [[ $# -eq 0 ]]; then
+  echo "usage: $0 <max-glibc> <root.so>... -- <dependent.so>..." >&2
+  exit 1
+fi
+shift # the --
+dependents=("$@")
+
+if [[ ${#roots[@]} -eq 0 ]]; then
+  echo "[FAIL] no root shims given" >&2
+  exit 1
+fi
 
 fail=0
 
-# DT_NEEDED allowlist: the glibc family plus the dynamic loader. Anything else
-# is a dependency the target image would have to satisfy. libgcc_s is
-# deliberately absent: -static-libgcc must have removed it.
-ALLOWED_RE='^(libc\.so|libm\.so|libpthread\.so|libdl\.so|librt\.so|ld-linux|linux-vdso)'
+# SONAMEs of every shim in this bundle, so a dependent shim's DT_NEEDED on
+# another one of them is recognized rather than flagged as foreign.
+bundle_sonames=()
+for so in "${roots[@]}" "${dependents[@]}"; do
+  bundle_sonames+=("$(basename "$so")")
+done
+bundle_re="$(IFS='|'; echo "${bundle_sonames[*]}")"
+bundle_re="${bundle_re//./\\.}"
+
+GLIBC_RE='^(libc\.so|libm\.so|libpthread\.so|libdl\.so|librt\.so|ld-linux|linux-vdso)'
 
 check_needed() {
-  local so="$1"
-  local bad
+  local so="$1" allow_bundle="$2" bad
   bad=$(readelf -d "$so" | awk '/NEEDED/{gsub(/[\[\]]/,"",$5); print $5}' \
-        | grep -vE "${ALLOWED_RE}" || true)
+        | grep -vE "${GLIBC_RE}" || true)
+  if [[ "$allow_bundle" == 1 && -n "$bad" ]]; then
+    bad=$(echo "$bad" | grep -vE "^(${bundle_re})$" || true)
+  fi
   if [[ -n "$bad" ]]; then
-    echo "[FAIL] $so has non-glibc DT_NEEDED entries:"
+    echo "[FAIL] $so has DT_NEEDED entries outside its allowance:"
     echo "$bad" | sed 's/^/         /'
     fail=1
+  elif [[ "$allow_bundle" == 1 ]]; then
+    echo "[ok] $so DT_NEEDED confined to glibc + this bundle"
   else
     echo "[ok] $so DT_NEEDED confined to glibc"
   fi
@@ -92,8 +126,11 @@ check_tls() {
 check_glibc_ceiling() {
   local so="$1"
   local max
+  # grep finding nothing is expected (a shim with no versioned glibc symbol) and
+  # must not abort the whole script under pipefail -- there are more shims to
+  # check after this one fails its own report below.
   max=$(readelf -V "$so" 2>/dev/null | grep -oE 'GLIBC_[0-9]+\.[0-9]+' \
-        | sort -uV | tail -1 | sed 's/GLIBC_//')
+        | sort -uV | tail -1 | sed 's/GLIBC_//' || true)
   if [[ -z "$max" ]]; then
     echo "[FAIL] $so: could not determine referenced glibc versions"
     fail=1
@@ -107,11 +144,18 @@ check_glibc_ceiling() {
   fi
 }
 
-for so in "$LIBCUDA" "$LIBNVML"; do
+for so in "${roots[@]}"; do
   test -f "$so" || { echo "[FAIL] missing artifact: $so"; exit 1; }
-  check_needed "$so"
+  check_needed "$so" 0
   check_exports "$so"
   check_tls "$so"
+  check_glibc_ceiling "$so"
+done
+
+for so in "${dependents[@]}"; do
+  test -f "$so" || { echo "[FAIL] missing artifact: $so"; exit 1; }
+  check_needed "$so" 1
+  check_exports "$so"
   check_glibc_ceiling "$so"
 done
 
