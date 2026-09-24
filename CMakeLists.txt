@@ -408,6 +408,10 @@ if(LUPINE_BUILD_CUDA)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         # shm_open/shm_unlink live in librt before glibc 2.34.
         target_link_libraries(lupine_cuda_client PRIVATE rt)
+        if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
+           CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9)
+            target_link_libraries(lupine_cuda_client PRIVATE stdc++fs)
+        endif()
     endif()
     set_target_properties(lupine_cuda_client PROPERTIES
         POSITION_INDEPENDENT_CODE ON)
