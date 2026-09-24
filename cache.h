@@ -19,4 +19,9 @@ void lupine_lane_context_cache_store(int route_id, CUcontext context);
 
 extern "C" void lupine_invalidate_current_context_cache();
 
+// A driver context set on the lane bound to the calling thread, or a
+// connection coming or going, moves that lane off what this thread believed
+// was current there.
+extern "C" void lupine_note_device_binding_changed();
+
 #endif

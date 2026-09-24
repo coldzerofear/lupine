@@ -47,6 +47,10 @@ struct h2_pair {
     server.connfd = LUPINE_INVALID_SOCKET;
   }
 
+  // Transports and their worker threads retain pointers to these connections.
+  h2_pair(const h2_pair &) = delete;
+  h2_pair &operator=(const h2_pair &) = delete;
+
   ~h2_pair() {
     rpc_conn_destroy(&client);
     rpc_conn_destroy(&server);
@@ -95,13 +99,11 @@ void test_response_completed_hook(conn_t *conn, int32_t stream_id) {
 void init_pair_sockets(h2_pair *pair);
 void exchange_settings(h2_pair *pair);
 
-h2_pair make_pair() {
-  h2_pair pair;
-  init_pair_sockets(&pair);
-  require(rpc_http2_client_init(&pair.client) == 0, "client h2 init failed");
-  rpc_http2_client_start_heartbeat(&pair.client);
-  require(rpc_http2_server_init(&pair.server) == 0, "server h2 init failed");
-  return pair;
+void init_pair(h2_pair *pair) {
+  init_pair_sockets(pair);
+  require(rpc_http2_client_init(&pair->client) == 0, "client h2 init failed");
+  rpc_http2_client_start_heartbeat(&pair->client);
+  require(rpc_http2_server_init(&pair->server) == 0, "server h2 init failed");
 }
 
 void init_pair_sockets(h2_pair *pair) {
@@ -364,7 +366,8 @@ void test_data_provider_frame_sizing() {
 }
 
 void test_client_to_server() {
-  h2_pair pair = make_pair();
+  h2_pair pair;
+  init_pair(&pair);
   std::string message = "hello over h2";
   std::string received;
   std::thread reader(
@@ -381,7 +384,8 @@ void test_server_receives_session_id() {
   lupine_test_setenv("LUPINE_SESSION", "lease-123");
 
   {
-    h2_pair pair = make_pair();
+    h2_pair pair;
+    init_pair(&pair);
     write_all(&pair.client, {"x"});
     require(read_string(&pair.server, 1) == "x",
             "server did not receive session test payload");
@@ -398,7 +402,8 @@ void test_server_receives_session_id() {
 }
 
 void test_server_to_client_after_request_headers() {
-  h2_pair pair = make_pair();
+  h2_pair pair;
+  init_pair(&pair);
   std::string request = "request";
   std::string response = "response";
   std::string received_request;
@@ -788,7 +793,8 @@ void test_va_window_and_aliases_are_disjoint() {
 }
 
 void test_fragmented_cursors() {
-  h2_pair pair = make_pair();
+  h2_pair pair;
+  init_pair(&pair);
   std::vector<std::string> chunks = {"alpha", "", ":", "beta", ":gamma"};
   std::string received;
   std::thread reader([&] { received = read_string(&pair.server, 16); });
@@ -798,7 +804,8 @@ void test_fragmented_cursors() {
 }
 
 void test_fragmented_frames_direct() {
-  h2_pair pair = make_pair();
+  h2_pair pair;
+  init_pair(&pair);
   exchange_settings(&pair);
   const rpc_http2_read_stats before = read_stats(&pair.server);
   const std::string expected = "fragmented-data";
@@ -819,7 +826,8 @@ void test_fragmented_frames_direct() {
 }
 
 void test_partial_read_stages_only_overflow() {
-  h2_pair pair = make_pair();
+  h2_pair pair;
+  init_pair(&pair);
   exchange_settings(&pair);
   std::string payload(4096, '\0');
   for (size_t i = 0; i < payload.size(); ++i) {
@@ -854,7 +862,8 @@ void test_partial_read_stages_only_overflow() {
 }
 
 void test_truncated_read_clears_direct_destination() {
-  h2_pair pair = make_pair();
+  h2_pair pair;
+  init_pair(&pair);
   exchange_settings(&pair);
   std::vector<unsigned char> guarded(48, 0xa5);
   const std::string prefix = "truncated";
@@ -879,8 +888,57 @@ void test_truncated_read_clears_direct_destination() {
   }
 }
 
+void test_shutdown_wakes_idle_reader() {
+  h2_pair pair;
+  init_pair(&pair);
+  exchange_settings(&pair);
+
+  int32_t lane = rpc_http2_lane_stream(&pair.client, 501);
+  require(lane > 0 && rpc_http2_accept_stream(&pair.server) == lane,
+          "idle reader lane setup failed");
+  int lane_result = 0;
+  std::thread lane_reader([&] {
+    char byte;
+    lane_result = rpc_http2_read_stream(&pair.client, lane, &byte, 1);
+  });
+  int result = 0;
+  std::thread reader([&] {
+    char byte;
+    result = rpc_http2_read(&pair.client, &byte, sizeof(byte));
+  });
+  // Keep the peer alive and silent while the local socket reader blocks.
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  rpc_shutdown_transport_socket(&pair.client);
+  reader.join();
+  lane_reader.join();
+  require(lane_result == -1, "shutdown did not wake the idle lane reader");
+  require(result == -1, "shutdown did not wake the idle HTTP/2 reader");
+  require(pair.client.connfd != LUPINE_INVALID_SOCKET,
+          "shutdown closed the socket before transport teardown");
+}
+
+void test_destroy_drains_pending_output() {
+  h2_pair pair;
+  init_pair(&pair);
+  exchange_settings(&pair);
+
+  std::string payload(256 * 1024 + 17, '\0');
+  uint32_t seed = 37;
+  for (char &byte : payload) {
+    seed = seed * 1664525u + 1013904223u;
+    byte = static_cast<char>(seed >> 24);
+  }
+  write_all(&pair.server, {payload});
+  // Destroy the transport while its socket remains open. Cancelling Windows
+  // receives must not discard the writer's queued frames or encoder tail.
+  rpc_http2_destroy(&pair.server);
+  require(read_string(&pair.client, payload.size()) == payload,
+          "transport teardown discarded pending output");
+}
+
 void test_close_already_failed_transport_socket() {
-  h2_pair pair = make_pair();
+  h2_pair pair;
+  init_pair(&pair);
   exchange_settings(&pair);
 
   // Transport readers mark the logical connection closed before the owner
@@ -896,7 +954,8 @@ void test_close_already_failed_transport_socket() {
   do {
     received = recv(pair.server.connfd, buffer, sizeof(buffer), 0);
   } while (received > 0);
-  require(received == 0 || (received < 0 && errno == ECONNRESET),
+  require(received == 0 ||
+              (received < 0 && lupine_test_socket_error_is_reset()),
           "failed transport socket did not notify peer");
 
   // Cleanup can race the dispatch thread and the library destructor.
@@ -906,8 +965,9 @@ void test_close_already_failed_transport_socket() {
 }
 
 void test_abort_failed_transport_with_queued_data() {
-  int listener = socket(AF_INET, SOCK_STREAM, 0);
-  require(listener >= 0, "queued close listener socket failed");
+  lupine_socket_t listener = socket(AF_INET, SOCK_STREAM, 0);
+  require(listener != LUPINE_INVALID_SOCKET,
+          "queued close listener socket failed");
 
   sockaddr_in address = {};
   address.sin_family = AF_INET;
@@ -924,7 +984,8 @@ void test_abort_failed_transport_with_queued_data() {
 
   conn_t connection = {};
   connection.connfd = socket(AF_INET, SOCK_STREAM, 0);
-  require(connection.connfd >= 0, "queued close client socket failed");
+  require(connection.connfd != LUPINE_INVALID_SOCKET,
+          "queued close client socket failed");
   require(lupine_socket_apply_transport_options(connection.connfd) == 0,
           "queued close transport setup failed");
 #ifdef TCP_USER_TIMEOUT
@@ -942,8 +1003,8 @@ void test_abort_failed_transport_with_queued_data() {
   require(connect(connection.connfd, reinterpret_cast<sockaddr *>(&address),
                   sizeof(address)) == 0,
           "queued close connect failed");
-  int peer = accept(listener, nullptr, nullptr);
-  require(peer >= 0, "queued close accept failed");
+  lupine_socket_t peer = accept(listener, nullptr, nullptr);
+  require(peer != LUPINE_INVALID_SOCKET, "queued close accept failed");
   require(
       lupine_test_setsockopt_int(peer, SOL_SOCKET, SO_RCVBUF, buffer_size) == 0,
       "queued close receive buffer setup failed");
@@ -959,7 +1020,7 @@ void test_abort_failed_transport_with_queued_data() {
       queued += static_cast<size_t>(sent);
       continue;
     }
-    require(sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK),
+    require(sent < 0 && lupine_test_socket_error_is_would_block(),
             "queued close fill failed");
     break;
   }
@@ -972,7 +1033,7 @@ void test_abort_failed_transport_with_queued_data() {
   do {
     received = recv(peer, payload.data(), payload.size(), 0);
   } while (received > 0);
-  require(received < 0 && errno == ECONNRESET,
+  require(received < 0 && lupine_test_socket_error_is_reset(),
           "queued transport close was not abortive");
 
   lupine_socket_close(peer);
@@ -980,7 +1041,8 @@ void test_abort_failed_transport_with_queued_data() {
 }
 
 void test_independent_stream_lanes() {
-  h2_pair pair = make_pair();
+  h2_pair pair;
+  init_pair(&pair);
   exchange_settings(&pair);
 
   int32_t client_first = rpc_http2_lane_stream(&pair.client, 101);
@@ -1032,7 +1094,8 @@ void test_independent_stream_lanes() {
 }
 
 void test_socket_reader_hands_off_between_streams() {
-  h2_pair pair = make_pair();
+  h2_pair pair;
+  init_pair(&pair);
   exchange_settings(&pair);
 
   int32_t client_lane = rpc_http2_lane_stream(&pair.client, 404);
@@ -1087,7 +1150,8 @@ void exchange_settings(h2_pair *pair) {
 }
 
 void test_large_payload() {
-  h2_pair pair = make_pair();
+  h2_pair pair;
+  init_pair(&pair);
   exchange_settings(&pair);
 
   std::string payload(2 * 1024 * 1024, '\0');
@@ -1103,10 +1167,18 @@ void test_large_payload() {
             {payload.substr(0, midpoint), payload.substr(midpoint)});
   reader.join();
   require(received == payload, "large payload mismatch");
+  require(rpc_http2_end_stream(&pair.client,
+                               rpc_http2_dispatch_stream(&pair.client)) == 0,
+          "large payload stream end failed");
+  char extra;
+  require(rpc_http2_read(&pair.server, &extra, 1) ==
+              LUPINE_RPC_HTTP2_STREAM_END,
+          "reader did not observe the end of the payload stream");
 }
 
 void test_payload_larger_than_flow_control_window() {
-  h2_pair pair = make_pair();
+  h2_pair pair;
+  init_pair(&pair);
   exchange_settings(&pair);
 
   // Flow control counts compressed bytes. Cross the current server window
@@ -1150,11 +1222,11 @@ void test_payload_larger_than_flow_control_window() {
 
   int write_result = write_bytes(&pair.client, payload.data(), payload.size());
   if (write_result != 0) {
-    shutdown(pair.client.connfd, LUPINE_TEST_SHUT_RDWR);
-    shutdown(pair.server.connfd, LUPINE_TEST_SHUT_RDWR);
+    rpc_shutdown_transport_socket(&pair.client);
+    rpc_shutdown_transport_socket(&pair.server);
   }
   server_reader.join();
-  shutdown(pair.client.connfd, LUPINE_TEST_SHUT_RDWR);
+  rpc_shutdown_transport_socket(&pair.client);
   client_control_reader.join();
 
   require(write_result == 0, "flow-controlled write failed before completion");
@@ -1167,7 +1239,8 @@ void test_payload_larger_than_flow_control_window() {
 // the hold always has credit left for the bytes it is blocked on, and the
 // release hands the rest back.
 void test_server_window_hold_caps_and_releases() {
-  h2_pair pair = make_pair();
+  h2_pair pair;
+  init_pair(&pair);
   exchange_settings(&pair);
 
   constexpr size_t kBurst = LUPINE_FF_STAGING_WINDOW_BYTES;
@@ -1337,7 +1410,8 @@ void test_reset_wakes_flow_controlled_writer() {
 // The transport LZ4-encodes the complete HTTP/2 body, including small RPC
 // fields and large transfer data spread across several caller-owned cursors.
 void test_lz4_content_encoding_round_trip() {
-  h2_pair pair = make_pair();
+  h2_pair pair;
+  init_pair(&pair);
   exchange_settings(&pair);
 
   std::string prefix = "head";
@@ -1398,7 +1472,8 @@ int refill_next_chunk(void *opaque, rpc_write_cursor *cursor) {
 }
 
 void test_refillable_cursor_round_trip() {
-  h2_pair pair = make_pair();
+  h2_pair pair;
+  init_pair(&pair);
   exchange_settings(&pair);
 
   refill_chunks source;
@@ -1429,7 +1504,8 @@ void test_refillable_cursor_round_trip() {
 }
 
 void test_refillable_cursor_across_flow_control_window() {
-  h2_pair pair = make_pair();
+  h2_pair pair;
+  init_pair(&pair);
   exchange_settings(&pair);
 
   refill_chunks source;
@@ -1469,7 +1545,8 @@ void test_rpc_write_queue_grows() {
   require(zero_length.write_queue.empty(),
           "zero-length write consumed a queue entry");
 
-  h2_pair pair = make_pair();
+  h2_pair pair;
+  init_pair(&pair);
 
   constexpr int kCount = 300;
   constexpr int kOp = 77;
@@ -1508,7 +1585,8 @@ void test_rpc_write_queue_grows() {
 }
 
 void test_rpc_write_buffer_uses_fixed_allocation() {
-  h2_pair pair = make_pair();
+  h2_pair pair;
+  init_pair(&pair);
   require(rpc_write_start_response(&pair.client, 21) == 0,
           "buffered response start failed");
   uint8_t first = 17;
@@ -1567,7 +1645,8 @@ void test_rpc_write_buffer_uses_fixed_allocation() {
 
 void test_rpc_write_buffer_cleans_up_on_transport_failure_and_destroy() {
   {
-    h2_pair pair = make_pair();
+    h2_pair pair;
+    init_pair(&pair);
     require(rpc_write_start_response(&pair.client, 25) == 0,
             "failed transport response start failed");
     int value = 23;
@@ -1595,7 +1674,8 @@ void test_rpc_write_buffer_cleans_up_on_transport_failure_and_destroy() {
 }
 
 void test_rpc_small_payload_round_trip() {
-  h2_pair pair = make_pair();
+  h2_pair pair;
+  init_pair(&pair);
 
   std::string prefix = "before";
   std::string suffix = "after";
@@ -1650,7 +1730,8 @@ void test_rpc_small_payload_round_trip() {
 }
 
 void test_rpc_repeated_responses_on_lane() {
-  h2_pair pair = make_pair();
+  h2_pair pair;
+  init_pair(&pair);
 
   constexpr int kOp = 81;
   constexpr int kChunkCount = 2;
@@ -1704,7 +1785,8 @@ void test_rpc_repeated_responses_on_lane() {
 }
 
 void test_rpc_request_nested_in_response_builder() {
-  h2_pair pair = make_pair();
+  h2_pair pair;
+  init_pair(&pair);
 
   constexpr int kOuterOp = 83;
   constexpr int kNestedOp = 85;
@@ -1799,7 +1881,8 @@ void test_rpc_request_nested_in_response_builder() {
 }
 
 void test_rpc_response_completed_hook() {
-  h2_pair pair = make_pair();
+  h2_pair pair;
+  init_pair(&pair);
   constexpr int kOp = 97;
   constexpr int kResponse = 1234;
 
@@ -1843,6 +1926,211 @@ void test_rpc_response_completed_hook() {
   expected_response_conn = nullptr;
   response_payload_consumed = false;
   server.join();
+}
+
+void wait_async_flag(const std::atomic<bool> &flag, const char *message) {
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!flag.load(std::memory_order_acquire)) {
+    require(std::chrono::steady_clock::now() < deadline, message);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+}
+
+void test_async_prefix_allows_overlap_and_joins_holes() {
+  h2_pair pair;
+  init_pair(&pair);
+  std::atomic<bool> a_running{false}, b_done{false}, release_a{false};
+  std::atomic<bool> waiting{false}, joined{false};
+  std::thread a([&] {
+    require(rpc_async_sequence_begin(&pair.server, 0) == 0, "A begin");
+    a_running = true;
+    wait_async_flag(release_a, "A was not released");
+    rpc_async_sequence_end(&pair.server);
+  });
+  wait_async_flag(a_running, "A did not begin");
+  std::thread b([&] {
+    require(rpc_async_sequence_begin(&pair.server, 1) == 0, "B begin");
+    rpc_async_sequence_end(&pair.server);
+    b_done = true;
+  });
+  wait_async_flag(b_done, "overlapping B could not complete before A");
+  std::thread consumer([&] {
+    waiting = true;
+    require(rpc_async_sequence_wait(&pair.server, 2) == 0, "prefix wait");
+    joined = true;
+  });
+  wait_async_flag(waiting, "consumer did not start");
+  std::this_thread::sleep_for(std::chrono::milliseconds(30));
+  require(!joined, "later completion skipped the unfinished prefix");
+  release_a = true;
+  a.join();
+  b.join();
+  consumer.join();
+  require(joined, "prefix did not advance through the completed hole");
+}
+
+void test_async_prefix_same_lane_elision_and_cross_lane_marker() {
+  h2_pair pair;
+  init_pair(&pair);
+  for (int i = 0; i < 2; ++i) {
+    uint64_t sequence;
+    require(rpc_write_start_async_request(&pair.client, 101, &sequence) == 0 &&
+                sequence == uint64_t(i) &&
+                rpc_write(&pair.client, &sequence, sizeof(sequence)) == 0 &&
+                rpc_write_end(&pair.client) > 0,
+            "same-lane enqueue failed");
+  }
+  int32_t lane = rpc_http2_accept_stream(&pair.server);
+  for (int i = 0; i < 2; ++i) {
+    int header[2];
+    uint64_t sequence;
+    require(rpc_http2_read_stream(&pair.server, lane, header, sizeof(header)) ==
+                    sizeof(header) &&
+                header[0] >= 2 && header[1] == 101 &&
+                rpc_http2_read_stream(&pair.server, lane, &sequence,
+                                      sizeof(sequence)) == sizeof(sequence) &&
+                sequence == uint64_t(i),
+            "same-lane FIFO emitted a marker or changed ordinary framing");
+  }
+  std::thread other([&] {
+    require(rpc_write_start_request(&pair.client, 102) == 0 &&
+                rpc_write_end(&pair.client) > 0,
+            "cross-lane enqueue failed");
+  });
+  other.join();
+  lane = rpc_http2_accept_stream(&pair.server);
+  int marker[2];
+  uint64_t published = 0;
+  require(rpc_http2_read_stream(&pair.server, lane, marker, sizeof(marker)) ==
+                  sizeof(marker) &&
+              marker[0] == 0 && marker[1] == 0 &&
+              rpc_http2_read_stream(&pair.server, lane, &published,
+                                    sizeof(published)) == sizeof(published) &&
+              published == 2,
+          "cross-lane consumer missed the published prefix");
+}
+
+void test_async_prefix_entry_precedes_builder_wait() {
+  h2_pair pair;
+  init_pair(&pair);
+  pthread_mutex_lock(&pair.client.write_mutex);
+  std::thread caller([&] {
+    uint64_t sequence;
+    require(rpc_write_start_async_request(&pair.client, 101, &sequence) == 0,
+            "blocked request start failed");
+    require(sequence == 1 && pair.client.write_dependency == 0,
+            "builder contention moved the entry snapshot to enqueue time");
+    require(rpc_write_end(&pair.client) > 0, "blocked request enqueue failed");
+    require(rpc_write_start_request(&pair.client, 102) == 0 &&
+                rpc_write_end(&pair.client) > 0,
+            "following request enqueue failed");
+  });
+  // The caller has captured its entry and acquired call_mutex, but cannot
+  // finish starting its builder until this test releases write_mutex.
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  for (;;) {
+    if (pthread_mutex_trylock(&pair.client.call_mutex) != 0) {
+      break;
+    }
+    pthread_mutex_unlock(&pair.client.call_mutex);
+    require(std::chrono::steady_clock::now() < deadline,
+            "caller did not reach the builder wait");
+    std::this_thread::yield();
+  }
+  // Simulate another producer publishing sequence 0 during the overlap.
+  pair.client.issued_async_sequence = 1;
+  __atomic_store_n(&pair.client.published_async_sequence, uint64_t{1},
+                   __ATOMIC_RELEASE);
+  pthread_mutex_unlock(&pair.client.write_mutex);
+  caller.join();
+  int32_t lane = rpc_http2_accept_stream(&pair.server);
+  int headers[4];
+  uint64_t published = 0;
+  require(rpc_http2_read_stream(&pair.server, lane, headers, sizeof(headers)) ==
+                  sizeof(headers) &&
+              headers[0] >= 2 && headers[1] == 101 && headers[2] == 0 &&
+              headers[3] == 0 &&
+              rpc_http2_read_stream(&pair.server, lane, &published,
+                                    sizeof(published)) == sizeof(published) &&
+              published == 2,
+          "own-lane completion elided a hole belonging to another producer");
+}
+
+void test_async_prefix_wait_preserves_flow_control() {
+  h2_pair pair;
+  init_pair(&pair);
+  uint64_t sequence;
+  require(rpc_write_start_async_request(&pair.client, 101, &sequence) == 0 &&
+              rpc_write(&pair.client, &sequence, sizeof(sequence)) == 0 &&
+              rpc_write_end(&pair.client) > 0,
+          "producer enqueue");
+  int32_t producer_lane = rpc_http2_accept_stream(&pair.server);
+  require(rpc_bind_http2_stream(&pair.server, producer_lane) == 0 &&
+              rpc_dispatch(&pair.server, 0) == 101 &&
+              rpc_read(&pair.server, &sequence, sizeof(sequence)) >= 0 &&
+              rpc_read_end(&pair.server) > 0 &&
+              rpc_async_sequence_begin(&pair.server, sequence) == 0,
+          "producer dispatch");
+  std::vector<unsigned char> payload(LUPINE_FF_STAGING_WINDOW_BYTES + 65537);
+  uint32_t seed = 53;
+  for (auto &byte : payload) {
+    seed = seed * 1664525u + 1013904223u;
+    byte = static_cast<unsigned char>(seed >> 24);
+  }
+  std::thread sender([&] {
+    rpc_write_cursor cursor(payload.data(), payload.size());
+    require(rpc_write_start_request(&pair.client, 102) == 0 &&
+                rpc_write_cursors(&pair.client, &cursor, 1) == 0 &&
+                rpc_write_end(&pair.client) > 0,
+            "consumer enqueue");
+  });
+  int32_t consumer_lane = rpc_http2_accept_stream(&pair.server);
+  std::atomic<bool> consumed{false};
+  std::thread consumer([&] {
+    require(rpc_bind_http2_stream(&pair.server, consumer_lane) == 0 &&
+                rpc_dispatch(&pair.server, 0) == 102,
+            "consumer dispatch");
+    std::vector<unsigned char> received(payload.size());
+    require(rpc_read(&pair.server, received.data(), received.size()) >= 0 &&
+                received == payload && rpc_read_end(&pair.server) > 0,
+            "consumer payload corrupted");
+    consumed = true;
+    rpc_unbind_http2_stream(&pair.server);
+  });
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (read_stats(&pair.server).staged_bytes < payload.size()) {
+    require(std::chrono::steady_clock::now() < deadline,
+            "prefix wait stopped flow-control progress");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  require(!consumed, "consumer skipped its unfinished prerequisite");
+  rpc_async_sequence_end(&pair.server);
+  rpc_unbind_http2_stream(&pair.server);
+  sender.join();
+  consumer.join();
+}
+
+void test_async_prefix_shutdown_wakes_waiters() {
+  for (bool peer_failure : {false, true}) {
+    h2_pair pair;
+    init_pair(&pair);
+    exchange_settings(&pair);
+    std::atomic<bool> waiting{false}, finished{false};
+    std::thread waiter([&] {
+      waiting = true;
+      require(rpc_async_sequence_wait(&pair.server, 1) == -1,
+              "transport failure did not cancel the prefix wait");
+      finished = true;
+    });
+    wait_async_flag(waiting, "prefix waiter did not start");
+    if (peer_failure) {
+      rpc_close_transport_socket(&pair.client);
+    } else {
+      rpc_shutdown_transport_socket(&pair.server);
+    }
+    wait_async_flag(finished, "shutdown stranded a prefix waiter");
+    waiter.join();
+  }
 }
 
 // Handlers start request chains without their own null checks; an unreachable
@@ -1890,7 +2178,8 @@ void test_rpc_read_uses_w_offset() {
   require(mprotect(read_view, page_size, PROT_NONE) == 0,
           "read view protection failed");
 
-  h2_pair pair = make_pair();
+  h2_pair pair;
+  init_pair(&pair);
   pair.client.w_offset = LUPINE_HOST_ALLOCATION_W_OFFSET;
   constexpr int kOp = 83;
   const std::array<unsigned char, 8> expected = {3, 1, 4, 1, 5, 9, 2, 6};
@@ -1946,6 +2235,11 @@ int main() {
   require(rpc_set_lifecycle_hooks(&hooks) == 0,
           "failed to install RPC test lifecycle hooks");
   RUN_CASE(test_server_rejects_request_without_lz4_encoding());
+  RUN_CASE(test_async_prefix_allows_overlap_and_joins_holes());
+  RUN_CASE(test_async_prefix_same_lane_elision_and_cross_lane_marker());
+  RUN_CASE(test_async_prefix_entry_precedes_builder_wait());
+  RUN_CASE(test_async_prefix_wait_preserves_flow_control());
+  RUN_CASE(test_async_prefix_shutdown_wakes_waiters());
   RUN_CASE(test_request_start_rejects_null_and_closed_conn());
 #if defined(MAP_FIXED_NOREPLACE) && !defined(__SANITIZE_THREAD__) &&           \
     !defined(_WIN32)
@@ -1982,6 +2276,8 @@ int main() {
   RUN_CASE(test_fragmented_frames_direct());
   RUN_CASE(test_partial_read_stages_only_overflow());
   RUN_CASE(test_truncated_read_clears_direct_destination());
+  RUN_CASE(test_shutdown_wakes_idle_reader());
+  RUN_CASE(test_destroy_drains_pending_output());
   RUN_CASE(test_close_already_failed_transport_socket());
   RUN_CASE(test_abort_failed_transport_with_queued_data());
   RUN_CASE(test_independent_stream_lanes());

@@ -46,11 +46,6 @@ constexpr size_t kH2DecodeBufferBytes = 64 * 1024;
 constexpr size_t kH2StagingPoolBytes = 4 * 1024 * 1024;
 // Output nghttp2 may produce ahead of the socket before request writers block.
 constexpr size_t kH2OutboundLimitBytes = 8 * 1024 * 1024;
-// How long the client write thread polls for more output before it parks.
-// Parked, every message costs its producer a futex wake and the two then
-// contend for session_mutex; polling covers the gap between back-to-back RPCs.
-// The server hosts one write thread per connection and does not poll.
-constexpr auto kH2WriterPoll = std::chrono::microseconds(200);
 constexpr std::array<uint8_t, 8> kH2ShutdownPing = {'l', 'u', 'p', 'i',
                                                     'n', 'e', 0,   1};
 // Linux restarts slow start after an idle period of one retransmission
@@ -64,9 +59,12 @@ struct h2_buffer {
 };
 
 struct h2_stream {
+  ~h2_stream() { pthread_cond_destroy(&read_ready); }
+
   std::deque<h2_buffer> local_out;
   unsigned char *read_destination = nullptr;
   size_t read_remaining = 0;
+  pthread_cond_t read_ready = PTHREAD_COND_INITIALIZER;
   bool closed = false;
   bool remote_end = false;
   bool response_received = false;
@@ -118,20 +116,18 @@ struct h2_transport {
   // far more than it will ever need again.
   std::vector<h2_buffer> buffer_pool;
   size_t buffer_pool_bytes = 0;
-  // Wire bytes nghttp2 has produced that the socket has not taken yet. Only
-  // the write thread sends, so a producer never blocks in the socket and
-  // everything queued while one send is in flight leaves in the next one.
+  // Wire bytes nghttp2 has produced that the writer sends outside
+  // session_mutex.
   std::vector<unsigned char> outbound;
   // Streams whose encoder holds input short of a block. The write thread
   // flushes them before each send, so every message queued while one send is
   // in flight shares a block instead of paying a block and a flush each.
   std::vector<int32_t> flush_pending;
-  // Bumped whenever outbound or flush_pending grows, so the write thread can
-  // poll for work without touching session_mutex.
   std::atomic<uint64_t> output_generation{0};
   pthread_mutex_t session_mutex = PTHREAD_MUTEX_INITIALIZER;
   pthread_cond_t session_progress = PTHREAD_COND_INITIALIZER;
   pthread_cond_t heartbeat_progress = PTHREAD_COND_INITIALIZER;
+  pthread_cond_t writer_ready = PTHREAD_COND_INITIALIZER;
   pthread_cond_t outbound_progress = PTHREAD_COND_INITIALIZER;
   pthread_t read_thread = {};
   pthread_t heartbeat_thread = {};
@@ -141,6 +137,7 @@ struct h2_transport {
   bool write_failed = false;
   int response_waiters = 0;
   bool transport_failed = false;
+  bool read_stop = false;
   bool shutdown_acknowledged = false;
   std::string peer_cuda_version;
   std::string peer_bulk_token;
@@ -165,6 +162,17 @@ struct h2_transport {
 
 h2_stream &h2_get_stream(h2_transport *transport, int32_t stream_id) {
   return transport->streams.try_emplace(stream_id).first->second;
+}
+
+void h2_fail_transport_locked(h2_transport *transport) {
+  transport->transport_failed = true;
+  if (transport->conn != nullptr) {
+    rpc_cancel_async_waits(transport->conn);
+  }
+  for (auto &entry : transport->streams) {
+    pthread_cond_broadcast(&entry.second.read_ready);
+  }
+  pthread_cond_broadcast(&transport->session_progress);
 }
 
 bool h2_retryable_handshake_rejection(const h2_transport *transport,
@@ -195,6 +203,9 @@ void receive_bytes(h2_transport *transport, int32_t stream_id,
     memcpy(stream.read_destination, data, direct);
     stream.read_destination += direct;
     stream.read_remaining -= direct;
+    if (stream.read_remaining == 0) {
+      pthread_cond_broadcast(&stream.read_ready);
+    }
     transport->read_stats.direct_bytes += direct;
     data += direct;
     len -= direct;
@@ -227,7 +238,7 @@ void h2_queue_output(h2_transport *transport, const struct iovec *iov,
                                data + iov[i].iov_len);
   }
   transport->output_generation.fetch_add(1, std::memory_order_release);
-  pthread_cond_broadcast(&transport->outbound_progress);
+  pthread_cond_broadcast(&transport->writer_ready);
 }
 
 int h2_write_socket(h2_transport *transport, const unsigned char *data,
@@ -412,7 +423,6 @@ int h2_on_data_chunk_recv_callback(nghttp2_session *session, uint8_t,
       break;
     }
   }
-  pthread_cond_broadcast(&transport->session_progress);
   return 0;
 }
 
@@ -616,6 +626,7 @@ int h2_on_frame_recv_callback(nghttp2_session *, const nghttp2_frame *frame,
       return NGHTTP2_ERR_CALLBACK_FAILURE;
     }
     stream.response_received = true;
+    pthread_cond_broadcast(&stream.read_ready);
   }
   if ((frame->hd.type == NGHTTP2_DATA || frame->hd.type == NGHTTP2_HEADERS) &&
       (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0) {
@@ -625,14 +636,14 @@ int h2_on_frame_recv_callback(nghttp2_session *, const nghttp2_frame *frame,
       return NGHTTP2_ERR_CALLBACK_FAILURE;
     }
     stream.remote_end = true;
+    pthread_cond_broadcast(&stream.read_ready);
     bool retryable_rejection =
         h2_retryable_handshake_rejection(transport, stream);
     if (frame->hd.stream_id == transport->dispatch_stream_id &&
         !retryable_rejection) {
-      transport->transport_failed = true;
+      h2_fail_transport_locked(transport);
     }
   }
-  pthread_cond_broadcast(&transport->session_progress);
   return 0;
 }
 
@@ -642,10 +653,11 @@ int h2_on_stream_close_callback(nghttp2_session *, int32_t stream_id, uint32_t,
   h2_stream &stream = h2_get_stream(transport, stream_id);
   h2_release_codecs(stream);
   stream.closed = true;
+  pthread_cond_broadcast(&stream.read_ready);
   bool retryable_rejection =
       h2_retryable_handshake_rejection(transport, stream);
   if (stream_id == transport->dispatch_stream_id && !retryable_rejection) {
-    transport->transport_failed = true;
+    h2_fail_transport_locked(transport);
   }
   pthread_cond_broadcast(&transport->session_progress);
   return 0;
@@ -835,8 +847,8 @@ int h2_pump_stream_locked(h2_transport *transport, int32_t stream_id,
   if (!stream.provider_submitted) {
     nghttp2_data_provider provider = {};
     provider.read_callback = h2_data_source_read_callback;
-    if (nghttp2_submit_data(transport->session, NGHTTP2_FLAG_NONE, stream_id,
-                            &provider) != 0) {
+    if (nghttp2_submit_data(transport->session, NGHTTP2_FLAG_END_STREAM,
+                            stream_id, &provider) != 0) {
       return -1;
     }
     stream.provider_submitted = true;
@@ -928,24 +940,6 @@ int h2_flush_pending_locked(h2_transport *transport) {
   return result;
 }
 
-void h2_await_output_locked(h2_transport *transport) {
-  if (!transport->server) {
-    uint64_t seen =
-        transport->output_generation.load(std::memory_order_relaxed);
-    pthread_mutex_unlock(&transport->session_mutex);
-    auto deadline = std::chrono::steady_clock::now() + kH2WriterPoll;
-    while (transport->output_generation.load(std::memory_order_acquire) ==
-               seen &&
-           std::chrono::steady_clock::now() < deadline) {
-    }
-    pthread_mutex_lock(&transport->session_mutex);
-  }
-  if (transport->outbound.empty() && transport->flush_pending.empty() &&
-      !transport->write_stop) {
-    pthread_cond_wait(&transport->outbound_progress, &transport->session_mutex);
-  }
-}
-
 void *h2_write_main(void *arg) {
   auto *transport = static_cast<h2_transport *>(arg);
   std::vector<unsigned char> chunk;
@@ -955,7 +949,22 @@ void *h2_write_main(void *arg) {
   for (;;) {
     while (transport->outbound.empty() && transport->flush_pending.empty() &&
            !transport->write_stop) {
-      h2_await_output_locked(transport);
+      if (!transport->server) {
+        uint64_t seen =
+            transport->output_generation.load(std::memory_order_relaxed);
+        pthread_mutex_unlock(&transport->session_mutex);
+        auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::microseconds(5);
+        while (transport->output_generation.load(std::memory_order_acquire) ==
+                   seen &&
+               std::chrono::steady_clock::now() < deadline) {
+        }
+        pthread_mutex_lock(&transport->session_mutex);
+      }
+      if (transport->outbound.empty() && transport->flush_pending.empty() &&
+          !transport->write_stop) {
+        pthread_cond_wait(&transport->writer_ready, &transport->session_mutex);
+      }
     }
     if (transport->write_stop) {
       break;
@@ -972,8 +981,7 @@ void *h2_write_main(void *arg) {
     }
     if (result < 0) {
       transport->write_failed = true;
-      transport->transport_failed = true;
-      pthread_cond_broadcast(&transport->session_progress);
+      h2_fail_transport_locked(transport);
       break;
     }
     pthread_cond_broadcast(&transport->outbound_progress);
@@ -1044,6 +1052,10 @@ void *h2_read_main(void *arg) {
   for (;;) {
     ssize_t received = h2_read_socket(transport, buffer, sizeof(buffer));
     pthread_mutex_lock(&transport->session_mutex);
+    if (transport->read_stop) {
+      pthread_mutex_unlock(&transport->session_mutex);
+      return nullptr;
+    }
     size_t offset = 0;
     while (received > 0 && offset < static_cast<size_t>(received)) {
       ssize_t consumed =
@@ -1056,15 +1068,14 @@ void *h2_read_main(void *arg) {
       offset += static_cast<size_t>(consumed);
     }
     if (received <= 0 || h2_flush_session_locked(transport) < 0) {
-      transport->transport_failed = true;
-      pthread_cond_broadcast(&transport->session_progress);
+      h2_fail_transport_locked(transport);
       pthread_mutex_unlock(&transport->session_mutex);
       return nullptr;
     }
-    // Wake stream readers, acceptors, and flow-controlled writers after the
-    // callbacks have applied this batch of connection events.
-    pthread_cond_broadcast(&transport->session_progress);
+    // Wake acceptors and flow-controlled writers after the complete batch
+    // is applied and the mutex is available to them.
     pthread_mutex_unlock(&transport->session_mutex);
+    pthread_cond_broadcast(&transport->session_progress);
   }
 }
 
@@ -1138,7 +1149,7 @@ void h2_stop_write_thread(h2_transport *transport) {
   pthread_mutex_lock(&transport->session_mutex);
   h2_drain_output_locked(transport);
   transport->write_stop = true;
-  pthread_cond_broadcast(&transport->outbound_progress);
+  pthread_cond_broadcast(&transport->writer_ready);
   pthread_mutex_unlock(&transport->session_mutex);
   pthread_join(transport->write_thread, nullptr);
   transport->write_thread = 0;
@@ -1292,12 +1303,14 @@ int rpc_http2_read_stream(conn_t *conn, int32_t stream_id, void *data,
     return result;
   }
 
+  // A partial chunk is not useful to a blocked reader. Wake only this lane
+  // when its read completes, the stream ends, or the transport fails.
   stream.read_destination = out + copied;
   stream.read_remaining = size - copied;
   while (stream.read_remaining != 0 && !transport->transport_failed &&
          !stream.closed && !stream.remote_end &&
          (stream.response_status == 0 || stream.response_status == 200)) {
-    pthread_cond_wait(&transport->session_progress, &transport->session_mutex);
+    pthread_cond_wait(&stream.read_ready, &transport->session_mutex);
   }
   bool complete = stream.read_remaining == 0;
   stream.read_destination = nullptr;
@@ -1329,10 +1342,8 @@ int rpc_http2_write_stream(conn_t *conn, int32_t stream_id,
   pthread_mutex_lock(&transport->session_mutex);
   int result = h2_write_stream_locked(transport, stream_id, cursors);
   pthread_mutex_unlock(&transport->session_mutex);
-  // Signalled after the unlock so the write thread never wakes into a mutex
-  // its producer still holds.
   transport->output_generation.fetch_add(1, std::memory_order_release);
-  pthread_cond_broadcast(&transport->outbound_progress);
+  pthread_cond_broadcast(&transport->writer_ready);
   return result;
 }
 
@@ -1389,7 +1400,7 @@ int32_t rpc_http2_lane_stream(conn_t *conn, uint64_t lane_id) {
     transport->local_lanes.emplace(lane_id, stream_id);
     if (h2_flush_session_locked(transport) < 0) {
       stream_id = -1;
-      transport->transport_failed = true;
+      h2_fail_transport_locked(transport);
     }
   }
   pthread_mutex_unlock(&transport->session_mutex);
@@ -1602,8 +1613,7 @@ int rpc_http2_client_retry_handshake(conn_t *conn) {
         h2_flush_session_locked(transport) == 0) {
       result = 0;
     } else {
-      transport->transport_failed = true;
-      pthread_cond_broadcast(&transport->session_progress);
+      h2_fail_transport_locked(transport);
     }
   }
   pthread_mutex_unlock(&transport->session_mutex);
@@ -1785,33 +1795,48 @@ int rpc_http2_server_graceful_shutdown(conn_t *conn) {
   return result == 0 ? 0 : -1;
 }
 
-void rpc_http2_destroy(conn_t *conn) {
+void rpc_http2_shutdown(conn_t *conn) {
   if (conn == nullptr || conn->http2 == nullptr) {
     return;
   }
   auto *transport = static_cast<h2_transport *>(conn->http2);
-  conn->http2 = nullptr;
+  pthread_mutex_lock(&transport->session_mutex);
+  transport->read_stop = true;
+  transport->response_waiters = -1;
+  h2_fail_transport_locked(transport);
+  pthread_cond_broadcast(&transport->heartbeat_progress);
+  pthread_mutex_unlock(&transport->session_mutex);
 #ifdef _WIN32
   (void)shutdown(transport->netfd, SD_RECEIVE);
 #else
   (void)shutdown(transport->netfd, SHUT_RD);
 #endif
-  pthread_mutex_lock(&transport->session_mutex);
-  transport->response_waiters = -1;
-  transport->transport_failed = true;
-  pthread_cond_broadcast(&transport->heartbeat_progress);
-  pthread_cond_broadcast(&transport->session_progress);
-  pthread_mutex_unlock(&transport->session_mutex);
+}
+
+void rpc_http2_destroy(conn_t *conn) {
+  if (conn == nullptr || conn->http2 == nullptr) {
+    return;
+  }
+  rpc_http2_shutdown(conn);
+  auto *transport = static_cast<h2_transport *>(conn->http2);
+  conn->http2 = nullptr;
   if (transport->heartbeat_thread != 0) {
     pthread_join(transport->heartbeat_thread, nullptr);
     transport->heartbeat_thread = 0;
   }
+  if (transport->write_thread != 0) {
+    h2_stop_write_thread(transport);
+  }
+#ifdef _WIN32
+  // SD_RECEIVE rejects future receives but leaves an already pending recv
+  // blocked. Cancel it before joining the reader and before the socket can be
+  // closed or reused. Drain and stop the writer first because this
+  // cancellation also covers pending sends.
+  (void)CancelIoEx(reinterpret_cast<HANDLE>(transport->netfd), nullptr);
+#endif
   if (transport->read_thread != 0) {
     pthread_join(transport->read_thread, nullptr);
     transport->read_thread = 0;
-  }
-  if (transport->write_thread != 0) {
-    h2_stop_write_thread(transport);
   }
   if (transport->session != nullptr) {
     nghttp2_session_del(transport->session);
@@ -1822,6 +1847,7 @@ void rpc_http2_destroy(conn_t *conn) {
     h2_release_codecs(stream);
   }
   pthread_cond_destroy(&transport->outbound_progress);
+  pthread_cond_destroy(&transport->writer_ready);
   pthread_cond_destroy(&transport->heartbeat_progress);
   pthread_cond_destroy(&transport->session_progress);
   pthread_mutex_destroy(&transport->session_mutex);

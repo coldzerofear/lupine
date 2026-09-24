@@ -709,21 +709,6 @@ extern "C" lupine_route lupine_route_for_known_stream(CUstream stream) {
   return lupine_route_for_known_owner(stream);
 }
 
-extern "C" void lupine_note_blas_handle_owner(void *handle, conn_t *conn) {
-  lupine_note_owner(static_cast<lupine_blas_handle>(handle), conn);
-}
-
-extern "C" void lupine_forget_blas_handle_owner(void *handle) {
-  std::lock_guard<std::mutex> lock(lupine_routing_mutex());
-  lupine_owners<lupine_blas_handle>().erase(
-      static_cast<lupine_blas_handle>(handle));
-}
-
-extern "C" conn_t *lupine_rpc_conn_for_blas_handle(void *handle) {
-  return lupine_route_remote_conn(
-      lupine_route_for_known_owner(static_cast<lupine_blas_handle>(handle)));
-}
-
 extern "C" lupine_route lupine_route_for_event(CUevent event) {
   return lupine_route_for_owner_or_default(event);
 }
@@ -826,15 +811,17 @@ CUresult lupine_set_current_context_on_route(lupine_route route,
       result = CUDA_ERROR_DEVICE_UNAVAILABLE;
     }
   }
+  // The lane just moved to another context, and with it to that context's
+  // device and to that context's server. Device answers cached against the old
+  // binding are stale even when the set failed and left the lane somewhere
+  // unknown.
+  lupine_note_device_binding_changed();
   lupine_lane_context_cache_update(lupine_route_identity(route), ctx, epoch,
                                    result == CUDA_SUCCESS);
   return result;
 }
 
 extern "C" lupine_route lupine_route_for_current_context() {
-  if (lupine_refresh_runtime_context() != CUDA_SUCCESS) {
-    return lupine_route{LUPINE_ROUTE_INVALID, nullptr};
-  }
   return lupine_route_for_context(lupine_current_context_hint());
 }
 
@@ -859,9 +846,6 @@ static lupine_route lupine_route_for_default_context_hint(CUcontext ctx) {
 }
 
 extern "C" lupine_route lupine_route_for_default() {
-  if (lupine_refresh_runtime_context() != CUDA_SUCCESS) {
-    return lupine_route{LUPINE_ROUTE_INVALID, nullptr};
-  }
   CUcontext current_hint = lupine_current_context_hint();
   if (current_hint != nullptr) {
     lupine_route route = lupine_route_for_default_context_hint(current_hint);

@@ -627,7 +627,6 @@ CUresult cuKernelSetCacheConfig(CUkernel kernel, CUfunc_cache config,
   return return_value;
 }
 /**
- * @guard CUDA_VERSION >= 12030
  * @routingkey FUNCTION hfunc
  * @retain name hfunc
  * @param name RECV_ONLY NULL_TERMINATED
@@ -683,8 +682,8 @@ CUresult cuMemAllocPitch_v2(CUdeviceptr *dptr, size_t *pPitch,
 CUresult cuMemFree_v2(CUdeviceptr dptr);
 /**
  * @routingkey DEVICEPTR dptr
- * @param pbase SEND_RECV
- * @param psize SEND_RECV
+ * @param pbase RECV_ONLY NULLABLE
+ * @param psize RECV_ONLY NULLABLE
  * @param dptr SEND_ONLY
  */
 CUresult cuMemGetAddressRange_v2(CUdeviceptr *pbase, size_t *psize,
@@ -1269,8 +1268,8 @@ CUresult
 cuMemGetAllocationPropertiesFromHandle(CUmemAllocationProp *prop,
                                        CUmemGenericAllocationHandle handle);
 /**
- * @param handle SEND_RECV
- * @param addr SEND_RECV
+ * @param handle RECV_ONLY
+ * @param addr SEND_ONLY
  */
 CUresult cuMemRetainAllocationHandle(CUmemGenericAllocationHandle *handle,
                                      void *addr);
@@ -1522,6 +1521,13 @@ CUresult cuStreamGetId(CUstream hStream, unsigned long long *streamId);
  * @param pctx SEND_RECV
  */
 CUresult cuStreamGetCtx(CUstream hStream, CUcontext *pctx);
+/**
+ * @disabled client - manual client resolves the device of the stream's server
+ * @routingkey STREAM hStream
+ * @param hStream SEND_ONLY
+ * @param device RECV_ONLY
+ */
+CUresult cuStreamGetDevice(CUstream hStream, CUdevice *device);
 /**
  * @guard CUDA_VERSION >= 13010
  * @routingkey STREAM hStream
@@ -1989,7 +1995,6 @@ CUresult cuFuncSetSharedMemConfig(CUfunction hfunc, CUsharedconfig config);
  */
 CUresult cuFuncGetModule(CUmodule *hmod, CUfunction hfunc);
 /**
- * @guard CUDA_VERSION >= 12030
  * @routingkey FUNCTION hfunc
  * @retain name hfunc
  * @param name RECV_ONLY NULL_TERMINATED
@@ -3332,6 +3337,8 @@ void cuGraphAddNode_v2();
 void lupineEventQueryBatch();
 /** @disabled */
 void lupineStreamPoolInit();
+/** @disabled */
+void lupineLibraryLoadBatch();
 /** @disabled */
 void cuStreamBeginCaptureToGraph();
 /** @disabled handle_cuStreamUpdateCaptureDependencies */

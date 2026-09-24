@@ -123,3 +123,11 @@ extern "C" void lupine_invalidate_current_context_cache() {
   lupine_current_context_device_cache_invalidate();
   lane_context_cache_epoch().fetch_add(1, std::memory_order_acq_rel);
 }
+
+extern "C" void lupine_note_device_binding_changed() {
+  // The lane's driver context went with its device, so what this thread
+  // believed was current there no longer holds.
+  for (auto &entry : lane_context_cache()) {
+    entry.epoch = 0;
+  }
+}

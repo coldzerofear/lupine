@@ -30,8 +30,7 @@ CUresult lupine_virtual_device_count(int *count);
 CUresult lupine_virtual_device_for_ordinal(CUdevice *device, int ordinal);
 CUresult lupine_set_current_context_on_route(lupine_route route, CUcontext ctx);
 bool lupine_local_cuda_available();
-CUcontext lupine_current_context_hint();
-CUresult lupine_refresh_runtime_context();
+extern "C" CUcontext lupine_current_context_hint();
 CUcontext lupine_default_context_hint_value();
 CUcontext lupine_global_default_context_hint_value();
 void lupine_accept_current_context_hint(CUcontext ctx);
@@ -97,11 +96,6 @@ static CUresult lupine_lookup_device_on_all_routes(CUdevice *device,
 }
 
 extern "C" void *lupine_real_cuda_symbol(const char *name);
-
-// A key of its own, so the shared cuBLAS/cuBLASLt handle does not land in a
-// map keyed by some other library's pointers.
-struct lupine_blas_handle_st;
-using lupine_blas_handle = lupine_blas_handle_st *;
 
 extern "C" void lupine_note_context_owner(CUcontext ctx, conn_t *conn);
 extern "C" void lupine_note_module_owner(CUmodule module, conn_t *conn);
