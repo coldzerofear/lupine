@@ -30,7 +30,7 @@
 #
 # Usage: check_static_client.sh <max-glibc> <root.so>... -- <dependent.so>...
 #   e.g. check_static_client.sh 2.28 build/libcuda.so.1 build/libnvidia-ml.so.1 \
-#          -- build/libcudart.so.13 build/libcublas.so.13
+#          -- build/libnccl.so.2
 
 set -o errexit
 set -o nounset

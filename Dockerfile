@@ -8,7 +8,6 @@ ARG ROCM_SDK_PLATFORM=linux/amd64
 FROM nvidia/cuda:${CUDA_VERSION}-${CUDA_IMAGE_FLAVOR}-ubuntu${UBUNTU_VERSION} AS cuda-sdk
 
 FROM --platform=${ROCM_SDK_PLATFORM} ${ROCM_SDK_IMAGE} AS rocm-sdk
-
 FROM ghcr.io/astral-sh/uv:0.9.18-python3.12-bookworm-slim@sha256:0b074d1ae15f5c3f1861354917d356e5afbd5a4c53c1190e81ad2f2add46e45b AS uv
 
 FROM cuda-sdk AS cuda-ops
@@ -284,28 +283,13 @@ ENTRYPOINT ["/opt/lupine/bin/lupine_driver_server"]
 # builder's. gcc-toolset supplies a newer compiler where nvcc requires one;
 # its libstdc++ delta links statically by design, so the floor stays 2.28.
 #
-# cuDNN, NCCL and cuSPARSELt ship outside the CUDA toolkit -- the RHEL/dnf
-# counterparts of the Ubuntu packages the regular client image installs for
-# the same reason (see the cudnn-headers/nccl-headers/cusparselt-headers
-# stages above). Everything else lupine_runtime_clients can build (cuBLAS,
-# cuFFT, cuRAND, cuSPARSE, cuSOLVER, NVRTC, nvJitLink, nvJPEG, NPP, cuFile,
-# CUPTI) ships inside the CUDA devel image already, so those need nothing
-# extra here. nvSHMEM is skipped: NVIDIA does not publish an RHEL8 package
-# for it, so LUPINE_BUILD_NVSHMEM's own header search simply never finds one
-# and that one shim is left out, the same way it is for CUDA 11 upstream.
+# NCCL ships outside the CUDA toolkit -- the RHEL/dnf counterpart of the Ubuntu
+# package the regular client image installs for the same reason (see the
+# nccl-headers stage above). The driver and NVML shims need nothing beyond the
+# devel image. nvSHMEM is skipped: NVIDIA does not publish an RHEL8 package for
+# it, so LUPINE_BUILD_NVSHMEM's own header search never finds one and that one
+# shim is left out, the same way it is for CUDA 11 upstream.
 # ---------------------------------------------------------------------------
-
-FROM nvidia/cuda:${CUDA_VERSION}-${CUDA_IMAGE_FLAVOR}-rockylinux8 AS static-cudnn-headers
-
-ARG CUDA_VERSION
-
-# cuDNN 9's headers are a separate subpackage from its devel meta-package (the
-# latter only pulls in the runtime + this one); installing the headers package
-# directly skips a runtime .so this build never links against.
-RUN dnf install -y "libcudnn9-headers-cuda-${CUDA_VERSION%%.*}" \
-    && mkdir -p /opt/cudnn/include \
-    && cp /usr/include/cudnn*.h /opt/cudnn/include/ \
-    && dnf clean all
 
 FROM nvidia/cuda:${CUDA_VERSION}-${CUDA_IMAGE_FLAVOR}-rockylinux8 AS static-nccl-headers
 
@@ -326,25 +310,7 @@ RUN set -eux; \
     cp /usr/include/nccl.h /opt/nccl/include/; \
     dnf clean all
 
-FROM nvidia/cuda:${CUDA_VERSION}-${CUDA_IMAGE_FLAVOR}-rockylinux8 AS static-cusparselt-headers
-
-ARG CUDA_VERSION
-
-# cuSPARSELt moved from one flat package to a CUDA-major-suffixed one partway
-# through its RHEL releases; try the current naming first and fall back to the
-# one it replaced. Older CUDA majors (11) may have neither -- left with an
-# empty include dir, LUPINE_BUILD_CUSPARSELT's own header search finds nothing
-# and that shim is simply left out for that lane, same as nvSHMEM.
-RUN set -eux; \
-    mkdir -p /opt/cusparselt/include; \
-    dnf install -y "libcusparselt0-devel-cuda-${CUDA_VERSION%%.*}" \
-      || dnf install -y libcusparselt-devel \
-      || true; \
-    cp /usr/include/cusparseLt.h /opt/cusparselt/include/ 2>/dev/null || true; \
-    dnf clean all
-
 FROM nvidia/cuda:${CUDA_VERSION}-${CUDA_IMAGE_FLAVOR}-rockylinux8 AS client-static-build
-
 ARG CMAKE_BUILD_TYPE=Release
 ARG NGHTTP2_VERSION=1.64.0
 ARG NGHTTP2_SHA256=20e73f3cf9db3f05988996ac8b3a99ed529f4565ca91a49eb0550498e10621e8
@@ -402,11 +368,9 @@ RUN set -eux; \
     make install_sw; \
     cd ..; rm -rf "openssl-${OPENSSL_VERSION}" openssl.tar.gz
 
-# Headers for the libraries that ship outside the toolkit; see the stages
-# above. Copied beside the toolkit's own so a single -I finds everything.
-COPY --from=static-cudnn-headers /opt/cudnn/include/ /usr/local/cuda/include/
+# NCCL headers ship outside the toolkit; see the stage above. Copied beside
+# the toolkit's own so a single -I finds everything.
 COPY --from=static-nccl-headers /opt/nccl/include/ /usr/local/cuda/include/
-COPY --from=static-cusparselt-headers /opt/cusparselt/include/ /usr/local/cuda/include/
 
 WORKDIR /opt/lupine
 COPY . /opt/lupine
@@ -418,9 +382,8 @@ COPY . /opt/lupine
 # The configure/build markers exist because BuildKit only shows the failing
 # step tail -- "exit code 2" alone told us nothing the first time this broke.
 #
-# lupine_runtime_clients is every runtime/library client shim CMake found
-# headers for (see CMakeLists.txt); it always includes lupine_cudart_client,
-# so naming that one alongside it would be redundant.
+# The NCCL shim is built only when CMake finds nccl.h (>= 2.14.3), so it is
+# absent from lanes where the header stage yielded nothing usable.
 RUN set -eux; \
     if [ -n "${GCC_TOOLSET}" ]; then export PATH="/opt/rh/${GCC_TOOLSET}/root/usr/bin:${PATH}"; fi; \
     cmake -S /opt/lupine -B /opt/lupine/build-static \
@@ -432,36 +395,18 @@ RUN set -eux; \
       -DCMAKE_SHARED_LINKER_FLAGS="-static-libstdc++ -static-libgcc" \
       -DCMAKE_LIBRARY_PATH="${CUDA_HOME}/lib64/stubs"; \
     cmake --build /opt/lupine/build-static --parallel "$(nproc)" \
-      --target lupine_cuda_client lupine_runtime_clients lupine_nvml_client
+      --target lupine_cuda_client lupine_nccl_client lupine_nvml_client
 
-# Every shim beyond the two roots: libcudart.so.<major> (a first-class codegen
-# shim, lupine_cudart_client) plus whatever lupine_runtime_clients built --
-# some entries are absent on a given CUDA major (nvJitLink needs >= 12.4,
-# cuFile/CUPTI need their own headers, cuSPARSELt needs the header stage above
-# to have found something) and the glob+existence-test below only picks up
-# what actually got built. Each links against libcuda.so.1/libcudart.so.* over
-# its own $ORIGIN rpath (BUILD_RPATH "$ORIGIN" in CMakeLists.txt) rather than
-# carrying its own copy of the transport, so the bundle is self-contained as a
-# whole even though no single shim beyond the roots is on its own.
+# Every shim beyond the two roots: libnccl.so.<major> (and libnvshmem_host if it
+# was built) forwards through libcuda.so.1 over its own $ORIGIN rpath
+# (BUILD_RPATH "$ORIGIN" in CMakeLists.txt) rather than carrying its own copy
+# of the transport, so the bundle is self-contained as a whole even though no
+# single shim beyond the roots is on its own. The existence test only picks up
+# what actually got built.
 RUN set -eux; \
     deps=""; \
-    for f in /opt/lupine/build-static/libcudart.so.* \
-             /opt/lupine/build-static/libcublas.so.* \
-             /opt/lupine/build-static/libcublasLt.so.* \
-             /opt/lupine/build-static/libcufft.so.* \
-             /opt/lupine/build-static/libcudnn.so.* \
-             /opt/lupine/build-static/libcurand.so.* \
-             /opt/lupine/build-static/libcusparse.so.* \
-             /opt/lupine/build-static/libcusparseLt.so.* \
-             /opt/lupine/build-static/libcusolver.so.* \
-             /opt/lupine/build-static/libcusolverMg.so.* \
-             /opt/lupine/build-static/libnvrtc.so.* \
-             /opt/lupine/build-static/libnvJitLink.so.* \
-             /opt/lupine/build-static/libnccl.so.* \
-             /opt/lupine/build-static/libnvjpeg.so.* \
-             /opt/lupine/build-static/libnpp*.so.* \
-             /opt/lupine/build-static/libcufile.so.* \
-             /opt/lupine/build-static/libcupti.so.*; \
+    for f in /opt/lupine/build-static/libnccl.so.* \
+             /opt/lupine/build-static/libnvshmem_host.so.*; \
     do [ -e "$f" ] && deps="$deps $f"; done; \
     chmod +x /opt/lupine/deploy/check_static_client.sh; \
     /opt/lupine/deploy/check_static_client.sh "${MAX_GLIBC}" \
@@ -670,15 +615,11 @@ RUN set -eux; \
     make install; \
     cd ..; rm -rf "nghttp2-${NGHTTP2_VERSION}" nghttp2.tar.gz
 
-# Headers for the libraries that ship outside the toolkit; see the
-# static-cudnn-headers/static-nccl-headers/static-cusparselt-headers stages
-# above the client lane. The per-library lupine_*_server static components
-# link into lupine_driver_server automatically once CMake finds these (see
-# CMakeLists.txt's repeated target_link_libraries(lupine_driver_server ...)),
-# so no target list change is needed here, only the headers to find.
-COPY --from=static-cudnn-headers /opt/cudnn/include/ /usr/local/cuda/include/
+# NCCL headers ship outside the toolkit; see the static-nccl-headers stage
+# above the client lane. The NCCL server component links into
+# lupine_driver_server automatically once CMake finds them, so no target list
+# change is needed here, only the headers to find.
 COPY --from=static-nccl-headers /opt/nccl/include/ /usr/local/cuda/include/
-COPY --from=static-cusparselt-headers /opt/cusparselt/include/ /usr/local/cuda/include/
 
 WORKDIR /opt/lupine
 COPY . /opt/lupine
@@ -750,24 +691,15 @@ LABEL io.lupine.min-glibc="${MAX_GLIBC}"
 COPY --from=server-static-runprobe /probe/runprobe-passed /opt/lupine/.runprobe-passed
 COPY --from=server-static-build /opt/lupine/build-static-server/lupine_driver_server /opt/lupine/bin/lupine_driver_server
 
-# cuBLAS, cuFFT, cuRAND, cuSPARSE, cuSOLVER, NVRTC, nvJitLink, nvJPEG, NPP,
-# cuFile and CUPTI ship inside this base image already (it is the same
-# CUDA-toolkit-on-rockylinux8 image server-static-build used), so their
-# lupine_*_server components can dlopen the real library without anything
-# more here. cuDNN, NCCL and cuSPARSELt ship outside the toolkit -- install
-# just their runtime .so (no headers/static libs, unlike the builder), with
-# the same version pinning and graceful skip as the header stages above.
+# The NCCL server component dlopens the real libnccl, which ships outside the
+# toolkit: install just its runtime .so (no headers/static libs, unlike the
+# builder), with the same version pinning and graceful skip as the header stage.
 RUN set -eux; \
-    cuda_major="${CUDA_VERSION%%.*}"; \
     series="$(printf '%s' "${CUDA_VERSION}" | awk -F. '{print $1"."$2}')"; \
-    dnf install -y "libcudnn9-cuda-${cuda_major}" || true; \
     nccl_nevra="$(dnf list --showduplicates libnccl 2>/dev/null \
                    | awk -v s="+cuda${series}" '$1 ~ /^libnccl\./ && index($2, s) {print $2}' \
                    | sort -V | tail -1)"; \
     if [ -n "$nccl_nevra" ]; then dnf install -y "libnccl-${nccl_nevra}"; fi; \
-    dnf install -y "libcusparselt0-cuda-${cuda_major}" \
-      || dnf install -y libcusparselt0 \
-      || true; \
     dnf clean all; \
     chmod +x /opt/lupine/bin/lupine_driver_server
 
